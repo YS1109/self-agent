@@ -11,6 +11,16 @@ const plan = (id = "one"): Plan => ({
   nodes: [{ ...node("a"), status: "pending" }],
 });
 describe("计划编辑状态", () => {
+  it("角色分配进入保存草稿，后端轮询不会覆盖未保存的角色选择", () => {
+    const original = plan();
+    original.nodes[0].agent_id = "coder";
+    const draft = createPlanDraft(original);
+    expect(draft.nodes[0].agent_id).toBe("coder");
+    draft.nodes[0].agent_id = "reviewer";
+    expect(original.nodes[0].agent_id).toBe("coder");
+    expect(planEditState(original, draft)).toMatchObject({ dirty: true, canStart: false });
+    expect(getPlanDraft(original, { one: draft }).nodes[0].agent_id).toBe("reviewer");
+  });
   it("后台轮询保留未保存编辑，版本变化阻止用旧版本启动", () => {
     const original = plan();
     const draft = createPlanDraft(original);

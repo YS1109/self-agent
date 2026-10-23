@@ -1,0 +1,518 @@
+//! A bounded, single-turn Codex app-server client. Protocol data and stderr are
+//! deliberately excluded from progress/errors because they can contain secrets.
+
+use std::{path::Path, process::Stdio, time::Duration};
+
+use anyhow::{bail, Result};
+use serde_json::{json, Value};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    time::{timeout, Instant},
+};
+
+const MAX_LINE: usize = 256 * 1024;
+const MAX_OUTPUT: usize = 8 * 1024 * 1024;
+const MAX_LINES: usize = 20_000;
+const MAX_RESULT: usize = 128 * 1024;
+const TURN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+pub async fn execute(
+    binary: &str,
+    model: &str,
+    root: &Path,
+    objective: &str,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+) -> Result<String> {
+    if cancelled() {
+        bail!("Codex 任务已取消");
+    }
+    if objective.len() > MAX_RESULT || model.len() > 256 {
+        bail!("Codex 任务输入超过大小限制");
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|_| anyhow::anyhow!("Codex 项目目录不可访问"))?;
+    if !root.is_dir() {
+        bail!("Codex 项目路径必须为目录");
+    }
+    let mut command = Command::new(binary);
+    command
+        .args(["app-server", "--listen", "stdio://"])
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if Path::new(binary).is_absolute() {
+        if let Some(parent) = Path::new(binary).parent() {
+            // GUI launches may omit the sibling Node.js used by Codex's shebang.
+            let mut paths = vec![parent.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(path) = std::env::join_paths(paths) {
+                command.env("PATH", path);
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        // Isolate the app-server and its tool subprocesses for cancellation.
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let mut child = command
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("无法启动 Codex，请检查可执行文件路径与安装状态"))?;
+    let process_id = child.id();
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut ids = RunIds::default();
+    let started = Instant::now();
+    let result = tokio::select! {
+        result = timeout(TURN_TIMEOUT, protocol(
+            &mut stdin, stdout, model, &root, objective, &progress, &mut ids,
+        )) => match result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("Codex 任务已超过 15 分钟时限")),
+        },
+        _ = async {
+            loop {
+                if cancelled() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        } => Err(anyhow::anyhow!("Codex 任务已取消")),
+    };
+    if result.is_err() {
+        if let (Some(thread), Some(turn)) = (&ids.thread, &ids.turn) {
+            let _ = timeout(
+                Duration::from_millis(300),
+                send(
+                    &mut stdin,
+                    json!({"id":4,"method":"turn/interrupt","params":{"threadId":thread,"turnId":turn}}),
+                ),
+            )
+            .await;
+            let _ = timeout(Duration::from_millis(300), child.wait()).await;
+        }
+    }
+    drop(stdin);
+    stop(&mut child, process_id).await;
+    if result.is_ok() {
+        progress(format!(
+            "Codex 执行完成，用时 {} 秒",
+            started.elapsed().as_secs()
+        ));
+    }
+    result
+}
+
+#[derive(Default)]
+struct RunIds {
+    thread: Option<String>,
+    turn: Option<String>,
+}
+
+async fn send(stdin: &mut ChildStdin, message: Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec(&message)?;
+    bytes.push(b'\n');
+    stdin
+        .write_all(&bytes)
+        .await
+        .map_err(|_| anyhow::anyhow!("无法向 Codex 发送协议消息"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|_| anyhow::anyhow!("Codex 协议连接已关闭"))
+}
+
+async fn protocol(
+    stdin: &mut ChildStdin,
+    stdout: ChildStdout,
+    model: &str,
+    root: &Path,
+    objective: &str,
+    progress: &impl Fn(String),
+    ids: &mut RunIds,
+) -> Result<String> {
+    progress("正在连接 Codex 执行器".into());
+    send(
+        stdin,
+        json!({"id":1,"method":"initialize","params":{
+            "clientInfo":{"name":"self_agent","title":"Self Agent","version":env!("CARGO_PKG_VERSION")},
+            "capabilities":{"experimentalApi":false}
+        }}),
+    )
+    .await?;
+    let mut reader = BufReader::new(stdout);
+    let mut total = 0usize;
+    let mut count = 0usize;
+    let mut expected = 1u64;
+    let mut answer = None;
+    loop {
+        // `take` bounds allocation even when a peer never writes a newline.
+        let mut line = Vec::new();
+        let bytes = (&mut reader)
+            .take((MAX_LINE + 1) as u64)
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(|_| anyhow::anyhow!("读取 Codex 协议消息失败"))?;
+        if bytes == 0 {
+            bail!("Codex 在回合完成前关闭了连接");
+        }
+        total += bytes;
+        count += 1;
+        if bytes > MAX_LINE || total > MAX_OUTPUT || count > MAX_LINES {
+            bail!("Codex 协议输出超过安全预算");
+        }
+        let message: Value = serde_json::from_slice(&line)
+            .map_err(|_| anyhow::anyhow!("Codex 返回了无法解析的协议消息"))?;
+        if let Some(method) = message.get("method").and_then(Value::as_str) {
+            if let Some(id) = message.get("id") {
+                // No approval or interactive tool flow is implemented here.
+                // Explicitly answer requests before stopping, rather than hang.
+                let response = match method {
+                    "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                        json!({"id":id,"result":{"decision":"cancel"}})
+                    }
+                    "item/permissions/requestApproval" => {
+                        json!({"id":id,"result":{"permissions":{},"scope":"turn"}})
+                    }
+                    _ => {
+                        json!({"id":id,"error":{"code":-32601,"message":"此执行器不支持交互请求"}})
+                    }
+                };
+                send(stdin, response).await?;
+                bail!("Codex 请求了当前执行器不支持的授权或交互，任务已停止");
+            }
+            let params = &message["params"];
+            if params["threadId"].as_str() != ids.thread.as_deref() {
+                continue;
+            }
+            if method == "turn/started" && expected == 3 {
+                ids.turn = params["turn"]["id"].as_str().map(str::to_owned);
+            }
+            let event_turn = if method == "turn/completed" {
+                params["turn"]["id"].as_str()
+            } else {
+                params["turnId"].as_str()
+            };
+            if ids.turn.is_none() || event_turn != ids.turn.as_deref() {
+                continue;
+            }
+            match method {
+                "item/started" => match params["item"]["type"].as_str() {
+                    Some("commandExecution") => progress("Codex 正在执行项目命令".into()),
+                    Some("fileChange") => progress("Codex 正在修改项目文件".into()),
+                    Some("mcpToolCall") => progress("Codex 正在调用已配置工具".into()),
+                    _ => {}
+                },
+                "item/completed" => capture_answer(&params["item"], &mut answer)?,
+                "turn/completed" => {
+                    match params["turn"]["status"].as_str() {
+                        Some("completed") => {}
+                        Some("interrupted") => bail!("Codex 回合已中断"),
+                        Some("failed") => {
+                            bail!("Codex 回合执行失败，请检查本机登录、模型和执行器配置")
+                        }
+                        _ => bail!("Codex 返回了未知回合状态"),
+                    }
+                    if let Some(items) = params["turn"]["items"].as_array() {
+                        for item in items {
+                            capture_answer(item, &mut answer)?;
+                        }
+                    }
+                    return answer
+                        .filter(|text: &String| !text.trim().is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("Codex 回合结束但未返回最终结果"));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if expected == 0 || message["id"].as_u64() != Some(expected) {
+            continue;
+        }
+        if message.get("error").is_some() {
+            bail!("Codex 协议请求失败，请检查本机版本、登录和模型配置");
+        }
+        let result = &message["result"];
+        match expected {
+            1 => {
+                if !result.is_object() {
+                    bail!("Codex 初始化响应无效");
+                }
+                send(stdin, json!({"method":"initialized","params":{}})).await?;
+                let mut params = json!({
+                    "cwd":root,"approvalPolicy":"never","sandbox":"workspace-write",
+                    "ephemeral":true,
+                    "config":{
+                        "sandbox_workspace_write":{
+                            "writable_roots":[],"network_access":false,
+                            "exclude_tmpdir_env_var":true,"exclude_slash_tmp":true
+                        }
+                    },
+                    "developerInstructions":"使用简体中文说明进度和结果。仅修改当前项目目录内的文件，不请求额外权限。完成目标后报告真实修改与验证结果。"
+                });
+                if !model.trim().is_empty() {
+                    params["model"] = json!(model);
+                }
+                send(
+                    stdin,
+                    json!({"id":2,"method":"thread/start","params":params}),
+                )
+                .await?;
+                expected = 2;
+            }
+            2 => {
+                let thread = result["thread"]["id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Codex 未返回有效会话标识"))?;
+                verify_sandbox(result, root)?;
+                ids.thread = Some(thread.to_owned());
+                progress("Codex 已创建独立执行会话，权限限定为项目目录写入".into());
+                send(
+                    stdin,
+                    json!({"id":3,"method":"turn/start","params":{
+                        "threadId":thread,"cwd":root,"approvalPolicy":"never",
+                        "sandboxPolicy":{
+                            "type":"workspaceWrite","writableRoots":[root],"networkAccess":false,
+                            "excludeTmpdirEnvVar":true,"excludeSlashTmp":true
+                        },
+                        "input":[{"type":"text","text":objective}]
+                    }}),
+                )
+                .await?;
+                expected = 3;
+            }
+            3 => {
+                let turn = result["turn"]["id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Codex 未返回有效回合标识"))?;
+                if ids.turn.as_deref().is_some_and(|known| known != turn) {
+                    bail!("Codex 回合标识不一致");
+                }
+                ids.turn = Some(turn.to_owned());
+                progress("Codex 正在处理任务".into());
+                expected = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn verify_sandbox(result: &Value, root: &Path) -> Result<()> {
+    let sandbox = &result["sandbox"];
+    let roots = sandbox["writableRoots"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Codex 未确认项目目录权限限制"))?;
+    if result["approvalPolicy"] != "never"
+        || result["cwd"].as_str() != root.to_str()
+        || sandbox["type"] != "workspaceWrite"
+        || sandbox["networkAccess"] != false
+        || sandbox["excludeTmpdirEnvVar"] != true
+        || sandbox["excludeSlashTmp"] != true
+        || roots.iter().any(|entry| entry.as_str() != root.to_str())
+    {
+        bail!("Codex 返回的权限超出项目目录限制，任务已停止");
+    }
+    Ok(())
+}
+
+fn capture_answer(item: &Value, answer: &mut Option<String>) -> Result<()> {
+    if item["type"] == "agentMessage"
+        && (item["phase"].is_null() || item["phase"] == "final_answer")
+    {
+        let text = item["text"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Codex 最终消息格式无效"))?;
+        if text.len() > MAX_RESULT {
+            bail!("Codex 最终结果超过大小限制");
+        }
+        *answer = Some(text.to_owned());
+    }
+    Ok(())
+}
+
+async fn stop(child: &mut Child, process_id: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = process_id {
+        // Kill the isolated process group, including a running shell/tool.
+        let _ = timeout(
+            Duration::from_secs(1),
+            Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+        .await;
+    }
+    #[cfg(windows)]
+    if let Some(pid) = process_id {
+        let _ = timeout(
+            Duration::from_secs(2),
+            Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+        .await;
+    }
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
+
+    struct Project(std::path::PathBuf);
+
+    impl Project {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("codex-fixture-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/codex_fixture.py")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    async fn run(mode: &str, root: &Path) -> Result<String> {
+        timeout(
+            Duration::from_secs(8),
+            execute(&fixture(), mode, root, "本地测试目标", |_| {}, || false),
+        )
+        .await
+        .expect("fixture must terminate")
+    }
+
+    #[tokio::test]
+    async fn real_completion_and_final_message_are_required() {
+        let project = Project::new();
+        let progress = Mutex::new(Vec::new());
+        let output = execute(
+            &fixture(),
+            "success",
+            &project.0,
+            "本地测试目标",
+            |message| progress.lock().unwrap().push(message),
+            || false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "测试执行结果");
+        assert_eq!(
+            std::fs::read_to_string(project.0.join("fixture-result.txt")).unwrap(),
+            "真实本地夹具写入"
+        );
+        assert!(progress
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.contains("执行项目命令")));
+    }
+
+    #[tokio::test]
+    async fn failure_after_agent_message_is_not_reported_as_success() {
+        let project = Project::new();
+        let error = run("failure", &project.0).await.unwrap_err().to_string();
+        assert!(error.contains("执行失败"));
+        assert!(!error.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_thread_configuration_is_rejected_before_starting_turn() {
+        let project = Project::new();
+        let error = run("unsafe", &project.0).await.unwrap_err().to_string();
+        assert!(error.contains("权限超出"));
+        assert!(!project.0.join("fixture-started").exists());
+    }
+
+    #[tokio::test]
+    async fn cancelling_hanging_turn_interrupts_and_reaps_process() {
+        let project = Project::new();
+        let cancel = AtomicBool::new(false);
+        let binary = fixture();
+        let task = execute(
+            &binary,
+            "hang",
+            &project.0,
+            "本地测试目标",
+            |_| {},
+            || cancel.load(Ordering::SeqCst),
+        );
+        let cancel_later = async {
+            timeout(Duration::from_secs(5), async {
+                while !project.0.join("fixture-started").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            cancel.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::join!(task, cancel_later);
+        assert!(result.unwrap_err().to_string().contains("已取消"));
+        assert!(project.0.join("fixture-interrupted").exists());
+        let pid = std::fs::read_to_string(project.0.join("fixture-started")).unwrap();
+        let alive = Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(!alive.success(), "app-server was not reaped");
+    }
+
+    #[tokio::test]
+    async fn approval_request_is_denied_without_hanging() {
+        let project = Project::new();
+        let error = run("approval", &project.0).await.unwrap_err().to_string();
+        assert!(error.contains("不支持的授权"));
+        assert!(project.0.join("fixture-denied").exists());
+    }
+
+    #[tokio::test]
+    async fn malformed_truncated_and_oversized_streams_are_rejected() {
+        for (mode, expected) in [
+            ("eof", "回合完成前"),
+            ("malformed", "无法解析"),
+            ("oversize", "安全预算"),
+            ("rpc-error", "协议请求失败"),
+        ] {
+            let project = Project::new();
+            let error = run(mode, &project.0).await.unwrap_err().to_string();
+            assert!(error.contains(expected), "{mode}: {error}");
+            assert!(!error.contains("secret"));
+        }
+    }
+}

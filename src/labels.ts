@@ -61,7 +61,7 @@ const CAPABILITIES: Record<string, { name: string; description: string }> = {
   shell: { name: "项目命令", description: "可信本地命令执行。通过 HARNESS_ALLOW_COMMANDS=1 开启，不具备操作系统沙箱隔离。" },
   callback: { name: "本地回调", description: "将任务结果持久化回传到桌面和远程模拟器，无需再次调用模型。" },
   demo: { name: "演示执行器", description: "使用固定演示流程验证编排和回传，不修改项目。" },
-  codex: { name: "Codex 执行器", description: "外部 Codex 执行器，尚未接入。" },
+  codex: { name: "Codex 执行器", description: "调用本机 Codex CLI 执行子任务，使用本机登录状态与配置；可在角色设置中选择。" },
   coordinator: { name: "主智能体", description: "接收目标、生成计划，并在子任务结束后回顾与继续编排。" },
   main_agent: { name: "主智能体", description: "接收目标、生成计划，并在子任务结束后回顾与继续编排。" },
   mcp: { name: "MCP 工具", description: "外部工具协议接入，尚未启用。" },

@@ -31,7 +31,7 @@ impl Bridge {
     pub async fn ensure_daemon(&self, app: &AppHandle) -> Result<DaemonInfo, String> {
         let _guard = self.startup.lock().await;
         if let Ok(info) = read_daemon_info().await {
-            if self.healthy(&info).await {
+            if self.healthy(&info).await? {
                 return Ok(info);
             }
         }
@@ -41,7 +41,7 @@ impl Bridge {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
         while tokio::time::Instant::now() < deadline {
             if let Ok(info) = read_daemon_info().await {
-                if self.healthy(&info).await {
+                if self.healthy(&info).await? {
                     return Ok(info);
                 }
             }
@@ -50,21 +50,32 @@ impl Bridge {
         Err("后台服务未能在 6 秒内就绪，请检查安装文件和本机服务端口。".into())
     }
 
-    async fn healthy(&self, info: &DaemonInfo) -> bool {
+    async fn healthy(&self, info: &DaemonInfo) -> Result<bool, String> {
         let Ok(base) = validate_base_url(&info.base_url) else {
-            return false;
+            return Ok(false);
         };
         let Ok(url) = base.join("health") else {
-            return false;
+            return Ok(false);
         };
-        matches!(
-            self.client
-                .get(url)
-                .timeout(Duration::from_millis(400))
-                .send()
-                .await,
-            Ok(response) if response.status().is_success()
-        )
+        let Ok(response) = self
+            .client
+            .get(url)
+            .timeout(Duration::from_millis(400))
+            .send()
+            .await
+        else {
+            return Ok(false);
+        };
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+        let Ok(health) = response.json::<Value>().await else {
+            return Ok(false);
+        };
+        if health["version"].as_str() != Some(env!("CARGO_PKG_VERSION")) {
+            return Err("检测到仍在运行的旧版后台服务。请先结束旧版后台进程，再重新打开桌面；已有会话会保留。".into());
+        }
+        Ok(health["status"] == "ok")
     }
 }
 
@@ -138,7 +149,9 @@ fn validate_base_url(base_url: &str) -> Result<Url, String> {
 
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
     match (method, path) {
-        ("GET", "/api/v1/snapshot" | "/api/v1/settings") => Ok(Method::GET),
+        ("GET", "/api/v1/snapshot" | "/api/v1/settings" | "/api/v1/codex/status") => {
+            Ok(Method::GET)
+        }
         ("POST", "/api/v1/commands") => Ok(Method::POST),
         ("PUT", "/api/v1/settings") => Ok(Method::PUT),
         _ => Err("不允许使用此本机接口路径或请求方法".into()),
@@ -232,12 +245,14 @@ mod tests {
         assert!(validate_route("GET", "/api/v1/snapshot").is_ok());
         assert!(validate_route("POST", "/api/v1/commands").is_ok());
         assert!(validate_route("PUT", "/api/v1/settings").is_ok());
+        assert!(validate_route("GET", "/api/v1/codex/status").is_ok());
         for (method, path) in [
             ("DELETE", "/api/v1/commands"),
             ("GET", "/api/v1/../health"),
             ("GET", "//example.com/api/v1/snapshot"),
             ("GET", "/api/v1/snapshot?url=http://example.com"),
             ("GET", "/health"),
+            ("POST", "/api/v1/codex/status"),
         ] {
             assert!(validate_route(method, path).is_err());
         }

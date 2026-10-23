@@ -1,6 +1,7 @@
 @import "tailwindcss";
 
 :root {
+  color-scheme: light;
   font-family: "Geist", sans-serif;
   color: #292a2d;
   background: #fafafa;
@@ -417,6 +418,8 @@ textarea {
   flex-direction: column;
 }
 .topbar {
+  background: var(--bg);
+  color: var(--ink);
   height: 64px;
   flex-shrink: 0;
   display: flex;
@@ -1531,6 +1534,8 @@ textarea {
   margin-bottom: 20px;
 }
 .form-body input,
+.form-body select,
+.form-body textarea,
 .remote-label > select {
   display: block;
   border: 1px solid var(--line);
@@ -1541,6 +1546,102 @@ textarea {
   font-size: 11px;
   margin-top: 9px;
   height: 39px;
+}
+.form-body textarea {
+  height: auto;
+  min-height: 82px;
+  line-height: 1.7;
+  resize: vertical;
+}
+.agent-settings {
+  margin-top: 24px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+}
+.agent-settings-heading,
+.agent-settings-heading > div,
+.agent-editor-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+}
+.agent-settings-heading > div {
+  justify-content: flex-start;
+}
+.agent-settings-heading h3 {
+  font-size: 13px;
+  font-weight: 500;
+}
+.agent-settings-heading > span,
+.agent-editor-heading {
+  color: var(--secondary);
+  font-size: 10px;
+}
+.agent-settings > .help-text {
+  margin: 10px 0 16px;
+  line-height: 1.8;
+}
+.agent-settings label {
+  display: block;
+  font-size: 11px;
+}
+.agent-settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 16px 0 12px;
+}
+.agent-editor {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  border-radius: 10px;
+  padding: 12px 14px 14px;
+  margin: 0;
+  min-width: 0;
+}
+.agent-editor-heading {
+  margin-bottom: 10px;
+}
+.agent-editor-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  margin: 14px 0;
+}
+.agent-settings .codex-binary {
+  margin-top: 22px;
+}
+.codex-check {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+.codex-check > span,
+.codex-check-result {
+  font-size: 10px;
+  line-height: 1.8;
+  color: var(--secondary);
+}
+.codex-check-result {
+  margin-top: 9px;
+  overflow-wrap: anywhere;
+}
+.flow-agent {
+  display: block;
+  margin: -3px 0 7px;
+  font-size: 9px;
+  color: var(--secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 480px) {
+  .agent-editor-columns {
+    grid-template-columns: 1fr;
+  }
 }
 .form-body input::placeholder {
   color: var(--muted);
@@ -2333,8 +2434,8 @@ textarea {
 .plan-editor-heading { display: flex; align-items: center; justify-content: space-between; font-size: 10px; margin-bottom: 12px; color: var(--muted); }
 .plan-editor-heading > button { padding: 3px; color: var(--muted); }
 .plan-editor-heading > button:hover { color: var(--danger); }
-.plan-editor-node input:not([type="checkbox"]), .plan-editor-node textarea { display: block; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); width: 100%; padding: 8px; margin: 6px 0 12px; font-size: 11px; line-height: 1.7; }
-.plan-editor-node:disabled input, .plan-editor-node:disabled textarea { border-color: transparent; background: transparent; padding: 0; opacity: 1; color: var(--ink); }
+.plan-editor-node input:not([type="checkbox"]), .plan-editor-node textarea, .plan-editor-node select { display: block; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); width: 100%; padding: 8px; margin: 6px 0 12px; font-size: 11px; line-height: 1.7; }
+.plan-editor-node:disabled input, .plan-editor-node:disabled textarea, .plan-editor-node:disabled select { border-color: transparent; background: transparent; padding: 0; opacity: 1; color: var(--ink); }
 .plan-editor-node textarea { resize: vertical; min-height: 78px; }
 .dependency-options { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; max-height: 160px; overflow-y: auto; }
 .dependency-options > label { display: flex; align-items: center; gap: 7px; line-height: 1.7; }

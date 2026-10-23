@@ -8,6 +8,9 @@ import "@xyflow/react/dist/style.css";
 import "./styles.css";
 import App from "./App";
 
+document.documentElement.dataset.theme =
+  localStorage.getItem("harness-theme") === "dark" ? "dark" : "light";
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <App />

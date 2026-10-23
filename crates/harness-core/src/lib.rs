@@ -56,6 +56,28 @@ pub struct Message {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentProfile {
+    pub id: String,
+    pub name: String,
+    pub instructions: String,
+    pub executor: String,
+    pub model: String,
+}
+
+impl Default for AgentProfile {
+    fn default() -> Self {
+        Self {
+            id: "coder".into(),
+            name: "编程智能体".into(),
+            instructions: "根据任务目标检查项目、实施修改并验证结果；如实说明证据和限制。".into(),
+            executor: "native".into(),
+            model: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskRun {
     pub id: String,
     pub session_id: String,
@@ -64,6 +86,8 @@ pub struct TaskRun {
     pub objective: Option<String>,
     pub status: String,
     pub execution_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +115,8 @@ pub struct PlanNodeInput {
     pub id: String,
     pub title: String,
     pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
 }
@@ -100,6 +126,8 @@ pub struct PlanNode {
     pub id: String,
     pub title: String,
     pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub depends_on: Vec<String>,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,6 +147,10 @@ pub struct Plan {
     pub title: String,
     pub source: SourceContext,
     pub execution_mode: String,
+    #[serde(default)]
+    pub agents: Vec<AgentProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agent_id: Option<String>,
     pub status: String,
     pub revision: u32,
     pub round: u32,
@@ -221,6 +253,8 @@ pub enum Command {
         #[serde(default)]
         session_id: Option<String>,
         title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
     },
     CancelTask {
         task_id: String,

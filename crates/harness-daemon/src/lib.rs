@@ -1,4 +1,6 @@
+mod codex;
 mod coordinator;
+pub mod profiles;
 pub mod provider;
 pub mod store;
 
@@ -45,6 +47,12 @@ pub struct Settings {
     pub base_url: String,
     pub model: String,
     pub execution_mode: String,
+    #[serde(default = "profiles::default_agents")]
+    pub agents: Vec<profiles::AgentProfile>,
+    #[serde(default = "profiles::default_agent_id")]
+    pub default_agent_id: String,
+    #[serde(default = "default_codex_binary")]
+    pub codex_binary: String,
     #[serde(skip)]
     pub api_key: String,
 }
@@ -56,9 +64,33 @@ impl Default for Settings {
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
             model: std::env::var("HARNESS_MODEL").unwrap_or_default(),
             execution_mode: "native".into(),
+            agents: profiles::default_agents(),
+            default_agent_id: profiles::default_agent_id(),
+            codex_binary: default_codex_binary(),
             api_key: std::env::var("HARNESS_API_KEY").unwrap_or_default(),
         }
     }
+}
+
+fn default_codex_binary() -> String {
+    if let Ok(binary) = std::env::var("HARNESS_CODEX_BINARY") {
+        return binary;
+    }
+    let command = if cfg!(windows) { "codex.exe" } else { "codex" };
+    if let Some(binary) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(command))
+            .find(|candidate| candidate.is_file())
+    }) {
+        return binary.to_string_lossy().into_owned();
+    }
+    for directory in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let candidate = PathBuf::from(directory).join(command);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "codex".into()
 }
 
 impl Settings {
@@ -70,7 +102,9 @@ impl Settings {
         json!({
             "base_url": self.base_url, "model": self.model,
             "execution_mode": self.execution_mode, "configured": self.configured(),
-            "api_key_configured": !self.api_key.is_empty()
+            "api_key_configured": !self.api_key.is_empty(),
+            "agents":self.agents, "default_agent_id":self.default_agent_id,
+            "codex_binary":self.codex_binary
         })
     }
 }
@@ -109,6 +143,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/commands", post(command))
         .route("/api/v1/settings", get(settings).put(update_settings))
+        .route("/api/v1/codex/status", get(codex_status))
         .route("/api/v1/events", get(events))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
@@ -147,6 +182,69 @@ async fn settings(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(state.settings.read().unwrap().public())
 }
 
+async fn codex_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    use tokio::io::AsyncReadExt;
+
+    let binary = state.settings.read().unwrap().codex_binary.clone();
+    let mut command = tokio::process::Command::new(&binary);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    prepend_binary_directory(&mut command, &binary);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let probe = async {
+        let mut child = command.spawn().ok()?;
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()?
+            .take(129)
+            .read_to_end(&mut output)
+            .await
+            .ok()?;
+        if output.len() > 128 || !child.wait().await.ok()?.success() {
+            return None;
+        }
+        let text = String::from_utf8(output).ok()?;
+        let version = text.trim().strip_prefix("codex-cli ")?;
+        if version.is_empty()
+            || !version
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || ".-_+".contains(character))
+        {
+            return None;
+        }
+        Some(version.to_owned())
+    };
+    let version = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .ok()
+        .flatten();
+    Json(json!({
+        "available": version.is_some(), "version":version,
+        "message": if version.is_some() {"已找到本机 Codex CLI；登录状态和模型可用性在执行时检查"} else {"无法运行 Codex CLI，请检查可执行文件路径；此检测不会请求模型"}
+    }))
+}
+
+fn prepend_binary_directory(command: &mut tokio::process::Command, binary: &str) {
+    let path = std::path::Path::new(binary);
+    if path.is_absolute() {
+        if let Some(parent) = path.parent() {
+            let mut paths = vec![parent.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(path) = std::env::join_paths(paths) {
+                command.env("PATH", path);
+            }
+        }
+    }
+}
+
 async fn update_settings(
     State(state): State<Arc<AppState>>,
     Json(patch): Json<Value>,
@@ -158,6 +256,8 @@ async fn update_settings(
         ("model", &mut updated.model),
         ("execution_mode", &mut updated.execution_mode),
         ("api_key", &mut updated.api_key),
+        ("default_agent_id", &mut updated.default_agent_id),
+        ("codex_binary", &mut updated.codex_binary),
     ] {
         if let Some(value) = patch.get(field) {
             *target = value
@@ -168,6 +268,20 @@ async fn update_settings(
                 .trim()
                 .to_string();
         }
+    }
+    if let Some(agents) = patch.get("agents") {
+        updated.agents = serde_json::from_value(agents.clone())
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "子智能体角色配置格式无效".into()))?;
+    }
+    profiles::validate_agents(&updated.agents, &updated.default_agent_id)?;
+    if updated.codex_binary.trim().is_empty()
+        || updated.codex_binary.len() > 4096
+        || updated.codex_binary.contains(['\0', '\n', '\r'])
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Codex 可执行文件需要填写有效命令名或路径，参数由后台管理".into(),
+        ));
     }
     if !matches!(updated.execution_mode.as_str(), "native" | "demo") {
         return Err(ApiError(StatusCode::BAD_REQUEST, "执行模式无效".into()));
@@ -298,34 +412,82 @@ async fn run_task(state: Arc<AppState>, task: Value) {
     let result = if task["execution_mode"] == "demo" {
         demo(&state, &task_id).await
     } else {
-        let settings = state.settings.read().unwrap().clone();
+        let mut settings = state.settings.read().unwrap().clone();
+        let agent = task
+            .get("agent")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value::<profiles::AgentProfile>(value.clone()))
+            .transpose();
+        let agent = match agent {
+            Ok(Some(agent)) => agent,
+            Ok(None) => profiles::AgentProfile::default(),
+            Err(_) => {
+                finish(
+                    &state,
+                    &task_id,
+                    Err(anyhow::anyhow!("任务角色快照格式无效")),
+                );
+                return;
+            }
+        };
+        if !agent.model.trim().is_empty() {
+            settings.model = agent.model.clone();
+        }
+        let objective = task["objective"]
+            .as_str()
+            .or_else(|| task["title"].as_str())
+            .unwrap_or_default();
+        let objective = if agent.instructions.trim().is_empty() {
+            objective.to_owned()
+        } else {
+            format!(
+                "角色职责：\n{}\n\n任务目标：\n{objective}",
+                agent.instructions
+            )
+        };
         let state_for_log = state.clone();
         let task_for_log = task_id.clone();
         let task_for_cancel = task_id.clone();
         let state_for_cancel = state.clone();
-        provider::execute(
-            &settings,
-            &root,
-            task["objective"]
-                .as_str()
-                .or_else(|| task["title"].as_str())
-                .unwrap_or_default(),
-            move |detail| {
-                if let Ok(event) = state_for_log
-                    .store
-                    .lock()
-                    .unwrap()
-                    .progress(&task_for_log, &detail)
-                {
-                    state_for_log.publish(event);
-                }
-            },
-            move || cancelled(&state_for_cancel, &task_for_cancel),
-        )
-        .await
+        let progress = move |detail: String| {
+            if let Ok(event) = state_for_log
+                .store
+                .lock()
+                .unwrap()
+                .progress(&task_for_log, &detail)
+            {
+                state_for_log.publish(event);
+            }
+        };
+        let is_cancelled = move || cancelled(&state_for_cancel, &task_for_cancel);
+        match agent.executor.as_str() {
+            "native" => {
+                provider::execute(&settings, &root, &objective, progress, is_cancelled).await
+            }
+            "codex" => codex::execute(
+                &settings.codex_binary,
+                &agent.model,
+                &root,
+                &objective,
+                progress,
+                is_cancelled,
+            )
+            .await
+            .map(|text| redact_secret(&text, &settings.api_key))
+            .map_err(|error| anyhow::anyhow!(redact_secret(&error.to_string(), &settings.api_key))),
+            _ => Err(anyhow::anyhow!("任务角色使用了不支持的执行器")),
+        }
     };
     drop(permit);
     finish(&state, &task_id, result);
+}
+
+fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_owned()
+    } else {
+        text.replace(secret, "[凭证已隐藏]")
+    }
 }
 
 fn finish(state: &AppState, task_id: &str, result: anyhow::Result<String>) {
@@ -391,6 +553,68 @@ pub fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_settings_patch_cannot_partially_replace_roles_or_credentials() {
+        let state = AppState::open(std::path::Path::new(":memory:"), "test".into()).unwrap();
+        let original = state.settings.read().unwrap().clone();
+        let response = update_settings(
+            State(state.clone()),
+            Json(json!({
+                "api_key":"must-not-be-saved",
+                "default_agent_id":"missing",
+                "agents":original.agents,
+            })),
+        )
+        .await;
+        assert!(response.is_err());
+        let settings = state.settings.read().unwrap();
+        assert_eq!(settings.default_agent_id, original.default_agent_id);
+        assert_eq!(settings.api_key, original.api_key);
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .load_settings()
+                .unwrap()
+                .default_agent_id,
+            original.default_agent_id
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_preserves_roles_and_hides_api_key() {
+        let state = AppState::open(std::path::Path::new(":memory:"), "test".into()).unwrap();
+        let Json(public) = update_settings(
+            State(state.clone()),
+            Json(json!({
+                "agents":[{"id":"implementer","name":"编码","instructions":"先阅读项目规则",
+                    "executor":"codex","model":""}],
+                "default_agent_id":"implementer",
+                "codex_binary":"codex",
+                "api_key":"secret-api-key",
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(public["agents"][0]["executor"], "codex");
+        assert_eq!(public["default_agent_id"], "implementer");
+        assert!(public.get("api_key").is_none());
+        let saved = state.store.lock().unwrap().load_settings().unwrap();
+        assert_eq!(saved.agents[0].instructions, "先阅读项目规则");
+        assert_eq!(saved.codex_binary, "codex");
+        assert!(!serde_json::to_string(&saved)
+            .unwrap()
+            .contains("secret-api-key"));
+        for binary in ["", "codex\n--unsafe", "codex\0bad"] {
+            assert!(
+                update_settings(State(state.clone()), Json(json!({"codex_binary":binary})))
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn coordinator_accepts_and_cancels_while_worker_waits() {

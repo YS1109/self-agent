@@ -5,7 +5,11 @@ use harness_core::{new_id, now, RunEvent};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
-use crate::{event, Settings};
+use crate::{
+    event,
+    profiles::{default_agent_id, default_agents, resolve_agent, validate_agents, AgentProfile},
+    Settings,
+};
 
 const MAX_NODES: usize = 12;
 const MAX_ROUNDS: u64 = 3;
@@ -70,8 +74,26 @@ impl Store {
 
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
+        // Existing databases predate roles; migrate them to the original native role.
+        for mut plan in rows(&tx, "plans")? {
+            if plan.get("agents").is_none() {
+                plan["agents"] = json!(default_agents());
+                plan["default_agent_id"] = json!(default_agent_id());
+                put(&tx, "plans", &plan)?;
+            }
+        }
         // Coordinator requests may be retried; project mutations are never replayed.
         for mut job in rows(&tx, "coordinator_jobs")? {
+            if job.get("agents").is_none() {
+                let (agents, default_id) = if let Some(id) = job["plan_id"].as_str() {
+                    role_snapshot(&record(&tx, "plans", id)?)?
+                } else {
+                    (default_agents(), default_agent_id())
+                };
+                job["agents"] = json!(agents);
+                job["default_agent_id"] = json!(default_id);
+                put(&tx, "coordinator_jobs", &job)?;
+            }
             if job["status"] == "running" {
                 job["status"] = json!("pending");
                 job["updated_at"] = json!(now());
@@ -79,6 +101,10 @@ impl Store {
             }
         }
         for mut task in rows(&tx, "tasks")? {
+            if task["task_kind"] != "plan" && task.get("agent").is_none() {
+                task["agent"] = json!(AgentProfile::default());
+                put(&tx, "tasks", &task)?;
+            }
             if task["status"] == "running" && task["task_kind"] != "plan" {
                 task["status"] = json!("failed");
                 task["error"] = json!("后台在执行过程中重启。请检查已有项目修改后再安排后续工作；此任务没有自动重放。");
@@ -124,7 +150,8 @@ impl Store {
                 {"id":"workspace","name":"项目文件","kind":"tool","description":"在项目根目录内读取、列出、搜索和写入文件","enabled":true},
                 {"id":"shell","name":"项目命令","kind":"tool","description":"可信本机命令执行；通过 HARNESS_ALLOW_COMMANDS=1 开启，尚无系统级沙箱","enabled":shell_enabled},
                 {"id":"callback","name":"本地回调","kind":"tool","description":"持久化桌面和远程模拟器回调，固定投递到任务发起来源","enabled":true},
-                {"id":"codex","name":"Codex 执行器","kind":"executor","description":"计划接入，当前版本尚未实现","enabled":false},
+                {"id":"codex","name":"Codex 执行器","kind":"executor","description":"通过本机 Codex CLI 执行项目任务，需安装并完成登录配置","enabled":true},
+                {"id":"roles","name":"子智能体角色","kind":"agent","description":"配置角色指令、执行器和模型；计划节点按角色快照执行","enabled":true},
                 {"id":"mcp","name":"MCP 连接","kind":"mcp","description":"计划接入能力注册表","enabled":false},
                 {"id":"skills","name":"本地技能","kind":"skill","description":"计划支持限定范围的 SKILL.md 发现","enabled":false}
             ]
@@ -210,6 +237,7 @@ impl Store {
                 let needs_configuration =
                     settings.execution_mode == "native" && !settings.configured();
                 let job = json!({"id":job_id,"kind":"message","session_id":id,"source":source,"content":content,
+                    "agents":settings.agents,"default_agent_id":settings.default_agent_id,
                     "execution_mode":settings.execution_mode,"status":if needs_configuration {"failed"} else {"pending"},
                     "created_at":now(),"updated_at":now(),"error":if needs_configuration {Some(CONFIGURATION_HINT)} else {None}});
                 put(&tx, "coordinator_jobs", &job)?;
@@ -237,13 +265,20 @@ impl Store {
             "start_task" => {
                 let session_id = resolve_session(&tx, source, command)?;
                 let title = bounded_text(command, "title", 100_000)?;
-                if settings.execution_mode == "native" && !settings.configured() {
+                validate_agents(&settings.agents, &settings.default_agent_id)?;
+                let requested = requested_agent(command)?;
+                let agent = resolve_agent(&settings.agents, &settings.default_agent_id, requested)?;
+                if settings.execution_mode == "native"
+                    && agent.executor == "native"
+                    && (settings.base_url.trim().is_empty()
+                        || (settings.model.trim().is_empty() && agent.model.trim().is_empty()))
+                {
                     bail!(CONFIGURATION_HINT);
                 }
                 if active_task_count(&tx)? >= MAX_ACTIVE_TASKS {
                     bail!("后台任务已达到 32 个，请先完成或取消部分任务");
                 }
-                let task = worker_task(
+                let mut task = worker_task(
                     &session_id,
                     title,
                     &settings.execution_mode,
@@ -252,6 +287,7 @@ impl Store {
                     None,
                     None,
                 );
+                task["agent"] = json!(agent);
                 let id = text(&task, "id")?.to_string();
                 put(&tx, "tasks", &task)?;
                 let mut session = record(&tx, "sessions", &session_id)?;
@@ -279,8 +315,14 @@ impl Store {
                 if plan["status"] != "draft" {
                     bail!("只有草稿计划可以编辑");
                 }
-                let nodes =
-                    validate_nodes(command.get("nodes").context("缺少计划节点")?, &[], false)?;
+                let (agents, default_id) = role_snapshot(&plan)?;
+                let nodes = validate_nodes(
+                    command.get("nodes").context("缺少计划节点")?,
+                    &[],
+                    false,
+                    &agents,
+                    &default_id,
+                )?;
                 plan["nodes"] = json!(nodes);
                 touch_plan(&mut plan);
                 put(&tx, "plans", &plan)?;
@@ -297,7 +339,8 @@ impl Store {
                 }
                 match plan["status"].as_str() {
                     Some("draft") => {
-                        validate_nodes(&plan["nodes"], &[], false)?;
+                        let (agents, default_id) = role_snapshot(&plan)?;
+                        validate_nodes(&plan["nodes"], &[], false, &agents, &default_id)?;
                         let task_id = new_id();
                         let parent = json!({"id":task_id,"session_id":plan["session_id"],"title":plan["title"],
                         "task_kind":"plan","plan_id":id,"status":"running","execution_mode":plan["execution_mode"],
@@ -525,9 +568,11 @@ impl Store {
             .as_str()
             .map(|id| record(&self.db, "plans", id))
             .transpose()?;
+        let (agents, default_id) = role_snapshot(job)?;
         Ok(
             json!({"job":job,"session":{"id":session["id"],"title":session["title"],"project_path":session["project_path"]},
-            "messages":messages,"tasks":tasks,"plan":plan,"execution_mode":job["execution_mode"]}),
+            "messages":messages,"tasks":tasks,"plan":plan,"execution_mode":job["execution_mode"],
+            "agents":agents,"default_agent_id":default_id}),
         )
     }
 
@@ -748,7 +793,7 @@ fn worker_task(
     parent_task_id: Option<&str>,
 ) -> Value {
     json!({"id":new_id(),"session_id":session_id,"title":title,"objective":title,"task_kind":"worker","plan_id":plan_id,"node_id":node_id,"parent_task_id":parent_task_id,
-    "status":"queued","execution_mode":execution_mode,"created_at":now(),"updated_at":now(),"source":source,"steps":[
+    "agent":AgentProfile::default(),"status":"queued","execution_mode":execution_mode,"created_at":now(),"updated_at":now(),"source":source,"steps":[
         {"id":new_id(),"title":"理解任务目标","status":"queued"},
         {"id":new_id(),"title":"使用项目工具执行","status":"queued"},
         {"id":new_id(),"title":"汇报证据和限制","status":"queued"}
@@ -827,7 +872,36 @@ fn plan_event(plan: &Value, kind: &str, message: &str) -> RunEvent {
     )
 }
 
-fn validate_nodes(input: &Value, existing: &[Value], extension: bool) -> Result<Vec<Value>> {
+fn requested_agent(value: &Value) -> Result<Option<&str>> {
+    match value.get("agent_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(id)) if !id.trim().is_empty() => Ok(Some(id)),
+        _ => bail!("agent_id 必须是非空角色 ID 或 null"),
+    }
+}
+
+fn role_snapshot(value: &Value) -> Result<(Vec<AgentProfile>, String)> {
+    let agents = value
+        .get("agents")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_else(default_agents);
+    let default_id = value["default_agent_id"]
+        .as_str()
+        .unwrap_or("coder")
+        .to_owned();
+    validate_agents(&agents, &default_id)?;
+    Ok((agents, default_id))
+}
+
+fn validate_nodes(
+    input: &Value,
+    existing: &[Value],
+    extension: bool,
+    agents: &[AgentProfile],
+    default_id: &str,
+) -> Result<Vec<Value>> {
     let input = input.as_array().context("计划 nodes 必须是数组")?;
     if input.is_empty() || input.len() + existing.len() > MAX_NODES {
         bail!("计划必须包含 1 至 12 个节点，累计不能超过 12 个");
@@ -845,6 +919,7 @@ fn validate_nodes(input: &Value, existing: &[Value], extension: bool) -> Result<
         }
         let title = bounded_text(node, "title", 200)?;
         let objective = bounded_text(node, "objective", 100_000)?;
+        let agent = resolve_agent(agents, default_id, requested_agent(node)?)?;
         let deps = node["depends_on"]
             .as_array()
             .context("节点 depends_on 必须是数组")?;
@@ -861,7 +936,7 @@ fn validate_nodes(input: &Value, existing: &[Value], extension: bool) -> Result<
                 bail!("节点依赖不能重复：{id}");
             }
         }
-        nodes.push(json!({"id":id,"title":title,"objective":objective,"depends_on":deps,"status":"pending"}));
+        nodes.push(json!({"id":id,"title":title,"objective":objective,"agent_id":agent.id,"depends_on":deps,"status":"pending"}));
     }
     for node in &nodes {
         for dep in node["depends_on"].as_array().unwrap() {
@@ -931,6 +1006,7 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
             continue;
         }
         let original = plan.clone();
+        let (agents, default_id) = role_snapshot(&plan)?;
         let mut nodes = plan["nodes"]
             .as_array()
             .context("计划节点数据无效")?
@@ -995,6 +1071,11 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                         Some(text(&nodes[index], "id")?),
                         plan["task_id"].as_str(),
                     );
+                    task["agent"] = json!(resolve_agent(
+                        &agents,
+                        &default_id,
+                        requested_agent(&nodes[index])?,
+                    )?);
                     task["title"] = nodes[index]["title"].clone();
                     put(tx, "tasks", &task)?;
                     nodes[index]["status"] = json!("queued");
@@ -1059,7 +1140,7 @@ fn enqueue_review(tx: &Transaction<'_>, plan: &Value) -> Result<()> {
     put(
         tx,
         "coordinator_jobs",
-        &json!({"id":new_id(),"kind":"review","session_id":plan["session_id"],"plan_id":plan["id"],"plan_revision":plan["revision"],"source":plan["source"],"execution_mode":plan["execution_mode"],"status":"pending","created_at":now(),"updated_at":now()}),
+        &json!({"id":new_id(),"kind":"review","session_id":plan["session_id"],"plan_id":plan["id"],"plan_revision":plan["revision"],"source":plan["source"],"execution_mode":plan["execution_mode"],"agents":plan["agents"],"default_agent_id":plan["default_agent_id"],"status":"pending","created_at":now(),"updated_at":now()}),
     )
 }
 fn review_target_current(db: &Connection, job: &Value) -> Result<bool> {
@@ -1160,17 +1241,19 @@ fn prepare_outcome(db: &Connection, job: &Value, value: &Value) -> Result<Outcom
     let action = text(value, "action")?;
     let message = bounded_text(value, "message", 100_000)?.to_owned();
     if job["kind"] == "message" {
+        let (agents, default_id) = role_snapshot(job)?;
         return match action {
             "reply" => Ok(Outcome::Reply(message)),
             "plan" => Ok(Outcome::Draft {
                 message,
                 title: bounded_text(value, "title", 200)?.into(),
-                nodes: validate_nodes(&value["nodes"], &[], false)?,
+                nodes: validate_nodes(&value["nodes"], &[], false, &agents, &default_id)?,
             }),
             _ => bail!("主智能体返回了不支持的目标处理动作：{action}"),
         };
     }
     let plan = record(db, "plans", text(job, "plan_id")?)?;
+    let (agents, default_id) = role_snapshot(&plan)?;
     let nodes = plan["nodes"].as_array().context("计划节点数据无效")?;
     if !nodes.iter().all(|node| {
         matches!(
@@ -1203,7 +1286,7 @@ fn prepare_outcome(db: &Connection, job: &Value, value: &Value) -> Result<Outcom
             }
             Ok(Outcome::Extend {
                 message,
-                nodes: validate_nodes(&value["nodes"], nodes, true)?,
+                nodes: validate_nodes(&value["nodes"], nodes, true, &agents, &default_id)?,
             })
         }
         "wait_input" => Ok(Outcome::Wait(message)),
@@ -1234,7 +1317,9 @@ fn apply_outcome(
             title,
             nodes,
         } => {
+            let (agents, default_id) = role_snapshot(job)?;
             let plan = json!({"id":new_id(),"session_id":job["session_id"],"task_id":null,"title":title,"source":job["source"],
+                "agents":agents,"default_agent_id":default_id,
                 "execution_mode":job["execution_mode"],"status":"draft","revision":1,"round":0,"max_rounds":MAX_ROUNDS,
                 "created_at":now(),"updated_at":now(),"nodes":nodes});
             put(tx, "plans", &plan)?;
@@ -1312,6 +1397,30 @@ mod tests {
             execution_mode: "demo".into(),
             ..Settings::default()
         }
+    }
+
+    fn role_config() -> Settings {
+        Settings {
+            agents: vec![AgentProfile {
+                id: "reviewer".into(),
+                name: "代码审查".into(),
+                instructions: "仅依据实际文件和执行结果审查。".into(),
+                executor: "codex".into(),
+                model: "review-model".into(),
+            }],
+            default_agent_id: "reviewer".into(),
+            ..config()
+        }
+    }
+
+    fn send_with(store: &mut Store, command: Value, settings: &Settings) -> Value {
+        store
+            .command(
+                json!({"command_id":new_id(),"source":source(),"command":command}),
+                settings,
+            )
+            .unwrap()
+            .0
     }
     fn send(store: &mut Store, command: Value) -> Value {
         store
@@ -1452,6 +1561,7 @@ mod tests {
             model: "test-model".into(),
             execution_mode: "demo".into(),
             api_key: "never-store-this-secret".into(),
+            ..Settings::default()
         };
         store.save_settings(&settings).unwrap();
         let body: String = store
@@ -1465,6 +1575,227 @@ mod tests {
         let decoded: Settings = serde_json::from_str(&body).unwrap();
         assert_eq!(decoded.model, "test-model");
         assert!(decoded.api_key.is_empty());
+    }
+
+    #[test]
+    fn role_configuration_supports_old_settings_and_persists_new_profiles() {
+        let old: Settings = serde_json::from_value(json!({
+            "base_url":"http://localhost/v1","model":"old","execution_mode":"native"
+        }))
+        .unwrap();
+        assert_eq!(old.default_agent_id, "coder");
+        assert_eq!(old.agents[0].executor, "native");
+        assert!(!old.codex_binary.is_empty());
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.save_settings(&role_config()).unwrap();
+        let persisted = store.load_settings().unwrap();
+        assert_eq!(persisted.default_agent_id, "reviewer");
+        assert_eq!(
+            persisted.agents[0].instructions,
+            role_config().agents[0].instructions
+        );
+    }
+
+    #[test]
+    fn plan_roles_are_snapshotted_before_model_reply_and_keep_delayed_and_extended_tasks_stable() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let original = role_config();
+        send_with(
+            &mut store,
+            json!({"type":"send_message","content":"请规划审查"}),
+            &original,
+        );
+        let job = store.claim_coordinator_job().unwrap().unwrap();
+        assert_eq!(
+            store.coordinator_context(&job).unwrap()["agents"][0]["id"],
+            "reviewer"
+        );
+        store.save_settings(&config()).unwrap();
+        store
+            .complete_coordinator_job(
+                job["id"].as_str().unwrap(),
+                Ok(
+                    json!({"action":"plan","message":"待审阅","title":"角色计划","nodes":[
+                        node("a",&[]),node("b",&["a"])
+                    ]}),
+                ),
+            )
+            .unwrap();
+        let mut plan = store.snapshot().unwrap()["plans"][0].clone();
+        assert_eq!(plan["default_agent_id"], "reviewer");
+        assert_eq!(plan["nodes"][0]["agent_id"], "reviewer");
+        let edited = json!([node("a", &[]), node("b", &["a"])]);
+        send_with(
+            &mut store,
+            json!({"type":"update_plan","plan_id":plan["id"],"expected_revision":plan["revision"],"nodes":edited}),
+            &config(),
+        );
+        plan = store.snapshot().unwrap()["plans"][0].clone();
+        start(&mut store, &plan);
+        let first = store.claim_task().unwrap().unwrap();
+        assert_eq!(first["agent"], json!(original.agents[0]));
+        store
+            .finish(first["id"].as_str().unwrap(), Ok("检查完成".into()))
+            .unwrap();
+        let second = store.claim_task().unwrap().unwrap();
+        assert_eq!(second["agent"], first["agent"]);
+        store
+            .finish(second["id"].as_str().unwrap(), Ok("审查完成".into()))
+            .unwrap();
+        let review = store.claim_coordinator_job().unwrap().unwrap();
+        assert_eq!(review["agents"], plan["agents"]);
+        store
+            .complete_coordinator_job(
+                review["id"].as_str().unwrap(),
+                Ok(json!({"action":"extend","message":"追加验证","nodes":[node("c",&["b"])]})),
+            )
+            .unwrap();
+        let extension = store.claim_task().unwrap().unwrap();
+        assert_eq!(extension["agent"], first["agent"]);
+    }
+
+    #[test]
+    fn unknown_roles_are_rejected_for_direct_tasks_drafts_and_edits() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let bad_node = json!({"id":"a","title":"未知角色","objective":"检查","depends_on":[],"agent_id":"missing"});
+        assert!(store
+            .command(
+                json!({"command_id":new_id(),"source":source(),"command":{
+                    "type":"start_task","title":"检查","agent_id":"missing"
+                }}),
+                &config()
+            )
+            .is_err());
+        send(&mut store, json!({"type":"send_message","content":"规划"}));
+        let job = store.claim_coordinator_job().unwrap().unwrap();
+        store.complete_coordinator_job(
+            job["id"].as_str().unwrap(),
+            Ok(json!({"action":"plan","message":"草稿","title":"错误角色","nodes":[bad_node.clone()]}))
+        ).unwrap();
+        assert!(store.snapshot().unwrap()["plans"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let plan = draft(&mut store, json!([node("a", &[])]));
+        assert!(store.command(
+            json!({"command_id":new_id(),"source":source(),"command":{
+                "type":"update_plan","plan_id":plan["id"],"expected_revision":plan["revision"],"nodes":[bad_node]
+            }}), &config()
+        ).is_err());
+        assert_eq!(
+            store.snapshot().unwrap()["plans"][0]["revision"],
+            plan["revision"]
+        );
+    }
+
+    #[test]
+    fn direct_codex_tasks_do_not_require_main_model_and_keep_role_after_cancel_restart() {
+        let dir = std::env::temp_dir().join(new_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let task_id;
+        let native_role_id;
+        {
+            let mut store = Store::open(&path).unwrap();
+            session(&mut store);
+            let settings = Settings {
+                execution_mode: "native".into(),
+                model: String::new(),
+                ..role_config()
+            };
+            task_id = send_with(
+                &mut store,
+                json!({"type":"start_task","title":"检查项目"}),
+                &settings,
+            )["task_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let task = store.claim_task().unwrap().unwrap();
+            assert_eq!(task["agent"]["executor"], "codex");
+            send(&mut store, json!({"type":"cancel_task","task_id":task_id}));
+            let mut native = settings;
+            native.agents[0].executor = "native".into();
+            native_role_id = send_with(
+                &mut store,
+                json!({"type":"start_task","title":"使用角色模型"}),
+                &native,
+            )["task_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+        {
+            let mut store = Store::open(&path).unwrap();
+            let cancelled = record(&store.db, "tasks", &task_id).unwrap();
+            assert_eq!(cancelled["status"], "cancelled");
+            assert_eq!(cancelled["agent"]["model"], "review-model");
+            let pending = store.claim_task().unwrap().unwrap();
+            assert_eq!(pending["id"], native_role_id);
+            assert_eq!(pending["agent"]["executor"], "native");
+            assert_eq!(
+                pending["agent"]["instructions"],
+                role_config().agents[0].instructions
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restart_migrates_pre_role_plans_jobs_and_tasks_without_using_new_settings() {
+        let dir = std::env::temp_dir().join(new_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        {
+            let mut store = Store::open(&path).unwrap();
+            session(&mut store);
+            let plan = draft(&mut store, json!([node("a", &[])]));
+            let mut legacy_plan = plan;
+            legacy_plan.as_object_mut().unwrap().remove("agents");
+            legacy_plan
+                .as_object_mut()
+                .unwrap()
+                .remove("default_agent_id");
+            legacy_plan["nodes"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("agent_id");
+            put(&store.db, "plans", &legacy_plan).unwrap();
+            let task_id = send(&mut store, json!({"type":"start_task","title":"旧任务"}))
+                ["task_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let mut legacy_task = record(&store.db, "tasks", &task_id).unwrap();
+            legacy_task.as_object_mut().unwrap().remove("agent");
+            put(&store.db, "tasks", &legacy_task).unwrap();
+            send(
+                &mut store,
+                json!({"type":"send_message","content":"旧请求"}),
+            );
+            for mut job in rows(&store.db, "coordinator_jobs").unwrap() {
+                job.as_object_mut().unwrap().remove("agents");
+                job.as_object_mut().unwrap().remove("default_agent_id");
+                put(&store.db, "coordinator_jobs", &job).unwrap();
+            }
+            store.save_settings(&role_config()).unwrap();
+        }
+        {
+            let mut store = Store::open(&path).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let plan = &snapshot["plans"][0];
+            assert_eq!(plan["default_agent_id"], "coder");
+            assert_eq!(plan["agents"][0]["executor"], "native");
+            assert_eq!(snapshot["tasks"][0]["agent"]["id"], "coder");
+            let job = store.claim_coordinator_job().unwrap().unwrap();
+            assert_eq!(job["agents"][0]["id"], "coder");
+            start(&mut store, plan);
+            let task = store.claim_task().unwrap().unwrap();
+            assert_eq!(task["agent"]["executor"], "native");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn node(id: &str, dependencies: &[&str]) -> Value {

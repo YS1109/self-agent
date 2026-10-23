@@ -6,8 +6,8 @@ export interface PlanDraft {
 }
 export const createPlanDraft = (plan: Plan): PlanDraft => ({
   revision: plan.revision,
-  nodes: plan.nodes.map(({ id, title, objective, depends_on }) => ({
-    id, title, objective, depends_on: [...depends_on],
+  nodes: plan.nodes.map(({ id, title, objective, depends_on, agent_id }) => ({
+    id, title, objective, depends_on: [...depends_on], ...(agent_id ? { agent_id } : {}),
   })),
 });
 export const draftChanged = (draft: PlanDraft, plan: Plan) =>

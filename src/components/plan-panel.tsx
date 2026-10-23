@@ -18,6 +18,7 @@ export function PlanGraph({ plan, editableNodes }: { plan: Plan; editableNodes?:
         <div className="flow-node-content">
           <span className="flow-step">任务 {String(index + 1).padStart(2, "0")}</span>
           <strong>{node.title || "未命名任务"}</strong>
+          {(plan.agents?.length ?? 0) > 0 && <span className="flow-agent">{plan.agents?.find((agent) => agent.id === (node.agent_id || plan.default_agent_id))?.name ?? "默认角色"}</span>}
           <Status status={status} />
         </div>
       ) },
@@ -140,6 +141,12 @@ export function PlanPanel({
               </div>
               <label>任务标题<input value={node.title} onChange={(event) => changeNode(node.id, { title: event.target.value })} /></label>
               <label>任务描述<textarea value={node.objective} rows={3} onChange={(event) => changeNode(node.id, { objective: event.target.value })} /></label>
+              {!!plan.agents?.length && <label>执行角色
+                <select value={node.agent_id || ""} onChange={(event) => changeNode(node.id, { agent_id: event.target.value || undefined })}>
+                  <option value="">计划默认 · {plan.agents.find((agent) => agent.id === plan.default_agent_id)?.name ?? "默认角色"}</option>
+                  {plan.agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · {agent.executor === "codex" ? "Codex CLI" : "原生工具循环"}</option>)}
+                </select>
+              </label>}
               <div className="dependency-label">依赖任务</div>
               {editable ? <div className="dependency-options">
                 {draft.nodes.filter((item) => item.id !== node.id).map((item) => <label key={item.id}>

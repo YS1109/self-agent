@@ -39,6 +39,14 @@ export interface TaskRun {
   plan_id?: string | null;
   node_id?: string | null;
   task_kind?: "worker" | "plan";
+  agent?: AgentProfile | null;
+}
+export interface AgentProfile {
+  id: string;
+  name: string;
+  instructions: string;
+  executor: "native" | "codex";
+  model: string;
 }
 export interface PlanNode {
   id: string;
@@ -49,8 +57,9 @@ export interface PlanNode {
   task_id?: string | null;
   result?: string | null;
   error?: string | null;
+  agent_id?: string | null;
 }
-export type EditablePlanNode = Pick<PlanNode, "id" | "title" | "objective" | "depends_on">;
+export type EditablePlanNode = Pick<PlanNode, "id" | "title" | "objective" | "depends_on" | "agent_id">;
 export interface Plan {
   id: string;
   session_id: string;
@@ -67,6 +76,8 @@ export interface Plan {
   summary?: string | null;
   error?: string | null;
   nodes: PlanNode[];
+  agents?: AgentProfile[];
+  default_agent_id?: string | null;
 }
 export interface Delivery {
   id: string;
@@ -110,6 +121,9 @@ export interface Settings {
   model: string;
   configured: boolean;
   execution_mode: "native" | "demo";
+  agents: AgentProfile[];
+  default_agent_id: string;
+  codex_binary: string;
 }
 export type Command =
   | { type: "create_session"; title: string; project_path: string }

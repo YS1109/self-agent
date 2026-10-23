@@ -48,6 +48,8 @@ import {
 import { api, dispatch } from "./api";
 import { PlanPanel } from "./components/plan-panel";
 import { Status } from "./components/status";
+import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/agent-settings";
+import { syncNativeTheme, type AppTheme } from "./theme";
 import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./labels";
 import { Button } from "./components/ui/button";
 import {
@@ -147,7 +149,7 @@ function TaskCard({
           <span>
             {task.execution_mode === "demo"
               ? "演示模式 · 模拟执行"
-              : "原生执行器"}
+              : task.task_kind === "plan" ? "主智能体编排" : task.agent ? `${task.agent.name} · ${task.agent.executor === "codex" ? "Codex CLI" : "原生执行器"}` : "原生执行器"}
           </span>
           <span>
             {done}/{task.steps.length} 步骤
@@ -200,14 +202,19 @@ export default function App() {
     model: "",
     configured: false,
     execution_mode: "native",
+    agents: [{ ...DEFAULT_AGENT }],
+    default_agent_id: DEFAULT_AGENT.id,
+    codex_binary: "codex",
   });
   const [settingsForm, setSettingsForm] = useState<Settings>(settings);
-  const [theme, setTheme] = useState(
-    () => localStorage.getItem("harness-theme") ?? "light",
+  const [theme, setTheme] = useState<AppTheme>(
+    () => localStorage.getItem("harness-theme") === "dark" ? "dark" : "light",
   );
   const [createTitle, setCreateTitle] = useState("");
   const [createPath, setCreatePath] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [codexStatus, setCodexStatus] = useState("");
+  const [checkingCodex, setCheckingCodex] = useState(false);
   const [remoteText, setRemoteText] = useState("");
   const [remoteSource, setRemoteSource] =
     useState<SourceContext>(REMOTE_SOURCE);
@@ -262,18 +269,22 @@ export default function App() {
   useEffect(() => {
     if (connected)
       api<Settings>("GET", "/settings")
-        .then(setSettings)
+        .then((value) => setSettings(normalizeSettings(value)))
         .catch(() => {});
   }, [connected]);
   useEffect(() => {
     if (modal === "settings") {
       setSettingsForm(settings);
       setApiKey("");
+      setCodexStatus("");
     }
   }, [modal]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("harness-theme", theme);
+    void syncNativeTheme(theme).catch(() => {
+      setNotice("原生窗口主题同步失败，请重启应用后重试。");
+    });
   }, [theme]);
   useEffect(() => {
     const desktop = window.matchMedia("(min-width: 761px)");
@@ -363,9 +374,12 @@ export default function App() {
         base_url: settingsForm.base_url,
         model: settingsForm.model,
         execution_mode: settingsForm.execution_mode,
+        agents: settingsForm.agents,
+        default_agent_id: settingsForm.default_agent_id,
+        codex_binary: settingsForm.codex_binary,
         ...(apiKey ? { api_key: apiKey } : {}),
       });
-      setSettings(value);
+      setSettings(normalizeSettings(value));
       setApiKey("");
       setModal(null);
     } catch (error) {
@@ -387,6 +401,18 @@ export default function App() {
         `已接收 · ${receipt.command_id.slice(0, 8)}${receipt.task_id ? ` · 任务 ${receipt.task_id.slice(0, 8)}` : ""}`,
       );
       setRemoteText((current) => current === remoteText ? "" : current);
+    }
+  }
+  async function checkCodex() {
+    setCheckingCodex(true);
+    setCodexStatus("");
+    try {
+      const result = await api<{ available: boolean; version: string | null; message: string }>("GET", "/codex/status");
+      setCodexStatus(`${result.available ? "检测通过" : "暂不可用"} · ${result.message}${result.version ? ` · ${result.version}` : ""}`);
+    } catch (error) {
+      setCodexStatus(errorMessage(error));
+    } finally {
+      setCheckingCodex(false);
     }
   }
   const togglePanel = (value: Panel) =>
@@ -501,7 +527,7 @@ export default function App() {
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-                <small>本地优先 · v0.2</small>
+                <small>本地优先 · v0.3</small>
               </span>
               <Settings2 size={15} />
             </button>
@@ -773,7 +799,7 @@ export default function App() {
                     <span
                       className={`mode-pill ${settings.execution_mode === "demo" ? "mode-demo" : ""}`}
                     >
-                      {settings.execution_mode === "demo" ? "演示" : "原生"}
+                      {settings.execution_mode === "demo" ? "演示" : "真实执行"}
                     </span>
                   </div>
                   <div className="composer-submit">
@@ -791,6 +817,7 @@ export default function App() {
                       size="small"
                       disabled={!connected || !session || !draft.trim() || busy}
                       onClick={() => void send(true)}
+                      title={`由默认角色「${settings.agents.find((agent) => agent.id === settings.default_agent_id)?.name ?? "编码助手"}」直接执行`}
                     >
                       <ArrowUp size={14} />
                       <span>直接执行</span>
@@ -885,7 +912,7 @@ export default function App() {
                     <span>
                       {selectedTask.execution_mode === "demo"
                         ? "演示模式 · 模拟任务"
-                        : "原生模式 · 真实执行"}
+                        : selectedTask.agent ? `${selectedTask.agent.name} · ${selectedTask.agent.executor === "codex" ? "Codex CLI" : "原生工具循环"}` : "真实执行"}
                     </span>
                     <code>{selectedTask.id.slice(0, 8)}</code>
                   </div>
@@ -1019,7 +1046,7 @@ export default function App() {
             <span>
               {settings.execution_mode === "demo"
                 ? "模拟执行模式"
-                : "原生执行器"}
+                : "真实执行模式"}
             </span>
             <button onClick={() => setModal("settings")} aria-label="打开设置">
               <Settings2 size={12} />
@@ -1095,7 +1122,8 @@ export default function App() {
         open={modal === "settings"}
         onClose={() => setModal(null)}
         title="模型与执行"
-        description="连接你自己的模型网关，由本机后台直接调用。"
+        description="配置主智能体的模型网关，以及执行子任务的角色和执行器。"
+        wide
       >
         <form onSubmit={saveSettings} className="form-body">
           <div className="mode-selector">
@@ -1109,8 +1137,8 @@ export default function App() {
               }
             >
               <Code2 size={19} />
-              <strong>原生模式</strong>
-              <span>真实模型与工具循环</span>
+              <strong>真实执行</strong>
+              <span>按角色选择执行器</span>
               {settingsForm.execution_mode === "native" && (
                 <CheckCircle2 size={15} />
               )}
@@ -1133,7 +1161,7 @@ export default function App() {
             </button>
           </div>
           <label>
-            模型服务地址
+            主智能体 · 模型服务地址
             <input
               type="url"
               placeholder="https://api.example.com/v1"
@@ -1144,7 +1172,7 @@ export default function App() {
             />
           </label>
           <label>
-            模型名称
+            主智能体 · 模型名称
             <input
               placeholder="输入网关支持的模型 ID"
               value={settingsForm.model}
@@ -1175,6 +1203,14 @@ export default function App() {
               Chat Completions。
             </p>
           </div>
+          <AgentSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy} />
+          <div className="codex-check">
+            <Button type="button" size="small" variant="secondary" disabled={busy || checkingCodex || !connected || settingsForm.codex_binary !== settings.codex_binary} onClick={() => void checkCodex()}>
+              {checkingCodex ? <Loader2 size={13} className="spin" /> : <Terminal size={13} />}检测 Codex
+            </Button>
+            <span>{settingsForm.codex_binary !== settings.codex_binary ? "路径已修改，请先保存设置再检测。" : "检测已保存的 CLI 路径，不验证模型连接或登录状态。"}</span>
+          </div>
+          {codexStatus && settingsForm.codex_binary === settings.codex_binary && <p className="codex-check-result" role="status">{codexStatus}</p>}
           {settingsForm.execution_mode === "demo" && (
             <div className="demo-warning">
               演示模式只验证编排和回传链路，不修改项目，也不运行真实测试。
