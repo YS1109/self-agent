@@ -72,10 +72,10 @@ class Daemon:
 
         def ready():
             if self.process.poll() is not None:
-                raise RuntimeError((self.directory / "smoke.log").read_text())
+                raise RuntimeError((self.directory / "smoke.log").read_text(encoding="utf-8"))
             with urllib.request.urlopen(self.base + "/health", timeout=1) as response:
                 health = json.load(response)
-            info = json.loads((self.directory / "daemon.json").read_text())
+            info = json.loads((self.directory / "daemon.json").read_text(encoding="utf-8"))
             if info["pid"] != self.process.pid:
                 return False
             assert health["status"] == "ok"

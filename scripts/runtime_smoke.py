@@ -20,7 +20,7 @@ from smoke import Daemon, DESKTOP, REMOTE, wait_for
 
 CHECK = "python3 test_calc.py" if sys.platform != "win32" else "python test_calc.py"
 REAL_CODEX = False
-TEST = "from pathlib import Path\nexec(compile(Path('calc.py').read_text(), 'calc.py', 'exec'))\nassert add(2, 3) == 5\nprint('ACCEPTANCE_OK')\n"
+TEST = "from pathlib import Path\nexec(compile(Path('calc.py').read_text(encoding='utf-8'), 'calc.py', 'exec'))\nassert add(2, 3) == 5\nprint('ACCEPTANCE_OK')\n"
 
 
 def node(identifier, objective, dependencies=None, **fields):
@@ -119,9 +119,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="self-agent-runtime-") as directory:
         project = Path(directory) / "project"
         project.mkdir()
-        (project / "test_calc.py").write_text(TEST)
+        (project / "test_calc.py").write_text(TEST, encoding="utf-8")
         (project / "AGENTS.md").write_text(
-            "仅操作当前隔离测试项目。不要联网，不调用MCP。不改test_calc.py。按任务执行。\n"
+            "仅操作当前隔离测试项目。不要联网，不调用MCP。不改test_calc.py。按任务执行。\n",
+            encoding="utf-8",
         )
         daemon = Daemon(directory, {"HARNESS_ALLOW_COMMANDS": "1"})
         try:
@@ -171,8 +172,8 @@ def main():
             assert by_id["verify"]["status"] == "completed"
             assert any(e["command"] == CHECK and e["exit_code"] == 0
                        and "ACCEPTANCE_OK" in e["output"] for e in by_id["verify"]["evidence"])
-            assert "a + b" in (project / "calc.py").read_text()
-            assert (project / "test_calc.py").read_text() == TEST
+            assert "a + b" in (project / "calc.py").read_text(encoding="utf-8")
+            assert (project / "test_calc.py").read_text(encoding="utf-8") == TEST
             expected = {t["id"] for t in daemon.snapshot()["tasks"] if t.get("plan_id") == plan_id}
             callbacks = wait_for(lambda: (items if len(items := [
                 d for d in daemon.snapshot()["deliveries"] if d["task_id"] in expected and d["status"] == "sent"

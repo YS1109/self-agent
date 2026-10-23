@@ -112,7 +112,7 @@ def main():
                     task = wait_for(finished, description=objective)
                     assert task["status"] == "completed", task
                     assert task["execution_mode"] == "native"
-                assert (project / "proof.txt").read_text() == "Written by the native agent tool loop.\n"
+                assert (project / "proof.txt").read_text(encoding="utf-8") == "Written by the native agent tool loop.\n"
                 assert not (Path(temporary) / "outside.txt").exists()
                 assert len(ModelFixture.observations) == 2
                 assert "fixture-not-a-real-secret" not in json.dumps(daemon.snapshot())

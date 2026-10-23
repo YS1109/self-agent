@@ -254,7 +254,7 @@ def main():
                 )
                 assert completed["status"] == "completed", completed
                 assert len(completed["nodes"]) == 3, completed
-                assert (project / "report.txt").read_text() == "依赖已读取并验证\n"
+                assert (project / "report.txt").read_text(encoding="utf-8") == "依赖已读取并验证\n"
                 parent_id = completed["task_id"]
                 callback = wait_for(
                     lambda: next(
