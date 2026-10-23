@@ -78,6 +78,13 @@ impl Default for AgentProfile {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommandEvidence {
+    pub command: String,
+    pub exit_code: i32,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskRun {
     pub id: String,
     pub session_id: String,
@@ -104,6 +111,8 @@ pub struct TaskRun {
     pub error: Option<String>,
     pub source: SourceContext,
     pub steps: Vec<TaskStep>,
+    #[serde(default)]
+    pub evidence: Vec<CommandEvidence>,
 }
 
 fn worker_kind() -> String {
@@ -119,6 +128,12 @@ pub struct PlanNodeInput {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub repairs: Vec<String>,
+    #[serde(default)]
+    pub verifies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,6 +151,16 @@ pub struct PlanNode {
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default)]
+    pub repairs: Vec<String>,
+    #[serde(default)]
+    pub verifies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_command: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<CommandEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,6 +177,8 @@ pub struct Plan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_agent_id: Option<String>,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_from_status: Option<String>,
     pub revision: u32,
     pub round: u32,
     pub max_rounds: u32,
@@ -162,6 +189,8 @@ pub struct Plan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub nodes: Vec<PlanNode>,
+    #[serde(default)]
+    pub used_node_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -263,6 +292,19 @@ pub enum Command {
         plan_id: String,
         expected_revision: u32,
         nodes: Vec<PlanNodeInput>,
+    },
+    PatchPlan {
+        plan_id: String,
+        expected_revision: u32,
+        nodes: Vec<PlanNodeInput>,
+    },
+    PausePlan {
+        plan_id: String,
+        expected_revision: u32,
+    },
+    ResumePlan {
+        plan_id: String,
+        expected_revision: u32,
     },
     StartPlan {
         plan_id: String,

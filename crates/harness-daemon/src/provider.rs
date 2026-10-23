@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
+use harness_core::CommandEvidence;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -16,14 +17,26 @@ const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Native v0 deliberately uses Chat Completions-compatible models only.
-pub async fn execute(
+#[cfg(test)]
+async fn execute(
     settings: &Settings,
     root: &Path,
     objective: &str,
     progress: impl Fn(String),
     cancelled: impl Fn() -> bool,
 ) -> Result<String> {
-    execute_inner(settings, root, objective, progress, cancelled)
+    execute_with_evidence(settings, root, objective, progress, cancelled, |_| {}).await
+}
+
+pub async fn execute_with_evidence(
+    settings: &Settings,
+    root: &Path,
+    objective: &str,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+    evidence: impl Fn(CommandEvidence),
+) -> Result<String> {
+    execute_inner(settings, root, objective, progress, cancelled, evidence)
         .await
         .map(|text| redact(&text, &settings.api_key))
         .map_err(|error| anyhow!(redact(&error.to_string(), &settings.api_key)))
@@ -43,6 +56,7 @@ async fn execute_inner(
     objective: &str,
     progress: impl Fn(String),
     cancelled: impl Fn() -> bool,
+    evidence: impl Fn(CommandEvidence),
 ) -> Result<String> {
     if !settings.configured() {
         bail!("模型配置不可用，请先配置兼容的模型服务，再继续原生执行");
@@ -169,6 +183,15 @@ async fn execute_inner(
                 }
                 Err(_) => Err(anyhow!("工具调用参数不是有效 JSON")),
             };
+            if name == "run_command" {
+                if let (Ok(value), Ok(arguments)) =
+                    (&result, serde_json::from_str::<Value>(arguments))
+                {
+                    if let Some(record) = command_evidence(value, &arguments, &settings.api_key) {
+                        evidence(record);
+                    }
+                }
+            }
             if cancelled() {
                 bail!("任务已取消");
             }
@@ -180,6 +203,44 @@ async fn execute_inner(
         }
     }
     bail!("原生执行已达到 10 轮预算，请检查已有改动后创建后续任务继续。")
+}
+
+fn command_evidence(value: &Value, arguments: &Value, secret: &str) -> Option<CommandEvidence> {
+    let command = redact_evidence(arguments["command"].as_str()?, secret);
+    if command.len() > 16 * 1024 {
+        return None;
+    }
+    let exit_code = i32::try_from(value["exit_code"].as_i64()?).ok()?;
+    let output = format!(
+        "{}{}",
+        value["stdout"].as_str().unwrap_or_default(),
+        value["stderr"].as_str().unwrap_or_default()
+    );
+    Some(CommandEvidence {
+        command,
+        exit_code,
+        output: bounded_redacted(&output, secret),
+    })
+}
+
+fn bounded_redacted(text: &str, secret: &str) -> String {
+    let mut text = redact_evidence(text, secret);
+    let mut end = text.len().min(16 * 1024);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+fn redact_evidence(text: &str, secret: &str) -> String {
+    let mut text = redact(text, secret);
+    for name in ["HARNESS_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(secret) = std::env::var(name) {
+            text = redact(&text, &secret);
+        }
+    }
+    text
 }
 
 async fn interruptible<T>(
@@ -439,6 +500,46 @@ fn walk(root: &Path, start: &Path, query: Option<&str>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_model_configuration_still_rejects_legacy_execute() {
+        assert!(execute(
+            &Settings {
+                model: String::new(),
+                ..Settings::default()
+            },
+            &std::env::temp_dir(),
+            "本地目标",
+            |_| {},
+            || false
+        )
+        .await
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn records_actual_failed_command_and_redacts_bounded_output() {
+        let arguments = json!({"command":"printf 'private-test-key'; printf '失败' >&2; exit 7"});
+        let value = tool(
+            &std::env::temp_dir(),
+            "run_command",
+            arguments.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        let evidence = command_evidence(&value, &arguments, "private-test-key").unwrap();
+        assert_eq!(evidence.exit_code, 7);
+        assert!(evidence.output.contains("失败"));
+        assert!(!evidence.output.contains("private-test-key"));
+        assert!(!evidence.command.contains("private-test-key"));
+        let output = bounded_redacted(&"中文证据".repeat(10_000), "");
+        assert!(output.len() <= 16 * 1024);
+        assert!(command_evidence(&json!({"exit_code":null}), &arguments, "").is_none());
+        assert!(command_evidence(&json!({"content":"测试通过"}), &arguments, "").is_none());
+    }
+
     #[test]
     fn rejects_traversal_and_nonexistent_parent() {
         let root = std::env::temp_dir();

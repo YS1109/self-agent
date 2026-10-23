@@ -47,6 +47,7 @@ import {
 } from "lucide-react";
 import { api, dispatch } from "./api";
 import { PlanPanel } from "./components/plan-panel";
+import { ExecutionEvidence } from "./components/execution-evidence";
 import { Status } from "./components/status";
 import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/agent-settings";
 import { syncNativeTheme, type AppTheme } from "./theme";
@@ -487,7 +488,7 @@ export default function App() {
                       {pending && (
                         <span
                           className="running-dot"
-                          aria-label="有任务运行中"
+                          aria-label="有任务运行或排队"
                         />
                       )}
                     </button>
@@ -527,7 +528,7 @@ export default function App() {
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-                <small>本地优先 · v0.3</small>
+                <small>本地优先 · v0.4.0</small>
               </span>
               <Settings2 size={15} />
             </button>
@@ -758,7 +759,7 @@ export default function App() {
                     className={running.length ? "running-dot" : "idle-dot"}
                   />
                   {running.length
-                    ? `${running.length} 个后台任务正在进行`
+                    ? `${running.length} 个后台任务尚未完成`
                     : "准备就绪，随时开始"}
                 </span>
                 {running.length > 0 && <span>主智能体 仍可接收指令</span>}
@@ -952,6 +953,7 @@ export default function App() {
                       </pre>
                     </div>
                   )}
+                  <ExecutionEvidence evidence={selectedTask.evidence} />
                   <div className="detail-divider" />
                   <div className="section-label">指令来源 / 回传位置</div>
                   <div className="source-card">

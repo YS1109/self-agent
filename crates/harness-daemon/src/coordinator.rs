@@ -21,11 +21,13 @@ const SYSTEM_PROMPT: &str = r#"你是本地编程工作台的主 Agent。默认�
 若用户提出可执行目标，输出 {"action":"plan","message":"中文说明","title":"计划标题","nodes":[{"id":"step-1","title":"任务标题","objective":"完整可独立执行的目标、必要上下文和验证要求","depends_on":[]}]}。
 计划先形成草稿供用户审阅，不能声称已经启动。节点数为 1 到 12，ID 唯一，依赖必须存在且不能成环。将适合并行的独立任务拆开，只为真实先后关系添加依赖。若信息不足，先回复澄清事项。
 当 kind=review：
-仅根据实际子任务结果判断。全部成功且目标已达成时输出 {"action":"complete","message":"真实结果、验证和限制的中文总结"}。
+仅根据实际子任务结果判断。所有节点完成或历史失败已有效验收解决，且目标已达成时输出 {"action":"complete","message":"真实结果、验证和限制的中文总结"}。
 仍有可执行的修复或补充时输出 {"action":"extend","message":"补充原因","nodes":[{"id":"新的唯一ID","title":"任务标题","objective":"包含修复背景和验证要求的完整目标","depends_on":[]}]}。
 追加节点 ID 不得与现有节点冲突；可依赖已成功节点或本轮新增节点，不能依赖失败、取消、阻塞节点。累计最多 12 节点，最多 3 轮。避免重复执行已经完成的工作。
 有失败、结果不可信、达到预算或需要用户选择时输出 {"action":"wait_input","message":"明确说明现状以及需要用户决定的事项"}。
-有失败节点时不得 complete，不得虚构成功，不得以缺少测试证据代替真实验证。"#;
+修复失败时，在修复节点添加 repairs:["失败节点ID"]，不要把失败节点放进 depends_on；可修复 failed、blocked、cancelled 的历史节点。
+另建验收节点，添加 verifies:["失败节点ID"]、depends_on:["对应修复节点ID"] 和 acceptance_command:"需要实际运行且退出码为0的完整命令"。验收节点必须依赖对应修复节点；验收命令需要与执行器实际记录的 command 去掉首尾空白后完全一致，请在目标中明确要求执行该命令。
+已有失败记录会保留；只有完成的验收节点带有实际成功命令证据时，后台才设置原失败节点的 resolved_by。所有节点已完成或失败已被验收解决，且目标达成，才可 complete。未解决失败、缺少证据时不得虚构成功。"#;
 
 /// The coordinator has its own worker so model latency never occupies a task worker.
 pub fn spawn(state: Arc<AppState>) {
@@ -232,6 +234,29 @@ fn parse_response(kind: &str, body: &Value) -> Result<Value> {
             {
                 bail!("主 Agent 节点依赖格式无效");
             }
+            for field in ["repairs", "verifies"] {
+                if let Some(value) = node.get(field) {
+                    let ids = value.as_array().context("修复与验收关系必须为数组")?;
+                    if ids.len() > 12
+                        || ids
+                            .iter()
+                            .any(|id| id.as_str().is_none_or(|id| id.is_empty() || id.len() > 128))
+                    {
+                        bail!("主 Agent 节点的修复与验收标识无效");
+                    }
+                }
+            }
+            if node
+                .get("acceptance_command")
+                .filter(|value| !value.is_null())
+                .is_some_and(|value| {
+                    value
+                        .as_str()
+                        .is_none_or(|command| command.trim().is_empty() || command.len() > 16_000)
+                })
+            {
+                bail!("验收命令必须为非空文本，且不超过 16000 字节");
+            }
         }
         validated["nodes"] = nodes
             .iter()
@@ -239,7 +264,10 @@ fn parse_response(kind: &str, body: &Value) -> Result<Value> {
                 json!({
                     "id":node["id"],"title":node["title"],
                     "objective":node["objective"],"depends_on":node["depends_on"],
-                    "agent_id":node["agent_id"]
+                    "agent_id":node["agent_id"],
+                    "repairs":node.get("repairs").cloned().unwrap_or(json!([])),
+                    "verifies":node.get("verifies").cloned().unwrap_or(json!([])),
+                    "acceptance_command":node["acceptance_command"]
                 })
             })
             .collect();
@@ -358,6 +386,30 @@ mod tests {
             output["nodes"][0]["agent_id"] = invalid;
             assert!(parse_response("message", &response(output.clone())).is_err());
         }
+    }
+
+    #[test]
+    fn review_preserves_repair_contract_and_rejects_malformed_relationships() {
+        let mut output = json!({
+            "action":"extend","message":"修复后复验",
+            "nodes":[
+                {"id":"fix","title":"修复","objective":"修复失败实现","depends_on":[],"repairs":["test"]},
+                {"id":"check","title":"复验","objective":"实际执行测试","depends_on":["fix"],
+                 "verifies":["test"],"acceptance_command":"python3 test_calc.py"}
+            ]
+        });
+        let parsed = parse_response("review", &response(output.clone())).unwrap();
+        assert_eq!(parsed["nodes"][0]["repairs"], json!(["test"]));
+        assert_eq!(parsed["nodes"][1]["verifies"], json!(["test"]));
+        assert_eq!(
+            parsed["nodes"][1]["acceptance_command"],
+            "python3 test_calc.py"
+        );
+        output["nodes"][0]["repairs"] = json!("test");
+        assert!(parse_response("review", &response(output.clone())).is_err());
+        output["nodes"][0]["repairs"] = json!(["test"]);
+        output["nodes"][1]["acceptance_command"] = json!(true);
+        assert!(parse_response("review", &response(output)).is_err());
     }
 
     #[test]

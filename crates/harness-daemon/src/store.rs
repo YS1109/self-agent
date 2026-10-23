@@ -1,7 +1,7 @@
 use std::{collections::HashSet, path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use harness_core::{new_id, now, RunEvent};
+use harness_core::{new_id, now, CommandEvidence, RunEvent};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
@@ -330,6 +330,154 @@ impl Store {
                 receipt["session_id"] = plan["session_id"].clone();
                 produced = Some(plan_event(&plan, "plan_updated", "计划草稿已保存"));
             }
+            "patch_plan" => {
+                let id = text(command, "plan_id")?;
+                let mut plan = record(&tx, "plans", id)?;
+                check_revision(&plan, command)?;
+                if !matches!(
+                    plan["status"].as_str(),
+                    Some("running" | "paused" | "waiting_input" | "reviewing")
+                ) {
+                    bail!("此计划当前不能调整后续节点");
+                }
+                let old = plan["nodes"]
+                    .as_array()
+                    .context("计划节点数据无效")?
+                    .clone();
+                let (agents, default_id) = role_snapshot(&plan)?;
+                let mut nodes = validate_nodes_with_history(
+                    command.get("nodes").context("缺少计划节点")?,
+                    &[],
+                    false,
+                    &old,
+                    &agents,
+                    &default_id,
+                )?;
+                let mut used = used_node_ids(&plan);
+                let mut replaced = Vec::new();
+                for previous in &old {
+                    let current = nodes.iter_mut().find(|node| node["id"] == previous["id"]);
+                    let editable =
+                        matches!(previous["status"].as_str(), Some("pending" | "queued"));
+                    if !editable
+                        && current.as_ref().is_none_or(|node| {
+                            node_definition(node, &default_id)
+                                != node_definition(previous, &default_id)
+                        })
+                    {
+                        bail!("已开始或已结束的节点不能修改或移除：{}", previous["id"]);
+                    }
+                    if let Some(current) = current {
+                        if node_definition(current, &default_id)
+                            == node_definition(previous, &default_id)
+                        {
+                            *current = previous.clone();
+                            continue;
+                        }
+                    }
+                    if previous["status"] == "queued" {
+                        replaced.push(record(&tx, "tasks", text(previous, "task_id")?)?);
+                    }
+                }
+                for node in &nodes {
+                    let id = text(node, "id")?;
+                    if !old.iter().any(|old| old["id"] == id) {
+                        if used.iter().any(|used| used == id) {
+                            bail!("已移除的历史节点 ID 不能复用：{id}");
+                        }
+                        used.push(id.to_string());
+                    }
+                }
+                if used.len() > MAX_NODES {
+                    bail!("计划累计创建节点不能超过 12 个，移除节点不会返还预算");
+                }
+                if matches!(plan["status"].as_str(), Some("waiting_input" | "reviewing"))
+                    || (plan["status"] == "paused"
+                        && matches!(
+                            plan["paused_from_status"].as_str(),
+                            Some("waiting_input" | "reviewing")
+                        ))
+                {
+                    if plan["round"].as_u64().unwrap_or(0) >= MAX_ROUNDS {
+                        bail!("计划已达到 3 轮上限，请新建计划继续处理");
+                    }
+                    plan["round"] = json!(plan["round"].as_u64().unwrap_or(0) + 1);
+                }
+                invalidate_reviews(&tx, id)?;
+                plan["nodes"] = json!(nodes);
+                plan["used_node_ids"] = json!(used);
+                if plan["status"] != "paused" {
+                    plan["status"] = json!("running");
+                } else {
+                    plan["paused_from_status"] = json!("running");
+                }
+                plan["error"] = Value::Null;
+                touch_plan(&mut plan);
+                put(&tx, "plans", &plan)?;
+                for mut task in replaced {
+                    task["status"] = json!("cancelled");
+                    task["error"] = json!("后续计划已调整，此排队任务由新节点版本替代。");
+                    terminal_steps(&mut task, false);
+                    complete_transaction(&tx, &mut task)?;
+                }
+                set_parent_waiting(&tx, &plan, plan["status"] == "paused")?;
+                advance_plans(&tx)?;
+                let plan = record(&tx, "plans", id)?;
+                receipt["plan_id"] = json!(id);
+                receipt["session_id"] = plan["session_id"].clone();
+                produced = Some(plan_event(
+                    &plan,
+                    "plan_patched",
+                    "后续计划已调整，执行历史已保留",
+                ));
+            }
+            "pause_plan" | "resume_plan" => {
+                let id = text(command, "plan_id")?;
+                let mut plan = record(&tx, "plans", id)?;
+                check_revision(&plan, command)?;
+                let pause = kind == "pause_plan";
+                if pause
+                    && !matches!(
+                        plan["status"].as_str(),
+                        Some("running" | "reviewing" | "waiting_input")
+                    )
+                {
+                    bail!("此计划当前不能暂停");
+                }
+                if !pause && plan["status"] != "paused" {
+                    bail!("只有已暂停的计划可以恢复");
+                }
+                if !pause && plan["paused_from_status"] == "waiting_input" {
+                    if plan["round"].as_u64().unwrap_or(0) >= MAX_ROUNDS {
+                        bail!("计划已达到 3 轮上限，请新建计划继续处理");
+                    }
+                    plan["round"] = json!(plan["round"].as_u64().unwrap_or(0) + 1);
+                }
+                invalidate_reviews(&tx, id)?;
+                plan["paused_from_status"] = if pause {
+                    plan["status"].clone()
+                } else {
+                    Value::Null
+                };
+                plan["status"] = json!(if pause { "paused" } else { "running" });
+                touch_plan(&mut plan);
+                put(&tx, "plans", &plan)?;
+                set_parent_waiting(&tx, &plan, pause)?;
+                if !pause {
+                    advance_plans(&tx)?;
+                }
+                receipt["plan_id"] = json!(id);
+                receipt["session_id"] = plan["session_id"].clone();
+                produced = Some(plan_event(
+                    &plan,
+                    if pause { "plan_paused" } else { "plan_resumed" },
+                    if pause {
+                        "计划已暂停派发，正在执行的任务可以完成"
+                    } else {
+                        "计划已恢复派发"
+                    },
+                ));
+            }
             "start_plan" => {
                 let id = text(command, "plan_id")?;
                 let mut plan = record(&tx, "plans", id)?;
@@ -352,6 +500,12 @@ impl Store {
                         plan["task_id"] = json!(task_id);
                         plan["status"] = json!("running");
                         plan["round"] = json!(1);
+                        plan["used_node_ids"] = json!(plan["nodes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|node| node["id"].clone())
+                            .collect::<Vec<_>>());
                         touch_plan(&mut plan);
                         put(&tx, "plans", &plan)?;
                         advance_plans(&tx)?;
@@ -436,10 +590,11 @@ impl Store {
         advance_plans(&tx)?;
         let mut candidates = rows(&tx, "tasks")?;
         candidates.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
-        let Some(mut task) = candidates
-            .into_iter()
-            .find(|task| task["status"] == "queued" && task["task_kind"] != "plan")
-        else {
+        let Some(mut task) = candidates.into_iter().find(|task| {
+            task["status"] == "queued"
+                && task["task_kind"] != "plan"
+                && task_plan_dispatchable(&tx, task).unwrap_or(false)
+        }) else {
             tx.commit()?;
             return Ok(None);
         };
@@ -463,6 +618,57 @@ impl Store {
 
     pub fn is_cancelled(&self, task_id: &str) -> Result<bool> {
         Ok(record(&self.db, "tasks", task_id)?["status"] == "cancelled")
+    }
+
+    pub fn task_may_start(&self, task_id: &str) -> Result<bool> {
+        let task = record(&self.db, "tasks", task_id)?;
+        Ok(task["status"] == "running" && task_plan_dispatchable(&self.db, &task)?)
+    }
+
+    pub fn defer_task(&mut self, task_id: &str) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let mut task = record(&tx, "tasks", task_id)?;
+        if task["status"] == "running" {
+            task["status"] = json!("queued");
+            task["updated_at"] = json!(now());
+            for step in task["steps"].as_array_mut().context("任务步骤数据无效")? {
+                step["status"] = json!("queued");
+            }
+            put(&tx, "tasks", &task)?;
+            sync_task_node(&tx, &task)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_evidence(&mut self, task_id: &str, mut evidence: CommandEvidence) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let mut task = record(&tx, "tasks", task_id)?;
+        if task["status"] != "running" {
+            return Ok(());
+        }
+        if evidence.command.trim().is_empty() || evidence.command.len() > 16_384 {
+            bail!("命令证据中的命令无效或过长");
+        }
+        if evidence.output.len() > 16_384 {
+            let mut boundary = 16_384;
+            while !evidence.output.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            evidence.output.truncate(boundary);
+        }
+        if !task["evidence"].is_array() {
+            task["evidence"] = json!([]);
+        }
+        let collected = task["evidence"].as_array_mut().unwrap();
+        if collected.len() >= 64 {
+            collected.remove(0);
+        }
+        collected.push(json!(evidence));
+        put(&tx, "tasks", &task)?;
+        sync_task_node(&tx, &task)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn progress(&mut self, task_id: &str, detail: &str) -> Result<RunEvent> {
@@ -495,6 +701,14 @@ impl Store {
         if task["task_kind"] == "plan" {
             bail!("计划父任务只能由主智能体回顾或用户取消来结束");
         }
+        let result = result.and_then(|result| {
+            if let Some(command) = task["acceptance_command"].as_str() {
+                if !has_passing_evidence(&task, command) {
+                    bail!("验收命令未取得真实的成功退出证据：{command}");
+                }
+            }
+            Ok(result)
+        });
         match result {
             Ok(result) => {
                 task["status"] = json!("completed");
@@ -771,8 +985,67 @@ fn append_message(
 fn task_active(task: &Value) -> bool {
     matches!(
         task["status"].as_str(),
-        Some("queued" | "running" | "waiting_input")
+        Some("queued" | "running" | "waiting_input" | "paused")
     )
+}
+fn task_plan_dispatchable(db: &Connection, task: &Value) -> Result<bool> {
+    let Some(id) = task["plan_id"].as_str() else {
+        return Ok(true);
+    };
+    let plan = record(db, "plans", id)?;
+    Ok(plan["status"] == "running"
+        && plan["nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().any(|node| node["task_id"] == task["id"])))
+}
+
+fn invalidate_reviews(tx: &Transaction<'_>, plan_id: &str) -> Result<()> {
+    for mut job in rows(tx, "coordinator_jobs")? {
+        if job["plan_id"] == plan_id
+            && matches!(job["status"].as_str(), Some("pending" | "running"))
+        {
+            job["status"] = json!("cancelled");
+            job["updated_at"] = json!(now());
+            put(tx, "coordinator_jobs", &job)?;
+        }
+    }
+    Ok(())
+}
+
+fn used_node_ids(plan: &Value) -> Vec<String> {
+    plan["used_node_ids"]
+        .as_array()
+        .filter(|ids| !ids.is_empty())
+        .unwrap_or_else(|| plan["nodes"].as_array().unwrap())
+        .iter()
+        .filter_map(|node| {
+            node.as_str()
+                .or_else(|| node["id"].as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn node_definition(node: &Value, default_id: &str) -> Value {
+    json!({"id":node["id"],"title":node["title"],"objective":node["objective"],
+        "agent_id":node["agent_id"].as_str().unwrap_or(default_id),"depends_on":node["depends_on"],
+        "repairs":node.get("repairs").cloned().unwrap_or(json!([])),
+        "verifies":node.get("verifies").cloned().unwrap_or(json!([])),
+        "acceptance_command":node["acceptance_command"]})
+}
+
+fn has_passing_evidence(node: &Value, command: &str) -> bool {
+    node["evidence"].as_array().is_some_and(|evidence| {
+        evidence
+            .iter()
+            .rev()
+            .find(|item| {
+                item["command"]
+                    .as_str()
+                    .is_some_and(|actual| actual.trim() == command.trim())
+            })
+            .is_some_and(|item| item["exit_code"].as_i64() == Some(0))
+    })
 }
 fn active_task_count(db: &Connection) -> Result<usize> {
     Ok(rows(db, "tasks")?
@@ -793,7 +1066,7 @@ fn worker_task(
     parent_task_id: Option<&str>,
 ) -> Value {
     json!({"id":new_id(),"session_id":session_id,"title":title,"objective":title,"task_kind":"worker","plan_id":plan_id,"node_id":node_id,"parent_task_id":parent_task_id,
-    "agent":AgentProfile::default(),"status":"queued","execution_mode":execution_mode,"created_at":now(),"updated_at":now(),"source":source,"steps":[
+    "agent":AgentProfile::default(),"status":"queued","evidence":[],"execution_mode":execution_mode,"created_at":now(),"updated_at":now(),"source":source,"steps":[
         {"id":new_id(),"title":"理解任务目标","status":"queued"},
         {"id":new_id(),"title":"使用项目工具执行","status":"queued"},
         {"id":new_id(),"title":"汇报证据和限制","status":"queued"}
@@ -818,6 +1091,7 @@ fn terminal_steps(task: &mut Value, success: bool) {
 fn complete_transaction(tx: &Transaction<'_>, task: &mut Value) -> Result<RunEvent> {
     task["updated_at"] = json!(now());
     put(tx, "tasks", task)?;
+    sync_task_node(tx, task)?;
     let task_id = text(task, "id")?;
     let session_id = text(task, "session_id")?;
     let status = text(task, "status")?;
@@ -902,6 +1176,17 @@ fn validate_nodes(
     agents: &[AgentProfile],
     default_id: &str,
 ) -> Result<Vec<Value>> {
+    validate_nodes_with_history(input, existing, extension, existing, agents, default_id)
+}
+
+fn validate_nodes_with_history(
+    input: &Value,
+    existing: &[Value],
+    extension: bool,
+    history: &[Value],
+    agents: &[AgentProfile],
+    default_id: &str,
+) -> Result<Vec<Value>> {
     let input = input.as_array().context("计划 nodes 必须是数组")?;
     if input.is_empty() || input.len() + existing.len() > MAX_NODES {
         bail!("计划必须包含 1 至 12 个节点，累计不能超过 12 个");
@@ -936,7 +1221,33 @@ fn validate_nodes(
                 bail!("节点依赖不能重复：{id}");
             }
         }
-        nodes.push(json!({"id":id,"title":title,"objective":objective,"agent_id":agent.id,"depends_on":deps,"status":"pending"}));
+        let repairs = relation_ids(node, "repairs", id)?;
+        let verifies = relation_ids(node, "verifies", id)?;
+        let acceptance_command = match node.get("acceptance_command") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(command))
+                if !command.trim().is_empty() && command.len() <= 16_384 =>
+            {
+                Some(command.trim())
+            }
+            _ => bail!("acceptance_command 必须是非空命令文本或 null，最多 16384 字节"),
+        };
+        if !verifies.is_empty() && acceptance_command.is_none() {
+            bail!("验收节点必须设置 acceptance_command");
+        }
+        for target in repairs.iter().chain(&verifies) {
+            if !history.iter().any(|old| {
+                old["id"] == *target
+                    && matches!(
+                        old["status"].as_str(),
+                        Some("failed" | "blocked" | "cancelled")
+                    )
+            }) {
+                bail!("修复或验收只能引用已经失败、取消或阻塞的历史节点：{target}");
+            }
+        }
+        nodes.push(json!({"id":id,"title":title,"objective":objective,"agent_id":agent.id,"depends_on":deps,
+            "repairs":repairs,"verifies":verifies,"acceptance_command":acceptance_command,"evidence":[],"status":"pending"}));
     }
     for node in &nodes {
         for dep in node["depends_on"].as_array().unwrap() {
@@ -950,6 +1261,25 @@ fn validate_nodes(
             }
             if old.unwrap()["status"] != "completed" {
                 bail!("追加节点只能引用已完成的历史节点：{dep}");
+            }
+        }
+    }
+    let mut all = existing.to_vec();
+    all.extend(nodes.clone());
+    for node in &nodes {
+        for target in node["verifies"].as_array().unwrap() {
+            if !all.iter().any(|repair| {
+                repair["repairs"]
+                    .as_array()
+                    .is_some_and(|targets| targets.contains(target))
+                    && depends_transitively(
+                        &all,
+                        text(node, "id").unwrap(),
+                        text(repair, "id").unwrap(),
+                        &mut HashSet::new(),
+                    )
+            }) {
+                bail!("验收节点必须依赖修复对应失败的节点：{}", node["id"]);
             }
         }
     }
@@ -973,6 +1303,85 @@ fn validate_nodes(
     }
 }
 
+fn relation_ids(node: &Value, key: &str, id: &str) -> Result<Vec<String>> {
+    let Some(value) = node.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .with_context(|| format!("{key} 必须是数组"))?;
+    let mut ids = HashSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let target = value
+                .as_str()
+                .filter(|target| !target.trim().is_empty() && target.len() <= 128)
+                .with_context(|| format!("{key} 中的节点 ID 必须是非空文本"))?;
+            if target == id || !ids.insert(target) {
+                bail!("{key} 不得引用自身或重复节点");
+            }
+            Ok(target.to_owned())
+        })
+        .collect()
+}
+
+fn depends_transitively(
+    nodes: &[Value],
+    from: &str,
+    target: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(from.to_string()) {
+        return false;
+    }
+    nodes
+        .iter()
+        .find(|node| node["id"] == from)
+        .and_then(|node| node["depends_on"].as_array())
+        .is_some_and(|deps| {
+            deps.iter()
+                .filter_map(Value::as_str)
+                .any(|dep| dep == target || depends_transitively(nodes, dep, target, visited))
+        })
+}
+
+fn update_resolutions(nodes: &mut [Value]) {
+    let snapshot = nodes.to_vec();
+    for failed in nodes {
+        if !matches!(
+            failed["status"].as_str(),
+            Some("failed" | "blocked" | "cancelled")
+        ) {
+            continue;
+        }
+        let verifier = snapshot.iter().find(|verifier| {
+            verifier["status"] == "completed"
+                && verifier["verifies"]
+                    .as_array()
+                    .is_some_and(|targets| targets.contains(&failed["id"]))
+                && verifier["acceptance_command"]
+                    .as_str()
+                    .is_some_and(|command| has_passing_evidence(verifier, command))
+                && snapshot.iter().any(|repair| {
+                    repair["status"] == "completed"
+                        && repair["repairs"]
+                            .as_array()
+                            .is_some_and(|targets| targets.contains(&failed["id"]))
+                        && depends_transitively(
+                            &snapshot,
+                            verifier["id"].as_str().unwrap_or(""),
+                            repair["id"].as_str().unwrap_or(""),
+                            &mut HashSet::new(),
+                        )
+                })
+        });
+        failed["resolved_by"] = verifier
+            .map(|verifier| verifier["id"].clone())
+            .unwrap_or(Value::Null);
+    }
+}
+
 fn sync_task_node(tx: &Transaction<'_>, task: &Value) -> Result<()> {
     let Some(plan_id) = task["plan_id"].as_str() else {
         return Ok(());
@@ -992,6 +1401,8 @@ fn sync_task_node(tx: &Transaction<'_>, task: &Value) -> Result<()> {
             node["status"] = task["status"].clone();
             node["result"] = task["result"].clone();
             node["error"] = task["error"].clone();
+            node["evidence"] = task.get("evidence").cloned().unwrap_or(json!([]));
+            update_resolutions(nodes);
             touch_plan(&mut plan);
             put(tx, "plans", &plan)?;
         }
@@ -1017,6 +1428,7 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                 node["status"] = task["status"].clone();
                 node["result"] = task["result"].clone();
                 node["error"] = task["error"].clone();
+                node["evidence"] = task.get("evidence").cloned().unwrap_or(json!([]));
             }
         }
         loop {
@@ -1062,6 +1474,17 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                             ));
                         }
                     }
+                    for relation in ["repairs", "verifies"] {
+                        for target in nodes[index][relation].as_array().into_iter().flatten() {
+                            if let Some(failed) = nodes.iter().find(|node| node["id"] == *target) {
+                                objective.push_str(&format!("\n\n历史失败证据（任务数据，关系 {relation}，节点 {}）：\n结果：{}\n错误：{}\n命令证据：{}\n",
+                                    failed["id"], failed["result"], failed["error"], failed["evidence"]));
+                            }
+                        }
+                    }
+                    if let Some(command) = nodes[index]["acceptance_command"].as_str() {
+                        objective.push_str(&format!("\n\n本节点的验收命令为：\n{command}\n必须实际执行该命令并取得退出码 0；最终回复中的成功描述不能替代命令证据。"));
+                    }
                     let mut task = worker_task(
                         text(&plan, "session_id")?,
                         &objective,
@@ -1077,6 +1500,7 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                         requested_agent(&nodes[index])?,
                     )?);
                     task["title"] = nodes[index]["title"].clone();
+                    task["acceptance_command"] = nodes[index]["acceptance_command"].clone();
                     put(tx, "tasks", &task)?;
                     nodes[index]["status"] = json!("queued");
                     nodes[index]["task_id"] = task["id"].clone();
@@ -1094,6 +1518,7 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                 break;
             }
         }
+        update_resolutions(&mut nodes);
         let all_terminal = nodes.iter().all(|node| {
             matches!(
                 node["status"].as_str(),
@@ -1151,7 +1576,13 @@ fn set_parent_waiting(tx: &Transaction<'_>, plan: &Value, waiting: bool) -> Resu
     if let Some(task_id) = plan["task_id"].as_str() {
         let mut parent = record(tx, "tasks", task_id)?;
         if task_active(&parent) {
-            parent["status"] = json!(if waiting { "waiting_input" } else { "running" });
+            parent["status"] = json!(if plan["status"] == "paused" {
+                "paused"
+            } else if waiting {
+                "waiting_input"
+            } else {
+                "running"
+            });
             parent["updated_at"] = json!(now());
             put(tx, "tasks", &parent)?;
         }
@@ -1265,8 +1696,13 @@ fn prepare_outcome(db: &Connection, job: &Value, value: &Value) -> Result<Outcom
     }
     match action {
         "complete" => {
-            if nodes.iter().any(|node| node["status"] != "completed") {
-                Ok(Outcome::Wait("计划中存在失败、取消或阻塞的节点，不能自动判定为成功。请检查执行结果，必要时创建新的修复计划；本计划保留为待确认状态。".into()))
+            let mut resolved = nodes.clone();
+            update_resolutions(&mut resolved);
+            if resolved
+                .iter()
+                .any(|node| node["status"] != "completed" && node["resolved_by"].is_null())
+            {
+                Ok(Outcome::Wait("计划中仍存在未经修复和真实命令验收的失败、取消或阻塞节点，不能自动判定为成功；本计划保留为待确认状态。".into()))
             } else {
                 Ok(Outcome::Complete(message))
             }
@@ -1278,11 +1714,19 @@ fn prepare_outcome(db: &Connection, job: &Value, value: &Value) -> Result<Outcom
                 ));
             }
             let proposed = value["nodes"].as_array().context("追加 nodes 必须是数组")?;
-            if nodes.len() + proposed.len() > MAX_NODES {
+            if used_node_ids(&plan).len() + proposed.len() > MAX_NODES {
                 return Ok(Outcome::Wait(
                     "计划累计节点已达到 12 个上限，未继续追加任务。请检查现有结果后创建新计划。"
                         .into(),
                 ));
+            }
+            let used = used_node_ids(&plan);
+            if proposed.iter().any(|node| {
+                node["id"]
+                    .as_str()
+                    .is_some_and(|id| used.iter().any(|used| used == id))
+            }) {
+                bail!("追加节点不能复用已使用或已移除的历史节点 ID");
             }
             Ok(Outcome::Extend {
                 message,
@@ -1350,6 +1794,13 @@ fn apply_outcome(
         }
         Outcome::Extend { message, nodes } => {
             let mut plan = record(tx, "plans", text(job, "plan_id")?)?;
+            let mut used = used_node_ids(&plan);
+            used.extend(
+                nodes
+                    .iter()
+                    .filter_map(|node| node["id"].as_str().map(str::to_owned)),
+            );
+            plan["used_node_ids"] = json!(used);
             plan["nodes"]
                 .as_array_mut()
                 .context("计划节点数据无效")?
@@ -2493,5 +2944,516 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows(&store.db, "deliveries").unwrap().len(), 2);
+    }
+
+    fn current_plan(store: &Store, id: &str) -> Value {
+        record(&store.db, "plans", id).unwrap()
+    }
+
+    fn control(store: &mut Store, id: &str, kind: &str) {
+        let plan = current_plan(store, id);
+        send(
+            store,
+            json!({"type":kind,"plan_id":id,"expected_revision":plan["revision"]}),
+        );
+    }
+
+    #[test]
+    fn pause_stops_dispatch_but_persists_inflight_completion_and_resume_dependencies() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[]), node("b", &["a"])]));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        let first = store.claim_task().unwrap().unwrap();
+        control(&mut store, id, "pause_plan");
+        assert!(!store.task_may_start(first["id"].as_str().unwrap()).unwrap());
+        store
+            .finish(
+                first["id"].as_str().unwrap(),
+                Ok("已在暂停之前开始的操作完成".into()),
+            )
+            .unwrap();
+        let paused = current_plan(&store, id);
+        assert_eq!(paused["status"], "paused");
+        assert_eq!(
+            record(&store.db, "tasks", paused["task_id"].as_str().unwrap()).unwrap()["status"],
+            "paused"
+        );
+        assert_eq!(paused["nodes"][0]["status"], "completed");
+        assert_eq!(paused["nodes"][1]["status"], "pending");
+        assert!(store.claim_task().unwrap().is_none());
+        assert!(store.claim_coordinator_job().unwrap().is_none());
+        control(&mut store, id, "resume_plan");
+        let second = store.claim_task().unwrap().unwrap();
+        assert_eq!(second["node_id"], "b");
+        assert!(second["objective"]
+            .as_str()
+            .unwrap()
+            .contains("已在暂停之前"));
+        control(&mut store, id, "pause_plan");
+        send(&mut store, json!({"type":"cancel_plan","plan_id":id}));
+        let cancelled = current_plan(&store, id);
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(
+            record(&store.db, "tasks", cancelled["task_id"].as_str().unwrap()).unwrap()["status"],
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn claimed_task_waiting_for_workspace_can_be_deferred_without_replaying_work() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[])]));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        let task = store.claim_task().unwrap().unwrap();
+        control(&mut store, id, "pause_plan");
+        store.defer_task(task["id"].as_str().unwrap()).unwrap();
+        assert_eq!(current_plan(&store, id)["nodes"][0]["status"], "queued");
+        assert!(store.claim_task().unwrap().is_none());
+        control(&mut store, id, "resume_plan");
+        let resumed = store.claim_task().unwrap().unwrap();
+        assert_eq!(resumed["id"], task["id"]);
+        assert!(store.task_may_start(task["id"].as_str().unwrap()).unwrap());
+        assert!(rows(&store.db, "deliveries").unwrap().is_empty());
+    }
+
+    #[test]
+    fn patch_replaces_only_unstarted_nodes_and_rejects_conflicts_and_history_edits() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(
+            &mut store,
+            json!([node("a", &[]), node("b", &[]), node("c", &["a"])]),
+        );
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        let running = store.claim_task().unwrap().unwrap();
+        let before = current_plan(&store, id);
+        let queued = before["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["status"] == "queued")
+            .unwrap()
+            .clone();
+        let mut nodes: Vec<_> = before["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["id"] != "c")
+            .cloned()
+            .collect();
+        let edited = nodes
+            .iter_mut()
+            .find(|node| node["id"] == queued["id"])
+            .unwrap();
+        edited["objective"] = json!("新增验收要求");
+        nodes.push(node("d", &["a"]));
+        let command = json!({"type":"patch_plan","plan_id":id,"expected_revision":before["revision"],"nodes":nodes});
+        send(&mut store, command.clone());
+        let after = current_plan(&store, id);
+        let replacement = after["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == queued["id"])
+            .unwrap();
+        assert_ne!(replacement["task_id"], queued["task_id"]);
+        assert_eq!(
+            record(&store.db, "tasks", queued["task_id"].as_str().unwrap()).unwrap()["status"],
+            "cancelled"
+        );
+        assert!(store
+            .finish(queued["task_id"].as_str().unwrap(), Ok("迟到旧结果".into()))
+            .unwrap()
+            .is_none());
+        assert_eq!(current_plan(&store, id)["nodes"], after["nodes"]);
+        assert!(store
+            .command(
+                json!({"command_id":new_id(),"source":source(),"command":command}),
+                &config()
+            )
+            .is_err());
+        let mut illegal = after["nodes"].clone();
+        let immutable = illegal
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|node| node["task_id"] == running["id"])
+            .unwrap();
+        immutable["objective"] = json!("重写执行中节点");
+        assert!(store.command(json!({"command_id":new_id(),"source":source(),"command":{
+            "type":"patch_plan","plan_id":id,"expected_revision":after["revision"],"nodes":illegal
+        }}), &config()).is_err());
+        assert_eq!(current_plan(&store, id)["revision"], after["revision"]);
+        assert!(!after["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["id"] == "c"));
+    }
+
+    #[test]
+    fn removed_node_ids_and_budget_survive_patch_and_cannot_be_reused() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[]), node("b", &["a"])]));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        control(&mut store, id, "pause_plan");
+        let paused = current_plan(&store, id);
+        send(
+            &mut store,
+            json!({"type":"patch_plan","plan_id":id,"expected_revision":paused["revision"],
+            "nodes":[paused["nodes"][0].clone()]}),
+        );
+        let current = current_plan(&store, id);
+        assert_eq!(current["used_node_ids"], json!(["a", "b"]));
+        assert!(store
+            .command(
+                json!({"command_id":new_id(),"source":source(),"command":{
+                    "type":"patch_plan","plan_id":id,"expected_revision":current["revision"],
+                    "nodes":[current["nodes"][0].clone(),node("b",&["a"])]
+                }}),
+                &config()
+            )
+            .is_err());
+        let mut nodes = vec![current["nodes"][0].clone()];
+        nodes.extend((0..11).map(|i| node(&format!("new{i}"), &["a"])));
+        assert!(store.command(json!({"command_id":new_id(),"source":source(),"command":{
+            "type":"patch_plan","plan_id":id,"expected_revision":current["revision"],"nodes":nodes
+        }}), &config()).is_err());
+    }
+
+    #[test]
+    fn pause_invalidates_review_and_late_model_reply_cannot_resume_or_complete_plan() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[])]));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        finish_workers(&mut store);
+        let review = store.claim_coordinator_job().unwrap().unwrap();
+        control(&mut store, id, "pause_plan");
+        assert!(!store
+            .coordinator_job_active(review["id"].as_str().unwrap())
+            .unwrap());
+        store
+            .complete_coordinator_job(
+                review["id"].as_str().unwrap(),
+                Ok(json!({"action":"complete","message":"迟到回顾"})),
+            )
+            .unwrap();
+        assert_eq!(current_plan(&store, id)["status"], "paused");
+        control(&mut store, id, "resume_plan");
+        let fresh = store.claim_coordinator_job().unwrap().unwrap();
+        assert_ne!(fresh["id"], review["id"]);
+        assert_eq!(fresh["plan_revision"], current_plan(&store, id)["revision"]);
+    }
+
+    #[test]
+    fn acceptance_requires_exact_successful_tool_evidence_and_keeps_failure_history() {
+        let dir = std::env::temp_dir().join(new_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let mut store = Store::open(&path).unwrap();
+        session(&mut store);
+        let mut acceptance = node("a", &[]);
+        acceptance["acceptance_command"] = json!("python3 -m unittest");
+        let plan = draft(&mut store, json!([acceptance]));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        let task = store.claim_task().unwrap().unwrap();
+        store
+            .record_evidence(
+                task["id"].as_str().unwrap(),
+                CommandEvidence {
+                    command: "ls".into(),
+                    exit_code: 0,
+                    output: "文件列表".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record_evidence(
+                task["id"].as_str().unwrap(),
+                CommandEvidence {
+                    command: "python3 -m unittest".into(),
+                    exit_code: 1,
+                    output: "测试失败".into(),
+                },
+            )
+            .unwrap();
+        store
+            .finish(task["id"].as_str().unwrap(), Ok("所有测试通过".into()))
+            .unwrap();
+        let failed = current_plan(&store, id);
+        assert_eq!(failed["nodes"][0]["status"], "failed");
+        assert!(failed["nodes"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("真实"));
+        assert_eq!(failed["nodes"][0]["evidence"][1]["exit_code"], 1);
+        let review = store.claim_coordinator_job().unwrap().unwrap();
+        let mut repair = node("repair", &[]);
+        repair["repairs"] = json!(["a"]);
+        let mut verify = node("verify", &["repair"]);
+        verify["verifies"] = json!(["a"]);
+        verify["acceptance_command"] = json!("python3 -m unittest");
+        store
+            .complete_coordinator_job(
+                review["id"].as_str().unwrap(),
+                Ok(json!({"action":"extend","message":"修复并复验","nodes":[repair,verify]})),
+            )
+            .unwrap();
+        let repair_task = store.claim_task().unwrap().unwrap();
+        assert!(repair_task["objective"]
+            .as_str()
+            .unwrap()
+            .contains("测试失败"));
+        store
+            .finish(repair_task["id"].as_str().unwrap(), Ok("完成修复".into()))
+            .unwrap();
+        let verify_task = store.claim_task().unwrap().unwrap();
+        store
+            .record_evidence(
+                verify_task["id"].as_str().unwrap(),
+                CommandEvidence {
+                    command: " python3 -m unittest ".into(),
+                    exit_code: 0,
+                    output: "测试通过".into(),
+                },
+            )
+            .unwrap();
+        store
+            .finish(verify_task["id"].as_str().unwrap(), Ok("复验通过".into()))
+            .unwrap();
+        let resolved = current_plan(&store, id);
+        assert_eq!(resolved["nodes"][0]["status"], "failed");
+        assert_eq!(resolved["nodes"][0]["resolved_by"], "verify");
+        let final_review = store.claim_coordinator_job().unwrap().unwrap();
+        store
+            .complete_coordinator_job(
+                final_review["id"].as_str().unwrap(),
+                Ok(json!({"action":"complete","message":"已根据真实复验完成"})),
+            )
+            .unwrap();
+        assert_eq!(current_plan(&store, id)["status"], "completed");
+        let parent = record(&store.db, "tasks", resolved["task_id"].as_str().unwrap()).unwrap();
+        assert_eq!(parent["status"], "completed");
+        assert_eq!(
+            rows(&store.db, "deliveries")
+                .unwrap()
+                .iter()
+                .filter(|delivery| delivery["task_id"] == parent["id"])
+                .count(),
+            1
+        );
+        drop(store);
+        let recovered = Store::open(&path).unwrap();
+        let restored = current_plan(&recovered, id);
+        assert_eq!(restored["status"], "completed");
+        assert_eq!(restored["nodes"][0]["status"], "failed");
+        assert_eq!(restored["nodes"][0]["resolved_by"], "verify");
+        assert_eq!(restored["nodes"][2]["evidence"][0]["exit_code"], 0);
+        assert_eq!(rows(&recovered.db, "deliveries").unwrap().len(), 4);
+        drop(recovered);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verifier_must_depend_on_corresponding_repair_and_metadata_types_are_strict() {
+        let agents = default_agents();
+        let history = vec![json!({"id":"failed","status":"failed"})];
+        let mut repair = node("repair", &[]);
+        repair["repairs"] = json!(["failed"]);
+        let mut verify = node("verify", &[]);
+        verify["verifies"] = json!(["failed"]);
+        verify["acceptance_command"] = json!("npm test");
+        assert!(validate_nodes(
+            &json!([repair.clone(), verify.clone()]),
+            &history,
+            true,
+            &agents,
+            "coder"
+        )
+        .is_err());
+        verify["depends_on"] = json!(["repair"]);
+        assert!(validate_nodes(
+            &json!([repair.clone(), verify.clone()]),
+            &history,
+            true,
+            &agents,
+            "coder"
+        )
+        .is_ok());
+        verify["verifies"] = json!("failed");
+        assert!(validate_nodes(
+            &json!([repair.clone(), verify.clone()]),
+            &history,
+            true,
+            &agents,
+            "coder"
+        )
+        .is_err());
+        repair["repairs"] = json!([false]);
+        assert!(validate_nodes(&json!([repair]), &history, true, &agents, "coder").is_err());
+    }
+
+    #[test]
+    fn paused_plan_evidence_and_queued_work_survive_restart_without_replay() {
+        let dir = std::env::temp_dir().join(new_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let id;
+        {
+            let mut store = Store::open(&path).unwrap();
+            session(&mut store);
+            let plan = draft(&mut store, json!([node("a", &[]), node("b", &["a"])]));
+            id = plan["id"].as_str().unwrap().to_string();
+            start(&mut store, &plan);
+            let task = store.claim_task().unwrap().unwrap();
+            store
+                .record_evidence(
+                    task["id"].as_str().unwrap(),
+                    CommandEvidence {
+                        command: "npm test".into(),
+                        exit_code: 0,
+                        output: "通过".into(),
+                    },
+                )
+                .unwrap();
+            store
+                .finish(task["id"].as_str().unwrap(), Ok("完成".into()))
+                .unwrap();
+            control(&mut store, &id, "pause_plan");
+        }
+        {
+            let mut store = Store::open(&path).unwrap();
+            let paused = current_plan(&store, &id);
+            assert_eq!(paused["status"], "paused");
+            assert_eq!(paused["nodes"][0]["status"], "completed");
+            assert_eq!(paused["nodes"][0]["evidence"][0]["command"], "npm test");
+            assert_eq!(paused["nodes"][1]["status"], "queued");
+            assert!(store.claim_task().unwrap().is_none());
+            control(&mut store, &id, "resume_plan");
+            assert_eq!(store.claim_task().unwrap().unwrap()["node_id"], "b");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn latest_acceptance_exit_wins_and_bounded_evidence_keeps_recent_failures() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let mut input = node("a", &[]);
+        input["acceptance_command"] = json!("npm test");
+        let plan = draft(&mut store, json!([input]));
+        start(&mut store, &plan);
+        let task = store.claim_task().unwrap().unwrap();
+        let id = task["id"].as_str().unwrap();
+        store
+            .record_evidence(
+                id,
+                CommandEvidence {
+                    command: "npm test".into(),
+                    exit_code: 0,
+                    output: "第一次通过".into(),
+                },
+            )
+            .unwrap();
+        for _ in 0..63 {
+            store
+                .record_evidence(
+                    id,
+                    CommandEvidence {
+                        command: "ls".into(),
+                        exit_code: 0,
+                        output: "中间命令".into(),
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .record_evidence(
+                id,
+                CommandEvidence {
+                    command: "npm test".into(),
+                    exit_code: 1,
+                    output: "最后一次失败".into(),
+                },
+            )
+            .unwrap();
+        let recorded = record(&store.db, "tasks", id).unwrap();
+        assert_eq!(recorded["evidence"].as_array().unwrap().len(), 64);
+        assert!(!has_passing_evidence(&recorded, "npm test"));
+        store.finish(id, Ok("第一次曾通过".into())).unwrap();
+        assert_eq!(record(&store.db, "tasks", id).unwrap()["status"], "failed");
+        let same_command = json!({"evidence":[
+            {"command":"npm test","exit_code":0}, {"command":"npm test","exit_code":1}
+        ]});
+        assert!(!has_passing_evidence(&same_command, "npm test"));
+    }
+
+    #[test]
+    fn pausing_waiting_input_does_not_bypass_review_round_budget() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[])]));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        finish_workers(&mut store);
+        for expected_round in 1..=3 {
+            let review = store.claim_coordinator_job().unwrap().unwrap();
+            store
+                .complete_coordinator_job(
+                    review["id"].as_str().unwrap(),
+                    Ok(json!({"action":"wait_input","message":"等待补充"})),
+                )
+                .unwrap();
+            assert_eq!(current_plan(&store, id)["round"], expected_round);
+            control(&mut store, id, "pause_plan");
+            if expected_round < 3 {
+                control(&mut store, id, "resume_plan");
+            }
+        }
+        let paused = current_plan(&store, id);
+        for kind in ["resume_plan", "patch_plan"] {
+            assert!(store.command(json!({"command_id":new_id(),"source":source(),"command":{
+                "type":kind,"plan_id":id,"expected_revision":paused["revision"],"nodes":paused["nodes"]
+            }}), &config()).is_err());
+        }
+        assert_eq!(current_plan(&store, id)["status"], "paused");
+    }
+
+    #[test]
+    fn model_extension_counts_removed_nodes_toward_lifetime_budget() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let mut inputs = vec![node("a", &[])];
+        inputs.extend((0..11).map(|i| node(&format!("later{i}"), &["a"])));
+        let plan = draft(&mut store, json!(inputs));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        control(&mut store, id, "pause_plan");
+        let paused = current_plan(&store, id);
+        send(
+            &mut store,
+            json!({"type":"patch_plan","plan_id":id,
+            "expected_revision":paused["revision"],"nodes":[paused["nodes"][0].clone()]}),
+        );
+        control(&mut store, id, "resume_plan");
+        finish_workers(&mut store);
+        let review = store.claim_coordinator_job().unwrap().unwrap();
+        store.complete_coordinator_job(review["id"].as_str().unwrap(),
+            Ok(json!({"action":"extend","message":"尝试继续追加","nodes":[node("new",&["a"])]}))).unwrap();
+        let bounded = current_plan(&store, id);
+        assert_eq!(bounded["status"], "waiting_input");
+        assert_eq!(bounded["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(bounded["used_node_ids"].as_array().unwrap().len(), 12);
+        assert!(bounded["summary"].as_str().unwrap().contains("12"));
     }
 }

@@ -1,9 +1,10 @@
 //! A bounded, single-turn Codex app-server client. Protocol data and stderr are
 //! deliberately excluded from progress/errors because they can contain secrets.
 
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
 
 use anyhow::{bail, Result};
+use harness_core::CommandEvidence;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -17,13 +18,26 @@ const MAX_LINES: usize = 20_000;
 const MAX_RESULT: usize = 128 * 1024;
 const TURN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-pub async fn execute(
+#[cfg(test)]
+async fn execute(
     binary: &str,
     model: &str,
     root: &Path,
     objective: &str,
     progress: impl Fn(String),
     cancelled: impl Fn() -> bool,
+) -> Result<String> {
+    execute_with_evidence(binary, model, root, objective, progress, cancelled, |_| {}).await
+}
+
+pub async fn execute_with_evidence(
+    binary: &str,
+    model: &str,
+    root: &Path,
+    objective: &str,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+    evidence: impl Fn(CommandEvidence),
 ) -> Result<String> {
     if cancelled() {
         bail!("Codex 任务已取消");
@@ -75,7 +89,7 @@ pub async fn execute(
     let started = Instant::now();
     let result = tokio::select! {
         result = timeout(TURN_TIMEOUT, protocol(
-            &mut stdin, stdout, model, &root, objective, &progress, &mut ids,
+            &mut stdin, stdout, model, &root, objective, (&progress, &evidence), &mut ids,
         )) => match result {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("Codex 任务已超过 15 分钟时限")),
@@ -138,9 +152,10 @@ async fn protocol(
     model: &str,
     root: &Path,
     objective: &str,
-    progress: &impl Fn(String),
+    callbacks: (&impl Fn(String), &impl Fn(CommandEvidence)),
     ids: &mut RunIds,
 ) -> Result<String> {
+    let (progress, evidence) = callbacks;
     progress("正在连接 Codex 执行器".into());
     send(
         stdin,
@@ -155,6 +170,7 @@ async fn protocol(
     let mut count = 0usize;
     let mut expected = 1u64;
     let mut answer = None;
+    let mut command_ids = HashSet::new();
     loop {
         // `take` bounds allocation even when a peer never writes a newline.
         let mut line = Vec::new();
@@ -213,7 +229,10 @@ async fn protocol(
                     Some("mcpToolCall") => progress("Codex 正在调用已配置工具".into()),
                     _ => {}
                 },
-                "item/completed" => capture_answer(&params["item"], &mut answer)?,
+                "item/completed" => {
+                    capture_answer(&params["item"], &mut answer)?;
+                    capture_evidence(&params["item"], &mut command_ids, evidence);
+                }
                 "turn/completed" => {
                     match params["turn"]["status"].as_str() {
                         Some("completed") => {}
@@ -342,6 +361,135 @@ fn capture_answer(item: &Value, answer: &mut Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn capture_evidence(
+    item: &Value,
+    command_ids: &mut HashSet<String>,
+    evidence: &impl Fn(CommandEvidence),
+) {
+    if item["type"] != "commandExecution"
+        || !matches!(item["status"].as_str(), Some("completed" | "failed"))
+    {
+        return;
+    }
+    let (Some(id), Some(command), Some(exit_code)) = (
+        item["id"].as_str().filter(|id| !id.is_empty()),
+        item["command"].as_str(),
+        item["exitCode"]
+            .as_i64()
+            .and_then(|code| i32::try_from(code).ok()),
+    ) else {
+        return;
+    };
+    if !command_ids.insert(id.to_owned()) {
+        return;
+    }
+    let normalized = normalize_command(command);
+    let redacted_command = redact_evidence(&normalized);
+    // Never turn an oversized command into a shorter, falsely matching command.
+    if normalized.len() > 16_000 || redacted_command.len() > 16 * 1024 {
+        return;
+    }
+    let output = item["aggregatedOutput"].as_str().unwrap_or_default();
+    let output = if normalized != command.trim() {
+        format!("原始命令：{command}\n{output}")
+    } else {
+        output.to_owned()
+    };
+    evidence(CommandEvidence {
+        command: redacted_command,
+        exit_code,
+        output: bounded_evidence(&output),
+    });
+}
+
+fn normalize_command(command: &str) -> String {
+    let original = command.trim();
+    // shlex splits words without expanding shell syntax. Reject syntax that an
+    // outer shell could expand or treat as operators before unwrapping a shell.
+    if !literal_shell_words(original) {
+        return original.to_owned();
+    }
+    let Some(words) = shlex::split(original) else {
+        return original.to_owned();
+    };
+    if words.len() == 3
+        && matches!(
+            words[0].as_str(),
+            "sh" | "bash"
+                | "zsh"
+                | "/bin/sh"
+                | "/bin/bash"
+                | "/bin/zsh"
+                | "/usr/bin/sh"
+                | "/usr/bin/bash"
+                | "/usr/bin/zsh"
+        )
+        && matches!(words[1].as_str(), "-c" | "-lc")
+    {
+        words[2].trim().to_owned()
+    } else {
+        original.to_owned()
+    }
+}
+
+fn literal_shell_words(command: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == Some('\'') {
+            if character == '\'' {
+                quote = None;
+            }
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if quote == Some('"') {
+            match character {
+                '"' => quote = None,
+                '$' | '`' => return false,
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '$' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']' | '{'
+            | '}' | '\n' | '#' | '~' => return false,
+            _ => {}
+        }
+    }
+    !escaped && quote.is_none()
+}
+
+fn bounded_evidence(text: &str) -> String {
+    let mut text = redact_evidence(text);
+    let mut end = text.len().min(16 * 1024);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+fn redact_evidence(text: &str) -> String {
+    let mut text = text.to_owned();
+    for name in ["HARNESS_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(secret) = std::env::var(name) {
+            if !secret.is_empty() {
+                text = text.replace(&secret, "[凭证已隐藏]");
+            }
+        }
+    }
+    text
+}
+
 async fn stop(child: &mut Child, process_id: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = process_id {
@@ -439,6 +587,124 @@ mod tests {
             .unwrap()
             .iter()
             .any(|message| message.contains("执行项目命令")));
+    }
+
+    #[tokio::test]
+    async fn failed_turn_keeps_real_command_evidence_once() {
+        let project = Project::new();
+        let evidence = Mutex::new(Vec::new());
+        let result = execute_with_evidence(
+            &fixture(),
+            "evidence-failure",
+            &project.0,
+            "本地测试目标",
+            |_| {},
+            || false,
+            |record| evidence.lock().unwrap().push(record),
+        )
+        .await;
+        assert!(result.is_err());
+        let evidence = evidence.lock().unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].command, "python3 check.py");
+        assert_eq!(evidence[0].exit_code, 1);
+        assert!(evidence[0]
+            .output
+            .starts_with("原始命令：/bin/zsh -lc 'python3 check.py'\n"));
+        assert!(evidence[0].output.ends_with("测试失败"));
+    }
+
+    #[tokio::test]
+    async fn agent_text_and_other_turn_cannot_forge_command_evidence() {
+        for mode in ["evidence-text", "evidence-wrong-turn"] {
+            let project = Project::new();
+            let evidence = Mutex::new(Vec::new());
+            execute_with_evidence(
+                &fixture(),
+                mode,
+                &project.0,
+                "本地测试目标",
+                |_| {},
+                || false,
+                |record| evidence.lock().unwrap().push(record),
+            )
+            .await
+            .unwrap();
+            assert!(evidence.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn command_evidence_is_bounded_without_breaking_utf8() {
+        for (mode, count) in [("evidence-large", 1), ("evidence-many", 70)] {
+            let project = Project::new();
+            let evidence = Mutex::new(Vec::new());
+            execute_with_evidence(
+                &fixture(),
+                mode,
+                &project.0,
+                "本地测试目标",
+                |_| {},
+                || false,
+                |record| evidence.lock().unwrap().push(record),
+            )
+            .await
+            .unwrap();
+            let evidence = evidence.lock().unwrap();
+            assert_eq!(evidence.len(), count);
+            assert!(evidence
+                .iter()
+                .all(|record| record.output.len() <= 16 * 1024));
+            if mode == "evidence-large" {
+                assert!(evidence[0].output.len() >= 16 * 1024 - 3);
+            } else {
+                assert_eq!(evidence[64].exit_code, 1);
+                assert!(evidence[64].output.ends_with("第 65 条命令失败"));
+            }
+        }
+    }
+
+    #[test]
+    fn nonterminal_missing_exit_and_declined_commands_are_not_evidence() {
+        let mut seen = HashSet::new();
+        for item in [
+            json!({"type":"commandExecution","id":"1","command":"true","status":"inProgress","exitCode":0}),
+            json!({"type":"commandExecution","id":"2","command":"true","status":"declined","exitCode":0}),
+            json!({"type":"commandExecution","id":"3","command":"true","status":"completed","exitCode":null}),
+        ] {
+            capture_evidence(&item, &mut seen, &|_| panic!("invalid evidence accepted"));
+        }
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn shell_normalization_keeps_the_complete_script_and_rejects_outer_syntax() {
+        for (input, expected) in [
+            ("/bin/zsh -lc 'python3 check.py'", "python3 check.py"),
+            ("bash -c \"python3 check.py\"", "python3 check.py"),
+            (
+                "/bin/sh -c 'python3 check.py || true'",
+                "python3 check.py || true",
+            ),
+            (
+                r#"sh -c 'printf '\''quoted'\''; python3 check.py'"#,
+                "printf 'quoted'; python3 check.py",
+            ),
+            (" python3 check.py ", "python3 check.py"),
+            ("sh -c true extra", "sh -c true extra"),
+            ("sh -c 'unterminated", "sh -c 'unterminated"),
+            (
+                "sh -c 'python3 check.py'; true",
+                "sh -c 'python3 check.py'; true",
+            ),
+            ("sh -c \"$(echo true)\"", "sh -c \"$(echo true)\""),
+            (
+                "/tmp/sh -c 'python3 check.py'",
+                "/tmp/sh -c 'python3 check.py'",
+            ),
+        ] {
+            assert_eq!(normalize_command(input), expected, "{input}");
+        }
     }
 
     #[tokio::test]

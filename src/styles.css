@@ -2432,10 +2432,12 @@ textarea {
 .plan-node-list { display: flex; flex-direction: column; gap: 12px; }
 .plan-editor-node { border: 1px solid var(--line); border-radius: 9px; padding: 12px; margin: 0; min-width: 0; background: var(--surface); }
 .plan-editor-heading { display: flex; align-items: center; justify-content: space-between; font-size: 10px; margin-bottom: 12px; color: var(--muted); }
-.plan-editor-heading > button { padding: 3px; color: var(--muted); }
-.plan-editor-heading > button:hover { color: var(--danger); }
+.plan-editor-heading > div { display: flex; align-items: center; gap: 7px; }
+.plan-editor-heading button { padding: 3px; color: var(--muted); }
+.plan-editor-heading button:hover { color: var(--danger); }
+.plan-node-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
 .plan-editor-node input:not([type="checkbox"]), .plan-editor-node textarea, .plan-editor-node select { display: block; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); width: 100%; padding: 8px; margin: 6px 0 12px; font-size: 11px; line-height: 1.7; }
-.plan-editor-node:disabled input, .plan-editor-node:disabled textarea, .plan-editor-node:disabled select { border-color: transparent; background: transparent; padding: 0; opacity: 1; color: var(--ink); }
+.plan-node-locked input, .plan-node-locked textarea, .plan-node-locked select { border-color: transparent !important; background: transparent !important; padding: 0 !important; opacity: 1; color: var(--ink); }
 .plan-editor-node textarea { resize: vertical; min-height: 78px; }
 .dependency-options { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; max-height: 160px; overflow-y: auto; }
 .dependency-options > label { display: flex; align-items: center; gap: 7px; line-height: 1.7; }
@@ -2464,6 +2466,23 @@ textarea {
 .status-draft, .status-reviewing { color: var(--accent); background: var(--accent-light); }
 .status-blocked { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
 .status-pending, .status-cancelled { color: var(--secondary); background: var(--surface-2); }
+.status-paused { color: var(--accent); background: var(--accent-light); }
+.plan-runtime-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 12px; }
+.plan-runtime-controls > div { flex: 1 1 180px; }
+.plan-runtime-controls strong { font-size: 12px; font-weight: 500; }
+.plan-runtime-controls p { font-size: 11px; line-height: 1.8; margin-top: 5px; color: var(--secondary); }
+.plan-runtime-controls > .help-text { flex-basis: 100%; line-height: 1.8; }
+.node-repair-fields { display: grid; gap: 13px; border-top: 1px solid var(--line); margin: 12px 0; padding-top: 12px; }
+.node-resolution { font-size: 11px; line-height: 1.8; border-left: 2px solid var(--accent); padding-left: 9px; color: var(--accent); margin-top: 12px; }
+.execution-evidence { font-size: 11px; color: var(--secondary); margin-top: 14px; }
+.execution-evidence > summary { cursor: pointer; color: var(--ink); }
+.execution-evidence > p { line-height: 1.8; margin-top: 9px; }
+.evidence-item { padding: 10px; border: 1px solid var(--line); border-radius: 6px; margin-top: 9px; min-width: 0; }
+.evidence-item > div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.evidence-item code { flex: 1 1 150px; overflow-wrap: anywhere; font-size: 10px; }
+.evidence-item span { font-size: 10px; white-space: nowrap; }
+.evidence-item pre { max-height: 220px; overflow: auto; font-size: 10px; line-height: 1.7; margin-top: 9px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.evidence-pass { color: var(--accent); }
 .plan-failed, .plan-blocked { border-color: var(--danger); }
 .plan-graph .react-flow__controls button { background: var(--surface); fill: var(--ink); border-color: var(--line); }
 .plan-graph .react-flow__controls button:hover { background: var(--surface-2); }

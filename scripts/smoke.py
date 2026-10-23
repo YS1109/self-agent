@@ -39,13 +39,14 @@ def wait_for(check, timeout=15, description="condition"):
 
 
 class Daemon:
-    def __init__(self, directory):
+    def __init__(self, directory, extra_env=None):
         self.directory = Path(directory)
         self.port = available_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.token = ""
         self.process = None
         self.log = None
+        self.extra_env = extra_env or {}
 
     def start(self):
         executable = ROOT / "target" / "debug" / (
@@ -63,6 +64,7 @@ class Daemon:
             HARNESS_BIND=f"127.0.0.1:{self.port}",
             HARNESS_DEMO_STEP_MS="450",
         )
+        env.update(self.extra_env)
         self.log = (self.directory / "smoke.log").open("ab")
         self.process = subprocess.Popen(
             [str(executable)], cwd=ROOT, env=env, stdout=self.log, stderr=self.log

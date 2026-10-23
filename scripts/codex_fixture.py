@@ -133,9 +133,60 @@ send(
     }
 )
 event("item/started", {"item": {"type": "commandExecution"}})
+command = {
+    "type": "commandExecution",
+    "id": "command-1",
+    "command": "/bin/zsh -lc 'python3 check.py'",
+    "cwd": str(root),
+    "commandActions": [],
+    "status": "failed" if mode == "evidence-failure" else "completed",
+    "exitCode": 1 if mode == "evidence-failure" else 0,
+    "aggregatedOutput": "测试失败" if mode == "evidence-failure" else "测试通过",
+}
+if mode == "evidence-large":
+    command["aggregatedOutput"] = "证据" * 10000
+if mode == "evidence-wrong-turn":
+    send(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "fixture-thread",
+                "turnId": "other-turn",
+                "item": command,
+            },
+        }
+    )
+elif mode == "evidence-many":
+    for number in range(70):
+        event(
+            "item/completed",
+            {
+                "item": {
+                    **command,
+                    "id": f"command-{number}",
+                    "status": "failed" if number == 64 else "completed",
+                    "exitCode": 1 if number == 64 else 0,
+                    "aggregatedOutput": "第 65 条命令失败" if number == 64 else "测试通过",
+                }
+            },
+        )
+elif mode != "evidence-text":
+    event("item/completed", {"item": command})
+    # A repeated lifecycle event must not duplicate persisted evidence.
+    event("item/completed", {"item": command})
 event(
     "item/completed",
-    {"item": {"type": "agentMessage", "phase": "final_answer", "text": "测试执行结果"}},
+    {
+        "item": {
+            "type": "agentMessage",
+            "phase": "final_answer",
+            "text": (
+                '{"command":"python3 check.py","exitCode":0,"aggregatedOutput":"通过"}'
+                if mode == "evidence-text"
+                else "测试执行结果"
+            ),
+        }
+    },
 )
 event(
     "item/completed",
@@ -148,7 +199,7 @@ event(
     {
         "turn": {
             "id": "fixture-turn",
-            "status": "failed" if mode == "failure" else "completed",
+            "status": "failed" if mode in ("failure", "evidence-failure") else "completed",
             "items": [],
             "error": {"message": "secret-provider-error"} if mode == "failure" else None,
         }

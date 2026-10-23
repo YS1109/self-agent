@@ -403,10 +403,30 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             permit = workspace_gate.clone().acquire_owned() => break permit.unwrap(),
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 if cancelled(&state, &task_id) { return; }
+                let mut store = state.store.lock().unwrap();
+                if !store.task_may_start(&task_id).unwrap_or(false) {
+                    if let Err(error) = store.defer_task(&task_id) {
+                        tracing::error!(%error, %task_id, "无法恢复等待项目锁的任务");
+                    }
+                    return;
+                }
             }
         }
     };
     if cancelled(&state, &task_id) {
+        return;
+    }
+    let may_start = state
+        .store
+        .lock()
+        .unwrap()
+        .task_may_start(&task_id)
+        .unwrap_or(false);
+    if !may_start {
+        if let Err(error) = state.store.lock().unwrap().defer_task(&task_id) {
+            tracing::error!(%error, %task_id, "无法恢复未执行任务的排队状态");
+        }
+        drop(permit);
         return;
     }
     let result = if task["execution_mode"] == "demo" {
@@ -437,8 +457,15 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             .as_str()
             .or_else(|| task["title"].as_str())
             .unwrap_or_default();
-        let objective = if agent.instructions.trim().is_empty() {
+        let objective = if let Some(command) = task["acceptance_command"].as_str() {
+            format!(
+                "{objective}\n\n节点验收要求：实际执行以下完整命令并报告真实退出结果；不得以其他命令或文字说明替代。命令失败时保留记录。\n{command}"
+            )
+        } else {
             objective.to_owned()
+        };
+        let objective = if agent.instructions.trim().is_empty() {
+            objective
         } else {
             format!(
                 "角色职责：\n{}\n\n任务目标：\n{objective}",
@@ -460,17 +487,41 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             }
         };
         let is_cancelled = move || cancelled(&state_for_cancel, &task_for_cancel);
+        let state_for_evidence = state.clone();
+        let task_for_evidence = task_id.clone();
+        let evidence_secret = settings.api_key.clone();
+        let evidence = move |mut item: harness_core::CommandEvidence| {
+            item.command = redact_secret(&item.command, &evidence_secret);
+            item.output = redact_secret(&item.output, &evidence_secret);
+            if let Err(error) = state_for_evidence
+                .store
+                .lock()
+                .unwrap()
+                .record_evidence(&task_for_evidence, item)
+            {
+                tracing::error!(%error, "无法保存命令执行证据");
+            }
+        };
         match agent.executor.as_str() {
             "native" => {
-                provider::execute(&settings, &root, &objective, progress, is_cancelled).await
+                provider::execute_with_evidence(
+                    &settings,
+                    &root,
+                    &objective,
+                    progress,
+                    is_cancelled,
+                    evidence,
+                )
+                .await
             }
-            "codex" => codex::execute(
+            "codex" => codex::execute_with_evidence(
                 &settings.codex_binary,
                 &agent.model,
                 &root,
                 &objective,
                 progress,
                 is_cancelled,
+                evidence,
             )
             .await
             .map(|text| redact_secret(&text, &settings.api_key))

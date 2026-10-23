@@ -24,6 +24,11 @@ export interface TaskStep {
   status: string;
   detail?: string;
 }
+export interface ExecutionEvidence {
+  command: string;
+  exit_code: number;
+  output: string;
+}
 export interface TaskRun {
   id: string;
   session_id: string;
@@ -40,6 +45,7 @@ export interface TaskRun {
   node_id?: string | null;
   task_kind?: "worker" | "plan";
   agent?: AgentProfile | null;
+  evidence?: ExecutionEvidence[];
 }
 export interface AgentProfile {
   id: string;
@@ -58,8 +64,13 @@ export interface PlanNode {
   result?: string | null;
   error?: string | null;
   agent_id?: string | null;
+  repairs?: string[];
+  verifies?: string[];
+  acceptance_command?: string | null;
+  evidence?: ExecutionEvidence[];
+  resolved_by?: string | null;
 }
-export type EditablePlanNode = Pick<PlanNode, "id" | "title" | "objective" | "depends_on" | "agent_id">;
+export type EditablePlanNode = Pick<PlanNode, "id" | "title" | "objective" | "depends_on" | "agent_id" | "repairs" | "verifies" | "acceptance_command">;
 export interface Plan {
   id: string;
   session_id: string;
@@ -67,7 +78,7 @@ export interface Plan {
   title: string;
   source: SourceContext;
   execution_mode: "native" | "demo";
-  status: "draft" | "running" | "reviewing" | "waiting_input" | "completed" | "failed" | "cancelled";
+  status: "draft" | "running" | "paused" | "reviewing" | "waiting_input" | "completed" | "failed" | "cancelled";
   revision: number;
   round: number;
   max_rounds: number;
@@ -78,6 +89,8 @@ export interface Plan {
   nodes: PlanNode[];
   agents?: AgentProfile[];
   default_agent_id?: string | null;
+  used_node_ids?: string[];
+  paused_from_status?: string | null;
 }
 export interface Delivery {
   id: string;
@@ -132,6 +145,8 @@ export type Command =
   | { type: "start_task"; session_id?: string; title: string }
   | { type: "cancel_task"; task_id: string }
   | { type: "update_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
+  | { type: "patch_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
+  | { type: "pause_plan" | "resume_plan"; plan_id: string; expected_revision: number }
   | { type: "start_plan"; plan_id: string; expected_revision: number }
   | { type: "cancel_plan"; plan_id: string }
   | { type: "retry_delivery"; delivery_id: string };
@@ -163,7 +178,7 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   plans: [],
 };
 export const activeTask = (status: string) =>
-  status === "queued" || status === "running" || status === "waiting_input";
+  status === "queued" || status === "running" || status === "paused" || status === "waiting_input";
 export const sameSource = (a: SourceContext, b: SourceContext) =>
   a.channel_id === b.channel_id &&
   a.actor_id === b.actor_id &&

@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "harness-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1362,6 +1362,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "shlex",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3055,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "self-agent-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "harness-core",
  "libc",
