@@ -7,14 +7,6 @@ import {
 } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
-  ReactFlow,
-  Background,
-  Controls,
-  MarkerType,
-  type Node,
-  type Edge,
-} from "@xyflow/react";
-import {
   ArrowDown,
   ArrowUp,
   ArrowUpRight,
@@ -54,6 +46,9 @@ import {
   Zap,
 } from "lucide-react";
 import { api, dispatch } from "./api";
+import { PlanPanel } from "./components/plan-panel";
+import { Status } from "./components/status";
+import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./labels";
 import { Button } from "./components/ui/button";
 import {
   activeTask,
@@ -70,17 +65,6 @@ import {
 
 type Panel = "plan" | "changes" | "artifacts" | "task";
 type Modal = "new" | "settings" | "remote" | "capabilities" | null;
-const STATUS: Record<string, string> = {
-  queued: "排队中",
-  running: "执行中",
-  waiting_input: "需要输入",
-  completed: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-  pending: "待投递",
-  sending: "投递中",
-  sent: "已送达",
-};
 const time = (value: string) =>
   new Date(value).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -91,20 +75,6 @@ const projectName = (path: string) =>
 const errorMessage = (value: unknown) =>
   value instanceof Error ? value.message : String(value);
 
-function Status({ status }: { status: string }) {
-  return (
-    <span className={`status status-${status}`}>
-      {status === "running" || status === "sending" ? (
-        <Loader2 size={11} className="spin" />
-      ) : status === "completed" || status === "sent" ? (
-        <Check size={11} />
-      ) : (
-        <span className="status-dot" />
-      )}
-      {STATUS[status] ?? status}
-    </span>
-  );
-}
 function ModalFrame({
   open,
   onClose,
@@ -169,15 +139,15 @@ function TaskCard({
       </div>
       <div className="task-card-content">
         <div className="task-card-top">
-          <span>执行 Agent</span>
+          <span>{task.task_kind === "plan" ? "计划执行" : task.plan_id ? "计划子任务" : "直接执行"}</span>
           <Status status={task.status} />
         </div>
         <strong>{task.title}</strong>
         <div className="task-card-meta">
           <span>
             {task.execution_mode === "demo"
-              ? "DEMO · 模拟执行"
-              : "Native executor"}
+              ? "演示模式 · 模拟执行"
+              : "原生执行器"}
           </span>
           <span>
             {done}/{task.steps.length} 步骤
@@ -191,66 +161,6 @@ function TaskCard({
       </div>
       <ChevronRight size={16} className="muted" />
     </button>
-  );
-}
-function PlanView({ task }: { task?: TaskRun }) {
-  if (!task || !task.steps.length)
-    return (
-      <EmptyPanel
-        icon={<Network />}
-        title="从一个目标开始"
-        detail="启动任务后，在这里查看真实执行步骤与状态。"
-      />
-    );
-  const nodes: Node[] = task.steps.map((step, i) => ({
-    id: step.id,
-    position: { x: 35, y: i * 118 },
-    data: {
-      label: (
-        <div className="flow-node-content">
-          <span className="flow-step">
-            STEP {String(i + 1).padStart(2, "0")}
-          </span>
-          <strong>{step.title}</strong>
-          <Status status={step.status} />
-        </div>
-      ),
-    },
-    className: `plan-node plan-${step.status}`,
-    draggable: false,
-  }));
-  const edges: Edge[] = task.steps
-    .slice(1)
-    .map((step, i) => ({
-      id: `e-${step.id}`,
-      source: task.steps[i].id,
-      target: step.id,
-      type: "smoothstep",
-      animated: step.status === "running",
-      markerEnd: { type: MarkerType.ArrowClosed, color: "#a4b1aa" },
-      style: { stroke: "#a4b1aa" },
-    }));
-  return (
-    <div className="flow-wrap">
-      <div className="panel-note">
-        <ShieldCheck size={13} />
-        执行步骤 · v0 只读
-      </div>
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        fitView
-        fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
-        nodesConnectable={false}
-        nodesDraggable={false}
-        elementsSelectable={false}
-        minZoom={0.3}
-        maxZoom={1.5}
-      >
-        <Background gap={18} size={1} color="#a8b2ab55" />
-        <Controls showInteractive={false} />
-      </ReactFlow>
-    </div>
   );
 }
 function EmptyPanel({
@@ -283,6 +193,7 @@ export default function App() {
   const [panel, setPanel] = useState<Panel | null>(null);
   const [activity, setActivity] = useState(false);
   const [taskId, setTaskId] = useState<string>();
+  const [planId, setPlanId] = useState<string>();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [settings, setSettings] = useState<Settings>({
     base_url: "",
@@ -307,8 +218,11 @@ export default function App() {
   )?.session_id;
   const session = snapshot.sessions.find((s) => s.id === sessionId);
   const tasks = snapshot.tasks.filter((t) => t.session_id === sessionId);
+  const plans = (snapshot.plans ?? []).filter((p) => p.session_id === sessionId);
   const selectedTask = tasks.find((t) => t.id === taskId) ?? tasks[0];
-  const running = snapshot.tasks.filter((t) => activeTask(t.status));
+  const running = snapshot.tasks.filter(
+    (t) => t.task_kind !== "plan" && ["queued", "running"].includes(t.status),
+  );
   const draftKey = sessionId ?? "new";
   const draft = drafts[draftKey] ?? "";
   const events = snapshot.events.filter(
@@ -321,7 +235,7 @@ export default function App() {
   async function refresh() {
     try {
       const value = await api<Snapshot>("GET", "/snapshot");
-      setSnapshot(value);
+      setSnapshot({ ...value, plans: value.plans ?? [] });
       setConnected(true);
       setConnectionError("");
     } catch (error) {
@@ -429,8 +343,15 @@ export default function App() {
           },
     );
     if (receipt) {
-      setDrafts((old) => ({ ...old, [key]: "" }));
+      setDrafts((old) => old[key] === draft ? { ...old, [key]: "" } : old);
       if (receipt.task_id) setTaskId(receipt.task_id);
+      if (!run) {
+        setPanel("plan");
+        setPlanId(receipt.plan_id);
+        setNotice(settings.execution_mode !== "demo" && !settings.configured
+          ? "请先在设置中配置模型服务。指令已保存，主智能体会提示配置要求。"
+          : "目标已接收，主智能体正在后台处理；生成计划后可在右侧审阅。" );
+      }
     }
   }
   async function saveSettings(event: FormEvent) {
@@ -465,7 +386,7 @@ export default function App() {
       setRemoteReceipt(
         `已接收 · ${receipt.command_id.slice(0, 8)}${receipt.task_id ? ` · 任务 ${receipt.task_id.slice(0, 8)}` : ""}`,
       );
-      setRemoteText("");
+      setRemoteText((current) => current === remoteText ? "" : current);
     }
   }
   const togglePanel = (value: Panel) =>
@@ -484,7 +405,7 @@ export default function App() {
           <strong>
             harness<span className="brand-period">.</span>
           </strong>
-          <span className="local-label">LOCAL</span>
+          <span className="local-label">本地</span>
           <Button
             variant="ghost"
             size="icon"
@@ -531,6 +452,7 @@ export default function App() {
                           session_id: s.id,
                         });
                         setTaskId(undefined);
+                        setPlanId(undefined);
                         if (window.innerWidth < 760) setSidebar(false);
                       }}
                     >
@@ -572,14 +494,14 @@ export default function App() {
           <button className="sidebar-link" onClick={() => setModal("remote")}>
             <Radio size={16} />
             <span>远程入口</span>
-            <span className="beta-tag">LAB</span>
+            <span className="beta-tag">实验</span>
           </button>
           <div className="sidebar-bottom">
             <button className="profile" onClick={() => setModal("settings")}>
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-                <small>Local-first · v0.1</small>
+                <small>本地优先 · v0.2</small>
               </span>
               <Settings2 size={15} />
             </button>
@@ -666,14 +588,14 @@ export default function App() {
                     <Waypoints size={36} strokeWidth={1.3} />
                     <span />
                   </div>
-                  <div className="eyebrow">YOUR AGENTS. YOUR WORKFLOW.</div>
+                  <div className="eyebrow">你的智能体，你的工作流。</div>
                   <h1>
                     想法在前，
                     <br />
-                    <span>Agent 随行。</span>
+                    <span>智能体随行。</span>
                   </h1>
                   <p>
-                    把目标交给主 Agent，让执行在后台继续。
+                    把目标交给主智能体，让执行在后台继续。
                     <br />
                     由你掌控每一段工作流。
                   </p>
@@ -726,7 +648,7 @@ export default function App() {
                         "zh-CN",
                         { month: "long", day: "numeric" },
                       )}{" "}
-                      · 主 Agent 会话
+                      · 主智能体 会话
                     </span>
                   </div>
                   {!session.messages.length && !tasks.length && (
@@ -734,7 +656,7 @@ export default function App() {
                       <Sparkles size={20} />
                       <p>准备好了，告诉我你的目标。</p>
                       <span>
-                        发送消息管理会话，或选择「执行任务」启动后台 Agent。
+                        发送目标生成可编辑计划，或选择「直接执行」运行单个任务。
                       </span>
                     </div>
                   )}
@@ -755,17 +677,32 @@ export default function App() {
                           {message.role === "user"
                             ? "你"
                             : message.role === "assistant"
-                              ? "主 Agent"
+                              ? "主智能体"
                               : "系统"}
                           <time>{time(message.created_at)}</time>
                           {message.task_id && (
                             <span className="inline-tag">任务更新</span>
                           )}
                         </div>
-                        <div className="message-text">{message.content}</div>
+                        <div className="message-text">{message.role === "user" ? message.content : localizeSystemText(message.content)}</div>
                       </div>
                     </article>
                   ))}
+                  {plans.length > 0 && (
+                    <section className="tasks-section">
+                      <div className="section-label"><Network size={13} />编排计划<span>{plans.length}</span></div>
+                      {plans.map((plan) => (
+                        <button key={plan.id} className={`task-card ${planId === plan.id && panel === "plan" ? "task-selected" : ""}`} onClick={() => { setPlanId(plan.id); setPanel("plan"); }}>
+                          <div className="task-icon"><Network size={18} /></div>
+                          <div className="task-card-content">
+                            <div className="task-card-top"><span>主智能体编排</span><Status status={plan.status} /></div>
+                            <strong>{plan.title}</strong>
+                            <div className="task-card-meta"><span>{plan.nodes.length} 个任务 · 版本 {plan.revision}</span><span>{plan.status === "draft" ? "审阅后启动" : `回顾 ${plan.round}/${plan.max_rounds}`}</span></div>
+                          </div><ChevronRight size={16} className="muted" />
+                        </button>
+                      ))}
+                    </section>
+                  )}
                   {tasks.length > 0 && (
                     <section className="tasks-section">
                       <div className="section-label">
@@ -798,16 +735,16 @@ export default function App() {
                     ? `${running.length} 个后台任务正在进行`
                     : "准备就绪，随时开始"}
                 </span>
-                {running.length > 0 && <span>主 Agent 仍可接收指令</span>}
+                {running.length > 0 && <span>主智能体 仍可接收指令</span>}
               </div>
               <div
                 className={`composer ${!session ? "composer-inactive" : ""}`}
               >
                 <textarea
-                  aria-label="向主 Agent 发送指令"
+                  aria-label="向主智能体 发送指令"
                   placeholder={
                     session
-                      ? "告诉 Agent 你的目标，或补充新的指令…"
+                      ? "告诉主智能体你的目标，或补充新的指令…"
                       : "先创建一个会话，开始编排你的工作…"
                   }
                   value={draft}
@@ -836,33 +773,33 @@ export default function App() {
                     <span
                       className={`mode-pill ${settings.execution_mode === "demo" ? "mode-demo" : ""}`}
                     >
-                      {settings.execution_mode === "demo" ? "DEMO" : "NATIVE"}
+                      {settings.execution_mode === "demo" ? "演示" : "原生"}
                     </span>
                   </div>
                   <div className="composer-submit">
                     <Button
-                      variant="ghost"
                       size="small"
                       disabled={!connected || !session || !draft.trim() || busy}
                       onClick={() => void send(false)}
-                      title="发送管理消息 (⌘/Ctrl + Enter)"
+                      title="发送目标给主智能体（⌘/Ctrl + Enter）"
                     >
                       <MessageSquare size={13} />
-                      <span>发送</span>
+                      <span>发送目标</span>
                     </Button>
                     <Button
+                      variant="ghost"
                       size="small"
                       disabled={!connected || !session || !draft.trim() || busy}
                       onClick={() => void send(true)}
                     >
                       <ArrowUp size={14} />
-                      <span>执行任务</span>
+                      <span>直接执行</span>
                     </Button>
                   </div>
                 </div>
               </div>
               <div className="composer-footnote">
-                <span>消息管理会话 · 执行任务启动 Agent 工具循环</span>
+                <span>发送目标 → 审阅计划 → 启动执行</span>
                 <span>⌘ ↵ 发送</span>
               </div>
             </div>
@@ -908,7 +845,10 @@ export default function App() {
                 </button>
               </div>
               {panel === "plan" ? (
-                <PlanView task={selectedTask} />
+                <PlanPanel
+                  plans={plans} selectedId={planId} onSelect={setPlanId}
+                  connected={connected} busy={busy} onCommand={command}
+                />
               ) : panel === "changes" ? (
                 <EmptyPanel
                   icon={<FileCode2 />}
@@ -921,7 +861,7 @@ export default function App() {
                     <div className="section-label">任务结果</div>
                     <pre className="result-text">
                       {typeof selectedTask.result === "string"
-                        ? selectedTask.result
+                        ? localizeSystemText(selectedTask.result)
                         : JSON.stringify(selectedTask.result, null, 2)}
                     </pre>
                   </div>
@@ -944,8 +884,8 @@ export default function App() {
                   <div className="detail-labels">
                     <span>
                       {selectedTask.execution_mode === "demo"
-                        ? "Demo · 模拟任务"
-                        : "Native · 真实执行"}
+                        ? "演示模式 · 模拟任务"
+                        : "原生模式 · 真实执行"}
                     </span>
                     <code>{selectedTask.id.slice(0, 8)}</code>
                   </div>
@@ -964,15 +904,15 @@ export default function App() {
                           )}
                         </span>
                         <div>
-                          <strong>{step.title}</strong>
-                          {step.detail && <p>{step.detail}</p>}
+                          <strong>{localizeSystemText(step.title)}</strong>
+                          {step.detail && <p>{localizeSystemText(step.detail)}</p>}
                         </div>
                       </div>
                     ))}
                   </div>
                   {selectedTask.error && (
                     <div className="task-error" role="alert">
-                      {selectedTask.error}
+                      {localizeSystemText(selectedTask.error)}
                     </div>
                   )}
                   {selectedTask.result && (
@@ -980,7 +920,7 @@ export default function App() {
                       <div className="section-label">执行结果</div>
                       <pre>
                         {typeof selectedTask.result === "string"
-                          ? selectedTask.result
+                          ? localizeSystemText(selectedTask.result)
                           : JSON.stringify(selectedTask.result, null, 2)}
                       </pre>
                     </div>
@@ -1007,10 +947,11 @@ export default function App() {
                       className="cancel-task"
                       disabled={busy || !connected}
                       onClick={() =>
-                        void command({
-                          type: "cancel_task",
-                          task_id: selectedTask.id,
-                        })
+                        void command(
+                          selectedTask.task_kind === "plan" && selectedTask.plan_id
+                            ? { type: "cancel_plan", plan_id: selectedTask.plan_id }
+                            : { type: "cancel_task", task_id: selectedTask.id },
+                        )
                       }
                     >
                       <Square size={13} />
@@ -1049,8 +990,8 @@ export default function App() {
                 events.slice(-80).map((event) => (
                   <div className="activity-line" key={event.id}>
                     <time>{time(event.created_at)}</time>
-                    <span className="event-kind">{event.kind}</span>
-                    <span>{event.message}</span>
+                    <span className="event-kind" title={event.kind}>{eventLabel(event.kind)}</span>
+                    <span>{localizeSystemText(event.message)}</span>
                   </div>
                 ))
               ) : (
@@ -1078,7 +1019,7 @@ export default function App() {
             <span>
               {settings.execution_mode === "demo"
                 ? "模拟执行模式"
-                : "Native executor"}
+                : "原生执行器"}
             </span>
             <button onClick={() => setModal("settings")} aria-label="打开设置">
               <Settings2 size={12} />
@@ -1092,7 +1033,7 @@ export default function App() {
         open={modal === "new"}
         onClose={() => setModal(null)}
         title="开启新的工作"
-        description="为 Agent 选择项目目录，所有工作围绕这个会话展开。"
+        description="选择项目目录，所有工作围绕这个会话展开。"
       >
         <form onSubmit={createSession} className="form-body">
           <label>
@@ -1168,7 +1109,7 @@ export default function App() {
               }
             >
               <Code2 size={19} />
-              <strong>Native</strong>
+              <strong>原生模式</strong>
               <span>真实模型与工具循环</span>
               {settingsForm.execution_mode === "native" && (
                 <CheckCircle2 size={15} />
@@ -1184,7 +1125,7 @@ export default function App() {
               }
             >
               <Sparkles size={19} />
-              <strong>Demo</strong>
+              <strong>演示模式</strong>
               <span>仅模拟步骤与回传</span>
               {settingsForm.execution_mode === "demo" && (
                 <CheckCircle2 size={15} />
@@ -1192,7 +1133,7 @@ export default function App() {
             </button>
           </div>
           <label>
-            Base URL
+            模型服务地址
             <input
               type="url"
               placeholder="https://api.example.com/v1"
@@ -1213,7 +1154,7 @@ export default function App() {
             />
           </label>
           <label>
-            API Key{" "}
+            访问密钥{" "}
             <span className="field-note">
               {settings.api_key_configured ? "已配置 · 留空保留" : "未配置"}
             </span>
@@ -1221,7 +1162,7 @@ export default function App() {
               type="password"
               autoComplete="off"
               placeholder={
-                settings.api_key_configured ? "留空保留现有密钥" : "输入 API Key"
+                settings.api_key_configured ? "留空保留现有密钥" : "输入访问密钥"
               }
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
@@ -1230,14 +1171,13 @@ export default function App() {
           <div className="form-info">
             <ShieldCheck size={16} />
             <p>
-              v0
-              密钥仅保存在后台进程内存中，重启后需重新填写，也可通过环境变量配置。模型协议为
+              访问密钥仅保存在后台进程内存中，重启后需重新填写，也可通过环境变量配置。模型协议为
               Chat Completions。
             </p>
           </div>
           {settingsForm.execution_mode === "demo" && (
             <div className="demo-warning">
-              Demo 只验证编排和回传链路，不修改项目，也不运行真实测试。
+              演示模式只验证编排和回传链路，不修改项目，也不运行真实测试。
             </div>
           )}
           <div className="modal-actions">
@@ -1260,7 +1200,7 @@ export default function App() {
         open={modal === "capabilities"}
         onClose={() => setModal(null)}
         title="能力目录"
-        description="由后台报告的真实可用能力。更多执行器、MCP 和 Skills 将在后续接入。"
+        description="由后台报告的真实可用能力。更多执行器、MCP 工具和技能将在后续接入。"
         wide
       >
         <div className="capability-list">
@@ -1278,10 +1218,10 @@ export default function App() {
                 </span>
                 <div>
                   <strong>
-                    {capability.name}
-                    <span className="inline-tag">{capability.kind}</span>
+                    {capabilityLabel(capability).name}
+                    <span className="inline-tag">{kindLabel(capability.kind)}</span>
                   </strong>
-                  <p>{capability.description}</p>
+                  <p>{capabilityLabel(capability).description}</p>
                 </div>
                 <span
                   className={`availability ${capability.enabled ? "available" : ""}`}
@@ -1320,7 +1260,7 @@ export default function App() {
                 <Globe2 size={20} />
               </span>
               <div>
-                <strong>simulator / owner</strong>
+                <strong>本地模拟器 / 所有者</strong>
                 <select
                   aria-label="远程对话"
                   value={remoteSource.conversation_id}
@@ -1332,11 +1272,11 @@ export default function App() {
                     setRemoteReceipt("");
                   }}
                 >
-                  <option value="remote-1">remote-1</option>
-                  <option value="remote-2">remote-2</option>
+                  <option value="remote-1">远程对话 1</option>
+                  <option value="remote-2">远程对话 2</option>
                 </select>
               </div>
-              <span className="beta-tag">LOCAL</span>
+              <span className="beta-tag">本地</span>
             </div>
             <label className="remote-label">
               此入口选中的会话
@@ -1372,7 +1312,6 @@ export default function App() {
             />
             <div className="remote-actions">
               <Button
-                variant="secondary"
                 size="small"
                 disabled={
                   !connected || busy || !remoteSelection || !remoteText.trim()
@@ -1380,9 +1319,10 @@ export default function App() {
                 onClick={() => void remoteSend(false)}
               >
                 <Send size={13} />
-                发送消息
+                发送目标
               </Button>
               <Button
+                variant="secondary"
                 size="small"
                 disabled={
                   !connected || busy || !remoteSelection || !remoteText.trim()
@@ -1390,7 +1330,7 @@ export default function App() {
                 onClick={() => void remoteSend(true)}
               >
                 <ArrowUp size={13} />
-                派发任务
+                直接执行
               </Button>
             </div>
             {remoteReceipt && (

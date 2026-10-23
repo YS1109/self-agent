@@ -30,9 +30,11 @@ jobs:
           python-version: "3.12"
       - run: python scripts/smoke.py
       - run: python scripts/provider_smoke.py
+      - run: python scripts/orchestration_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}
+    timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -49,9 +51,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: pnpm build:web

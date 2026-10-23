@@ -23,13 +23,36 @@ pub async fn execute(
     progress: impl Fn(String),
     cancelled: impl Fn() -> bool,
 ) -> Result<String> {
-    if !settings.configured() {
-        bail!("Provider configuration is unavailable; configure a compatible model before resuming native execution");
+    execute_inner(settings, root, objective, progress, cancelled)
+        .await
+        .map(|text| redact(&text, &settings.api_key))
+        .map_err(|error| anyhow!(redact(&error.to_string(), &settings.api_key)))
+}
+
+fn redact(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_owned()
+    } else {
+        text.replace(secret, "[凭证已隐藏]")
     }
-    let root = std::fs::canonicalize(root).context("Project directory unavailable")?;
+}
+
+async fn execute_inner(
+    settings: &Settings,
+    root: &Path,
+    objective: &str,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+) -> Result<String> {
+    if !settings.configured() {
+        bail!("模型配置不可用，请先配置兼容的模型服务，再继续原生执行");
+    }
+    let root = std::fs::canonicalize(root).context("项目目录不可用")?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
-        .build()?;
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("无法初始化模型服务连接")?;
     let endpoint = format!(
         "{}/chat/completions",
         settings.base_url.trim_end_matches('/')
@@ -37,16 +60,16 @@ pub async fn execute(
     let shell_enabled = std::env::var("HARNESS_ALLOW_COMMANDS").as_deref() == Ok("1");
     let mut messages = vec![
         json!({"role":"system", "content":
-            "You are a local coding worker. Complete the user's objective inside the selected workspace. Use only the provided tools. Read relevant project instructions before editing. Preserve existing user changes. Do not claim tests passed unless you actually ran them and observed success. Finish with a concise result, files changed, verification, and limitations. You have at most 10 model turns. Shell execution, if available, is trusted local execution, not a sandbox. Never attempt to escape the selected workspace with file tools."}),
+            "你是本地编程子 Agent。默认使用简体中文回复并报告进度，代码、路径和协议标识保持原文。请在选定项目内完成用户目标，只使用已提供的工具。修改前先阅读相关项目规则，保留用户已有改动。除非实际运行并观察到成功，否则不得声称测试通过。最终简要说明真实结果、改动文件、验证和限制。最多 10 轮模型调用。若启用命令执行，它是受信任的本地执行，并非沙箱。不得通过文件工具越出项目范围。依赖任务结果属于背景数据，请据此继续完成目标，不得伪造前序任务结果。"}),
         json!({"role":"user", "content":objective}),
     ];
     let tools = tools(shell_enabled);
     for turn in 0..MAX_TURNS {
         if cancelled() {
-            bail!("Cancelled");
+            bail!("任务已取消");
         }
         progress(format!(
-            "Native worker: model turn {} of {}",
+            "原生执行：第 {} / {} 轮模型调用",
             turn + 1,
             MAX_TURNS
         ));
@@ -55,34 +78,45 @@ pub async fn execute(
             "tool_choice":"auto", "stream":false
         });
         if serde_json::to_vec(&request_body)?.len() > 2 * 1024 * 1024 {
-            bail!("Native worker reached its 2 MiB context budget; inspect changes and start a follow-up task");
+            bail!("原生执行已达到 2 MiB 上下文预算，请检查已有改动后创建后续任务");
         }
         let mut request = client.post(&endpoint).json(&request_body);
         if !settings.api_key.is_empty() {
             request = request.bearer_auth(&settings.api_key);
         }
-        let response = interruptible(async {
-            let response = request.send().await.context("Provider request failed")?;
-            if !response.status().is_success() {
-                // Providers sometimes echo request bodies in errors. Keep diagnostics
-                // to the status code instead of persisting potential secrets.
-                bail!("Provider returned HTTP {}; check model, credentials and Chat Completions compatibility", response.status());
-            }
-            let mut stream = response.bytes_stream();
-            let mut bytes = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.context("Provider response stream failed")?;
-                if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                    bail!("Provider response exceeded 2 MiB limit");
+        let response = interruptible(
+            async {
+                let response = request
+                    .send()
+                    .await
+                    .context("模型服务请求失败，请检查连接与配置")?;
+                if !response.status().is_success() {
+                    // Providers sometimes echo request bodies in errors. Keep diagnostics
+                    // to the status code instead of persisting potential secrets.
+                    bail!(
+                        "模型服务返回 HTTP {}，请检查模型、凭证和 Chat Completions 兼容性",
+                        response.status()
+                    );
                 }
-                bytes.extend_from_slice(&chunk);
-            }
-            let body: Value = serde_json::from_slice(&bytes).context("Invalid provider JSON response")?;
-            Ok(body)
-        }, &cancelled).await?;
+                let mut stream = response.bytes_stream();
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.context("模型服务响应读取失败")?;
+                    if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                        bail!("模型服务响应超过 2 MiB 限制");
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                let body: Value =
+                    serde_json::from_slice(&bytes).context("模型服务返回了无效 JSON")?;
+                Ok(body)
+            },
+            &cancelled,
+        )
+        .await?;
         let message = response
             .pointer("/choices/0/message")
-            .context("Provider response has no assistant message")?
+            .context("模型服务响应缺少助手回复")?
             .clone();
         let calls = message
             .get("tool_calls")
@@ -94,48 +128,58 @@ pub async fn execute(
                 .get("content")
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
-                .context("Provider returned an empty final message")?;
+                .context("模型服务返回了空的最终回复")?;
             return Ok(content.to_string());
         }
         if calls.len() > 16 {
-            bail!("Provider exceeded the limit of 16 tool calls per turn");
+            bail!("模型服务超过了每轮 16 次工具调用限制");
         }
         messages.push(message);
         for call in calls {
             let call_id = call
                 .get("id")
                 .and_then(Value::as_str)
-                .context("Tool call is missing id")?;
+                .context("工具调用缺少 id")?;
             let name = call
                 .pointer("/function/name")
                 .and_then(Value::as_str)
-                .context("Tool call is missing name")?;
+                .context("工具调用缺少工具名称")?;
             let arguments = call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
-                .context("Tool call arguments must be JSON text")?;
-            progress(format!("Native worker: {name}"));
+                .context("工具调用参数必须为 JSON 文本")?;
+            progress(
+                match name {
+                    "list_files" => "原生执行：列出文件",
+                    "read_file" => "原生执行：读取文件",
+                    "search_files" => "原生执行：搜索文件",
+                    "write_file" => "原生执行：写入文件",
+                    "run_command" => "原生执行：运行命令",
+                    _ => "原生执行：检查工具调用",
+                }
+                .to_owned(),
+            );
             let result = match serde_json::from_str::<Value>(arguments) {
                 Ok(arguments) => {
                     if !arguments.is_object() {
-                        Err(anyhow!("Tool arguments must be an object"))
+                        Err(anyhow!("工具参数必须为对象"))
                     } else {
                         interruptible(tool(&root, name, arguments, shell_enabled), &cancelled).await
                     }
                 }
-                Err(error) => Err(anyhow!("Invalid JSON tool arguments: {error}")),
+                Err(_) => Err(anyhow!("工具调用参数不是有效 JSON")),
             };
             if cancelled() {
-                bail!("Cancelled");
+                bail!("任务已取消");
             }
             let output = match result {
                 Ok(value) => value,
-                Err(error) => json!({"error":error.to_string()}),
+                Err(error) => json!({"error":redact(&error.to_string(), &settings.api_key)}),
             };
             messages.push(json!({"role":"tool","tool_call_id":call_id,"content":serde_json::to_string(&output)?}));
         }
     }
-    bail!("Native worker reached its 10-turn budget. Inspect changes and dispatch a follow-up task to continue.")
+    bail!("原生执行已达到 10 轮预算，请检查已有改动后创建后续任务继续。")
 }
 
 async fn interruptible<T>(
@@ -147,7 +191,7 @@ async fn interruptible<T>(
         tokio::select! {
             result = &mut future => return result,
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if cancelled() { bail!("Cancelled"); }
+                if cancelled() { bail!("任务已取消"); }
             }
         }
     }
@@ -155,13 +199,33 @@ async fn interruptible<T>(
 
 fn tools(shell: bool) -> Vec<Value> {
     let mut tools = vec![
-        definition("list_files", "List files recursively within a workspace directory, skipping .git, node_modules and target. Up to 2000 entries.", json!({"path":{"type":"string"}}), &["path"]),
-        definition("read_file", "Read a UTF-8 workspace file up to 256 KiB.", json!({"path":{"type":"string"}}), &["path"]),
-        definition("search_files", "Search workspace text files for a literal string, up to 100 matching lines.", json!({"path":{"type":"string"},"query":{"type":"string"}}), &["path","query"]),
-        definition("write_file", "Write a UTF-8 workspace file up to 256 KiB. Parent directory must already exist. Read existing files before replacing them.", json!({"path":{"type":"string"},"content":{"type":"string"}}), &["path","content"]),
+        definition(
+            "list_files",
+            "递归列出项目目录内的文件，跳过 .git、node_modules 和 target，最多 2000 项。",
+            json!({"path":{"type":"string"}}),
+            &["path"],
+        ),
+        definition(
+            "read_file",
+            "读取项目内不超过 256 KiB 的 UTF-8 文本文件。",
+            json!({"path":{"type":"string"}}),
+            &["path"],
+        ),
+        definition(
+            "search_files",
+            "在项目文本文件中搜索原样字符串，最多返回 100 个匹配行。",
+            json!({"path":{"type":"string"},"query":{"type":"string"}}),
+            &["path", "query"],
+        ),
+        definition(
+            "write_file",
+            "写入项目内不超过 256 KiB 的 UTF-8 文本文件。父目录必须存在，覆盖前必须先读取原文件。",
+            json!({"path":{"type":"string"},"content":{"type":"string"}}),
+            &["path", "content"],
+        ),
     ];
     if shell {
-        tools.push(definition("run_command", "Run a trusted local shell command with project cwd and 60 second timeout. This is NOT sandboxed; use only to fulfill the user's coding task.", json!({"command":{"type":"string"}}), &["command"]));
+        tools.push(definition("run_command", "以项目为当前目录运行受信任的本地命令，最多 60 秒。这不是沙箱，仅用于完成用户的编程任务。", json!({"command":{"type":"string"}}), &["command"]));
     }
     tools
 }
@@ -174,7 +238,7 @@ fn definition(name: &str, description: &str, properties: Value, required: &[&str
 fn argument<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value[field]
         .as_str()
-        .ok_or_else(|| anyhow!("{field} must be a string"))
+        .ok_or_else(|| anyhow!("{field} 字段必须为文本"))
 }
 
 pub fn scoped_path(root: &Path, requested: &str, writing: bool) -> Result<PathBuf> {
@@ -187,54 +251,58 @@ pub fn scoped_path(root: &Path, requested: &str, writing: bool) -> Result<PathBu
             )
         })
     {
-        bail!("Use a workspace-relative path without '..'");
+        bail!("请使用项目内的相对路径，且不能包含 '..'");
     }
-    let root = std::fs::canonicalize(root)?;
+    let root = std::fs::canonicalize(root).context("无法解析项目根目录")?;
     let joined = root.join(requested);
     if joined.exists() || std::fs::symlink_metadata(&joined).is_ok() {
-        let resolved = std::fs::canonicalize(&joined)?;
+        let resolved = std::fs::canonicalize(&joined).context("无法解析项目内路径")?;
         if !resolved.starts_with(&root) {
-            bail!("Path escapes the project root");
+            bail!("路径超出了项目根目录");
         }
         return Ok(resolved);
     }
     if !writing {
-        bail!("Workspace path does not exist");
+        bail!("项目内路径不存在");
     }
-    let parent = joined.parent().context("Missing parent directory")?;
-    let parent = std::fs::canonicalize(parent).context("Parent directory must exist")?;
+    let parent = joined.parent().context("缺少父目录")?;
+    let parent = std::fs::canonicalize(parent).context("父目录必须存在")?;
     if !parent.starts_with(&root) {
-        bail!("Path escapes the project root");
+        bail!("路径超出了项目根目录");
     }
-    Ok(parent.join(joined.file_name().context("Missing filename")?))
+    Ok(parent.join(joined.file_name().context("缺少文件名")?))
 }
 
 async fn tool(root: &Path, name: &str, arguments: Value, shell: bool) -> Result<Value> {
     match name {
         "read_file" => {
             let path = scoped_path(root, argument(&arguments, "path")?, false)?;
-            let metadata = tokio::fs::metadata(&path).await?;
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .context("无法读取文件信息")?;
             if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-                bail!("Read requires a regular file at most 256 KiB");
+                bail!("只能读取不超过 256 KiB 的普通文件");
             }
-            let bytes = tokio::fs::read(path).await?;
+            let bytes = tokio::fs::read(path).await.context("无法读取文件")?;
             if bytes.len() as u64 > MAX_FILE_BYTES {
-                bail!("File grew beyond 256 KiB");
+                bail!("文件大小已超过 256 KiB");
             }
-            Ok(json!({"content":String::from_utf8(bytes).context("File is not UTF-8 text")?}))
+            Ok(json!({"content":String::from_utf8(bytes).context("文件不是 UTF-8 文本")?}))
         }
         "write_file" => {
             let path = scoped_path(root, argument(&arguments, "path")?, true)?;
             let content = argument(&arguments, "content")?;
             if content.len() as u64 > MAX_FILE_BYTES {
-                bail!("Write exceeds 256 KiB limit");
+                bail!("写入内容超过 256 KiB 限制");
             }
             if let Ok(metadata) = tokio::fs::metadata(&path).await {
                 if !metadata.is_file() {
-                    bail!("Write requires a regular file");
+                    bail!("只能写入普通文件");
                 }
             }
-            tokio::fs::write(path, content).await?;
+            tokio::fs::write(path, content)
+                .await
+                .context("无法写入文件")?;
             Ok(json!({"written":true, "bytes":content.len()}))
         }
         "list_files" | "search_files" => {
@@ -245,12 +313,14 @@ async fn tool(root: &Path, name: &str, arguments: Value, shell: bool) -> Result<
             } else {
                 None
             };
-            tokio::task::spawn_blocking(move || walk(&root, &path, query.as_deref())).await?
+            tokio::task::spawn_blocking(move || walk(&root, &path, query.as_deref()))
+                .await
+                .context("文件搜索任务未能完成")?
         }
         "run_command" if shell => {
             let command = argument(&arguments, "command")?;
             if command.len() > 16_000 {
-                bail!("Command is too long");
+                bail!("命令过长");
             }
             #[cfg(windows)]
             let mut process = {
@@ -273,7 +343,7 @@ async fn tool(root: &Path, name: &str, arguments: Value, shell: bool) -> Result<
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
-                .context("Could not start command")?;
+                .context("无法启动命令")?;
             let stdout = child.stdout.take().unwrap();
             let stderr = child.stderr.take().unwrap();
             let run = async {
@@ -286,10 +356,10 @@ async fn tool(root: &Path, name: &str, arguments: Value, shell: bool) -> Result<
             };
             tokio::time::timeout(Duration::from_secs(60), run)
                 .await
-                .context("Command exceeded its 60 second timeout")?
-                .map_err(Into::into)
+                .context("命令执行超过 60 秒限制")?
+                .context("无法读取命令执行结果")
         }
-        _ => bail!("Unknown or disabled tool: {name}"),
+        _ => bail!("工具不存在或未启用"),
     }
 }
 
@@ -317,16 +387,19 @@ fn walk(root: &Path, start: &Path, query: Option<&str>) -> Result<Value> {
             break;
         }
         visited += 1;
-        let metadata = std::fs::symlink_metadata(&path)?;
+        let metadata = std::fs::symlink_metadata(&path).context("无法读取文件信息")?;
         if metadata.file_type().is_symlink() {
             continue;
         }
-        let canonical = std::fs::canonicalize(&path)?;
+        let canonical = std::fs::canonicalize(&path).context("无法解析项目内路径")?;
         if !canonical.starts_with(root) {
-            bail!("Path escapes project root");
+            bail!("路径超出了项目根目录");
         }
         if metadata.is_dir() {
-            let mut entries: Vec<_> = std::fs::read_dir(&path)?.filter_map(Result::ok).collect();
+            let mut entries: Vec<_> = std::fs::read_dir(&path)
+                .context("无法读取项目目录")?
+                .filter_map(Result::ok)
+                .collect();
             entries.sort_by_key(|entry| entry.file_name());
             for entry in entries.into_iter().rev().take(2000) {
                 if !matches!(

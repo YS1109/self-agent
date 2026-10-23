@@ -35,9 +35,9 @@ async fn main() -> Result<()> {
     let bind: SocketAddr = std::env::var("HARNESS_BIND")
         .unwrap_or_else(|_| "127.0.0.1:47371".into())
         .parse()
-        .context("Invalid HARNESS_BIND")?;
+        .context("HARNESS_BIND 监听地址无效")?;
     if bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
-        bail!("HARNESS_BIND must use 127.0.0.1; public listeners are not supported");
+        bail!("HARNESS_BIND 必须使用 127.0.0.1，当前版本不支持公网监听");
     }
     let directory = data_dir();
     std::fs::create_dir_all(&directory)?;
@@ -56,12 +56,12 @@ async fn main() -> Result<()> {
     let _lock_file = lock_options.open(directory.join("daemon.lock"))?;
     _lock_file
         .try_lock_exclusive()
-        .context("Another daemon already owns this data directory")?;
+        .context("已有后台服务正在使用此数据目录")?;
     // Bind before opening SQLite so a second process cannot run crash recovery
     // against a still-active daemon using the usual address.
     let listener = tokio::net::TcpListener::bind(bind)
         .await
-        .context("Could not bind local daemon; another instance may be running")?;
+        .context("无法绑定本机服务端口，可能已有实例正在运行")?;
     let address = listener.local_addr()?;
     let token = format!("{}{}", new_id(), new_id());
     let state = AppState::open(&directory.join("harness.sqlite"), token.clone())?;
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     }
     std::fs::rename(&temporary, &metadata)?;
     spawn_workers(state.clone());
-    tracing::info!(base_url=%info.base_url, "Local daemon ready");
+    tracing::info!(base_url=%info.base_url, "本机后台服务已就绪");
     let result = axum::serve(listener, router(state)).await;
     // Do not remove metadata after an abrupt exit; clients verify health and PID.
     result?;

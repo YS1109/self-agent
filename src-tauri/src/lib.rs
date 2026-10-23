@@ -1,4 +1,5 @@
 mod bridge;
+mod menu;
 
 use bridge::{api_request, Bridge};
 use tauri::{Emitter, Manager};
@@ -6,6 +7,7 @@ use tauri::{Emitter, Manager};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .menu(menu::chinese_menu)
         .manage(Bridge::new())
         .invoke_handler(tauri::generate_handler![api_request])
         .setup(|app| {
@@ -21,5 +23,5 @@ pub fn run() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("could not start the desktop application");
+        .expect("无法启动桌面应用");
 }

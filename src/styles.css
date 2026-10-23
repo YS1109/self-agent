@@ -2,36 +2,36 @@
 
 :root {
   font-family: "Geist", sans-serif;
-  color: #292d2a;
-  background: #fafbf9;
+  color: #292a2d;
+  background: #fafafa;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --bg: #fafbf9;
-  --sidebar: #f0f2ee;
+  --bg: #fafafa;
+  --sidebar: #f1f2f4;
   --surface: #fff;
-  --surface-2: #f4f6f2;
-  --ink: #292d2a;
-  --muted: #879087;
-  --secondary: #687269;
-  --line: #e3e8e0;
-  --accent: #1d6c4b;
-  --accent-light: #eaf3ec;
-  --shadow: 0 12px 40px #26372b0a;
+  --surface-2: #f4f5f7;
+  --ink: #292a2d;
+  --muted: #858991;
+  --secondary: #666c78;
+  --line: #e2e4e9;
+  --accent: #4267ad;
+  --accent-light: #edf2fb;
+  --shadow: 0 12px 40px #28344c0a;
   --danger: #b54d46;
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #1c201d;
-  --sidebar: #171b18;
-  --surface: #242a25;
-  --surface-2: #222823;
-  --ink: #e3e9e3;
-  --muted: #818c82;
-  --secondary: #a0aaa1;
-  --line: #343d35;
-  --accent: #9bc7ab;
-  --accent-light: #2a3d2e;
+  --bg: #1d1e21;
+  --sidebar: #17181b;
+  --surface: #25262b;
+  --surface-2: #222329;
+  --ink: #e5e7eb;
+  --muted: #858b98;
+  --secondary: #a5aab6;
+  --line: #383b44;
+  --accent: #91b3f3;
+  --accent-light: #29344d;
   --shadow: 0 12px 40px #0002;
   --danger: #e18d84;
   color: var(--ink);
@@ -88,7 +88,7 @@ svg {
   vertical-align: middle;
 }
 ::selection {
-  background: #9ccaae55;
+  background: #9dbbfa55;
 }
 h1,
 h2,
@@ -387,8 +387,8 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #dfe5dc;
-  color: #58634f;
+  background: #e1e4eb;
+  color: #56627b;
   font-size: 11px;
   font-weight: 500;
   flex-shrink: 0;
@@ -477,8 +477,8 @@ textarea {
   border-radius: 50%;
 }
 .connection.online > span {
-  background: #6f9b7c;
-  box-shadow: 0 0 0 3px #6f9b7c12;
+  background: #6b8dc4;
+  box-shadow: 0 0 0 3px #6b8dc412;
 }
 .notice,
 .offline-banner {
@@ -553,11 +553,11 @@ textarea {
   justify-content: center;
   width: 66px;
   height: 66px;
-  background: radial-gradient(circle at 30% 20%, #f2f7e8, #e5eddf);
-  border: 1px solid #dce6d8;
+  background: radial-gradient(circle at 30% 20%, #f0f4fd, #e2e9f7);
+  border: 1px solid #dce4f3;
   border-radius: 21px;
-  color: #567454;
-  box-shadow: 0 6px 12px #31452c06;
+  color: #5875ac;
+  box-shadow: 0 6px 12px #31456806;
   margin-bottom: 25px;
 }
 .welcome-emblem > span {
@@ -565,10 +565,10 @@ textarea {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #739b68;
+  background: #7397d1;
   right: 8px;
   top: 8px;
-  box-shadow: 0 0 0 3px #edf2e8;
+  box-shadow: 0 0 0 3px #edf2fc;
 }
 .eyebrow {
   font-family: "IBM Plex Mono", monospace;
@@ -597,7 +597,7 @@ textarea {
   font-size: 11px;
   padding: 10px 14px;
   gap: 12px;
-  box-shadow: 0 3px 5px #23322913;
+  box-shadow: 0 3px 5px #23324913;
 }
 .welcome-features {
   display: grid;
@@ -643,7 +643,7 @@ textarea {
   margin-top: 34px;
 }
 .version-note .status-dot {
-  background: #91a78d;
+  background: #879bc0;
   width: 4px;
   height: 4px;
 }
@@ -737,8 +737,8 @@ textarea {
 }
 .message-user .message-avatar {
   border-radius: 50%;
-  background: #e5e7df;
-  color: #687059;
+  background: #e5e8ef;
+  color: #626c82;
 }
 .message-system .message-avatar {
   background: var(--surface-2);
@@ -815,7 +815,7 @@ textarea {
 .task-card:hover,
 .task-selected {
   border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
-  box-shadow: 0 3px 10px #26452e05;
+  box-shadow: 0 3px 10px #26456e05;
 }
 .task-icon {
   width: 32px;
@@ -869,7 +869,7 @@ textarea {
 .task-progress > span {
   display: block;
   height: 100%;
-  background: #83a58b;
+  background: #7d9bc8;
   transition: width 0.3s;
 }
 .status {
@@ -893,13 +893,13 @@ textarea {
 }
 .status-running,
 .status-sending {
-  color: #538b69;
-  background: #73a48513;
+  color: #557fbd;
+  background: #739de413;
 }
 .status-completed,
 .status-sent {
-  color: #65826a;
-  background: #93b29a12;
+  color: #6282b2;
+  background: #93a9d212;
 }
 .status-failed {
   color: var(--danger);
@@ -916,11 +916,11 @@ textarea {
   height: 5px;
   display: inline-block;
   border-radius: 50%;
-  background: #73a17c;
+  background: #7398d1;
   flex-shrink: 0;
 }
 .running-dot {
-  box-shadow: 0 0 0 3px #73a17c10;
+  box-shadow: 0 0 0 3px #7398d110;
   animation: pulse 2s infinite;
 }
 .idle-dot {
@@ -929,7 +929,7 @@ textarea {
 }
 @keyframes pulse {
   50% {
-    box-shadow: 0 0 0 4px #73a17c20;
+    box-shadow: 0 0 0 4px #7398d120;
   }
 }
 .composer-area {
@@ -955,7 +955,7 @@ textarea {
 }
 .composer-context > span:last-child:not(:first-child) {
   font-size: 8px;
-  color: #79907d;
+  color: #798baa;
 }
 .composer {
   background: var(--surface);
@@ -1168,7 +1168,7 @@ textarea {
   box-shadow: 0 2px 5px #00000003;
 }
 .react-flow__node.plan-running {
-  border-color: #79a287;
+  border-color: #799fd7;
 }
 .react-flow__node.plan-failed {
   border-color: var(--danger);
@@ -1477,7 +1477,7 @@ textarea {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: #151e1a55;
+  background: #15192255;
   backdrop-filter: blur(5px);
   z-index: 30;
   animation: appear 0.12s ease;
@@ -1937,13 +1937,13 @@ textarea {
     bottom: 0;
     z-index: 10;
     width: 360px;
-    box-shadow: -10px 0 40px #1423190e;
+    box-shadow: -10px 0 40px #1419230e;
   }
   .panel-open .conversation:after {
     content: "";
     position: absolute;
     inset: 0;
-    background: #14231912;
+    background: #14192312;
     pointer-events: none;
   }
   .panel-open .composer-options {
@@ -1964,7 +1964,7 @@ textarea {
     left: 0;
     z-index: 22;
     width: 252px;
-    box-shadow: 10px 0 60px #14231930;
+    box-shadow: 10px 0 60px #14192330;
   }
   .topbar {
     height: 55px;
@@ -2289,3 +2289,82 @@ textarea {
     margin-top: 18px;
   }
 }
+
+.plan-panel {
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+  padding: 18px;
+}
+.plan-selector label,
+.plan-editor-node label,
+.dependency-label {
+  display: block;
+  font-size: 10px;
+  color: var(--secondary);
+}
+.plan-selector select {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  margin-top: 7px;
+  padding: 9px;
+  font-size: 12px;
+}
+.plan-overview { padding: 18px 0 15px; }
+.plan-overview-top { display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: var(--muted); }
+.plan-overview h2 { font-size: 17px; font-weight: 500; line-height: 1.6; margin-top: 11px; }
+.plan-overview > p { font-size: 10px; color: var(--muted); margin-top: 8px; }
+.plan-round { display: flex; align-items: center; gap: 7px; font-size: 10px; margin-top: 13px; color: var(--secondary); }
+.plan-round > span:last-child { margin-left: auto; }
+.plan-explanation { display: flex; gap: 7px; align-items: flex-start; font-size: 11px; line-height: 1.8; padding: 11px; border-radius: 7px; background: var(--accent-light); color: var(--accent); }
+.plan-explanation > svg { flex-shrink: 0; margin-top: 3px; }
+.plan-attention { padding: 12px; border-radius: 7px; background: color-mix(in srgb, #c58c3c 10%, var(--surface)); color: var(--secondary); border: 1px solid color-mix(in srgb, #c58c3c 30%, var(--line)); font-size: 11px; line-height: 1.8; margin: 10px 0; }
+.plan-attention strong { display: block; font-size: 12px; margin-bottom: 5px; }
+.plan-attention .button { margin-top: 9px; }
+.plan-summary { font-size: 11px; line-height: 1.9; white-space: pre-wrap; color: var(--secondary); padding: 12px 0; }
+.plan-view-tabs { display: flex; align-items: center; gap: 16px; border-bottom: 1px solid var(--line); margin: 17px 0 15px; font-size: 11px; }
+.plan-view-tabs > button { padding: 0 0 10px; color: var(--muted); border-bottom: 2px solid transparent; }
+.plan-view-tabs > button.selected { border-color: var(--accent); color: var(--accent); }
+.plan-view-tabs > span { font-size: 9px; color: var(--accent); margin-left: auto; }
+.plan-node-list { display: flex; flex-direction: column; gap: 12px; }
+.plan-editor-node { border: 1px solid var(--line); border-radius: 9px; padding: 12px; margin: 0; min-width: 0; background: var(--surface); }
+.plan-editor-heading { display: flex; align-items: center; justify-content: space-between; font-size: 10px; margin-bottom: 12px; color: var(--muted); }
+.plan-editor-heading > button { padding: 3px; color: var(--muted); }
+.plan-editor-heading > button:hover { color: var(--danger); }
+.plan-editor-node input:not([type="checkbox"]), .plan-editor-node textarea { display: block; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); width: 100%; padding: 8px; margin: 6px 0 12px; font-size: 11px; line-height: 1.7; }
+.plan-editor-node:disabled input, .plan-editor-node:disabled textarea { border-color: transparent; background: transparent; padding: 0; opacity: 1; color: var(--ink); }
+.plan-editor-node textarea { resize: vertical; min-height: 78px; }
+.dependency-options { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; max-height: 160px; overflow-y: auto; }
+.dependency-options > label { display: flex; align-items: center; gap: 7px; line-height: 1.7; }
+.dependency-options input { accent-color: var(--accent); margin: 0; }
+.dependency-options > label > span { overflow-wrap: anywhere; }
+.dependency-readonly { font-size: 11px; line-height: 1.8; margin-top: 6px; color: var(--secondary); }
+.node-result { color: var(--secondary); font-size: 10px; margin-top: 12px; }
+.node-result summary { cursor: pointer; }
+.node-result pre { font-size: 10px; margin: 9px 0 0; max-height: 220px; overflow: auto; }
+.plan-graph { height: 440px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); overflow: hidden; }
+.plan-actions {
+  position: sticky;
+  bottom: -18px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 12px 0 14px;
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+}
+.plan-actions .button { font-size: 11px; padding-left: 10px; padding-right: 10px; }
+.plan-save-note, .plan-validation { font-size: 10px; line-height: 1.8; margin-top: 10px; color: var(--muted); }
+.plan-validation { color: var(--danger); }
+.status-draft, .status-reviewing { color: var(--accent); background: var(--accent-light); }
+.status-blocked { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
+.status-pending, .status-cancelled { color: var(--secondary); background: var(--surface-2); }
+.plan-failed, .plan-blocked { border-color: var(--danger); }
+.plan-graph .react-flow__controls button { background: var(--surface); fill: var(--ink); border-color: var(--line); }
+.plan-graph .react-flow__controls button:hover { background: var(--surface-2); }
+@media (min-width: 1121px) { .work-panel { width: 400px; flex-basis: 400px; } }
+@media (min-width: 1500px) { .work-panel { width: 460px; flex-basis: 460px; } }

@@ -1,5 +1,7 @@
 # v0 integration contract
 
+这是基础版本协议的历史记录。第二阶段已替换 `send_message` 的确定性确认行为，并增加计划与主智能体作业，当前增量协议见 [第二阶段协议](protocol-v1-draft.md)。
+
 This is the shared contract for the first implementation. All field names are snake_case. IDs and RFC3339 timestamps are strings. Optional values are null or omitted.
 
 ## Ownership

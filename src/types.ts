@@ -36,6 +36,37 @@ export interface TaskRun {
   error?: string;
   source: SourceContext;
   steps: TaskStep[];
+  plan_id?: string | null;
+  node_id?: string | null;
+  task_kind?: "worker" | "plan";
+}
+export interface PlanNode {
+  id: string;
+  title: string;
+  objective: string;
+  depends_on: string[];
+  status: "pending" | "queued" | "running" | "completed" | "failed" | "cancelled" | "blocked";
+  task_id?: string | null;
+  result?: string | null;
+  error?: string | null;
+}
+export type EditablePlanNode = Pick<PlanNode, "id" | "title" | "objective" | "depends_on">;
+export interface Plan {
+  id: string;
+  session_id: string;
+  task_id?: string | null;
+  title: string;
+  source: SourceContext;
+  execution_mode: "native" | "demo";
+  status: "draft" | "running" | "reviewing" | "waiting_input" | "completed" | "failed" | "cancelled";
+  revision: number;
+  round: number;
+  max_rounds: number;
+  created_at: string;
+  updated_at: string;
+  summary?: string | null;
+  error?: string | null;
+  nodes: PlanNode[];
 }
 export interface Delivery {
   id: string;
@@ -71,6 +102,7 @@ export interface Snapshot {
   events: RunEvent[];
   capabilities: Capability[];
   selections: { source: SourceContext; session_id: string }[];
+  plans: Plan[];
 }
 export interface Settings {
   api_key_configured?: boolean;
@@ -85,12 +117,17 @@ export type Command =
   | { type: "send_message"; session_id?: string; content: string }
   | { type: "start_task"; session_id?: string; title: string }
   | { type: "cancel_task"; task_id: string }
+  | { type: "update_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
+  | { type: "start_plan"; plan_id: string; expected_revision: number }
+  | { type: "cancel_plan"; plan_id: string }
   | { type: "retry_delivery"; delivery_id: string };
 export interface Receipt {
   command_id: string;
   status: string;
   session_id?: string;
   task_id?: string;
+  plan_id?: string;
+  job_id?: string;
 }
 export const DESKTOP_SOURCE: SourceContext = {
   channel_id: "desktop",
@@ -109,6 +146,7 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   events: [],
   capabilities: [],
   selections: [],
+  plans: [],
 };
 export const activeTask = (status: string) =>
   status === "queued" || status === "running" || status === "waiting_input";

@@ -1,3 +1,4 @@
+mod coordinator;
 pub mod provider;
 pub mod store;
 
@@ -132,11 +133,7 @@ async fn authenticate(
         .map(|value| value == expected)
         .unwrap_or(false);
     if !authorized {
-        return ApiError(
-            StatusCode::UNAUTHORIZED,
-            "Local authentication required".into(),
-        )
-        .into_response();
+        return ApiError(StatusCode::UNAUTHORIZED, "需要本机身份验证".into()).into_response();
     }
     next.run(request).await
 }
@@ -165,23 +162,32 @@ async fn update_settings(
         if let Some(value) = patch.get(field) {
             *target = value
                 .as_str()
-                .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("{field} must be text")))?
+                .ok_or_else(|| {
+                    ApiError(StatusCode::BAD_REQUEST, format!("{field} 字段必须为文本"))
+                })?
                 .trim()
                 .to_string();
         }
     }
     if !matches!(updated.execution_mode.as_str(), "native" | "demo") {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "Unknown execution mode".into(),
-        ));
+        return Err(ApiError(StatusCode::BAD_REQUEST, "执行模式无效".into()));
     }
     let url = reqwest::Url::parse(&updated.base_url)
-        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "Invalid provider URL".into()))?;
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "模型服务地址无效".into()))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "Use an HTTP(S) provider URL".into(),
+            "模型服务地址必须使用 HTTP 或 HTTPS".into(),
+        ));
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "模型服务地址不能包含凭证、查询参数或片段，请在 API 密钥字段填写凭证".into(),
         ));
     }
     state.store.lock().unwrap().save_settings(&updated)?;
@@ -224,6 +230,7 @@ async fn events(
 }
 
 pub fn spawn_workers(state: Arc<AppState>) {
+    coordinator::spawn(state.clone());
     for _ in 0..2 {
         let state = state.clone();
         tokio::spawn(async move {
@@ -238,7 +245,7 @@ pub fn spawn_workers(state: Arc<AppState>) {
                         }
                     }
                     Err(error) => {
-                        tracing::error!(%error, "task claim failed");
+                        tracing::error!(%error, "无法领取子任务");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
@@ -251,7 +258,7 @@ pub fn spawn_workers(state: Arc<AppState>) {
             match result {
                 Ok(Some(event)) => state.publish(event),
                 Ok(None) => {}
-                Err(error) => tracing::error!(%error, "delivery failed"),
+                Err(error) => tracing::error!(%error, "回调投递失败"),
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
@@ -299,7 +306,10 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         provider::execute(
             &settings,
             &root,
-            task["title"].as_str().unwrap_or_default(),
+            task["objective"]
+                .as_str()
+                .or_else(|| task["title"].as_str())
+                .unwrap_or_default(),
             move |detail| {
                 if let Ok(event) = state_for_log
                     .store
@@ -322,8 +332,9 @@ fn finish(state: &AppState, task_id: &str, result: anyhow::Result<String>) {
     match state.store.lock().unwrap().finish(task_id, result) {
         Ok(Some(event)) => state.publish(event),
         Ok(None) => {}
-        Err(error) => tracing::error!(%error, %task_id, "task completion failed"),
+        Err(error) => tracing::error!(%error, %task_id, "无法保存子任务结果"),
     }
+    state.wake.notify_waiters();
 }
 
 fn cancelled(state: &AppState, task_id: &str) -> bool {
@@ -342,23 +353,23 @@ async fn demo(state: &AppState, task_id: &str) -> anyhow::Result<String> {
         .unwrap_or(1000)
         .clamp(100, 60_000);
     for detail in [
-        "Demo: staging a synthetic planning step",
-        "Demo: staging a synthetic execution step",
-        "Demo: staging a synthetic verification step",
+        "演示：模拟整理任务目标",
+        "演示：模拟执行子任务",
+        "演示：模拟验证与结果汇总",
     ] {
         if cancelled(state, task_id) {
-            anyhow::bail!("Cancelled");
+            anyhow::bail!("任务已取消");
         }
         let event = state.store.lock().unwrap().progress(task_id, detail)?;
         state.publish(event);
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(step_ms / 10)).await;
             if cancelled(state, task_id) {
-                anyhow::bail!("Cancelled");
+                anyhow::bail!("任务已取消");
             }
         }
     }
-    Ok("Demo completed. This was synthetic work; no project files were changed and no real checks were run.".into())
+    Ok("演示已完成。本次仅模拟任务流程，没有修改项目文件，也没有运行真实检查。".into())
 }
 
 pub fn event(

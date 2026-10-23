@@ -23,7 +23,7 @@ impl Bridge {
                 .connect_timeout(Duration::from_millis(500))
                 .timeout(Duration::from_secs(20))
                 .build()
-                .expect("could not construct the local API client"),
+                .expect("无法创建本机服务客户端"),
             startup: Mutex::new(()),
         }
     }
@@ -47,7 +47,7 @@ impl Bridge {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Err("The background service did not become ready within 6 seconds. Check its installation and local service port.".into())
+        Err("后台服务未能在 6 秒内就绪，请检查安装文件和本机服务端口。".into())
     }
 
     async fn healthy(&self, info: &DaemonInfo) -> bool {
@@ -81,7 +81,7 @@ pub async fn api_request(
     let base = validate_base_url(&info.base_url)?;
     let url = base
         .join(&path)
-        .map_err(|_| "Invalid local API path".to_string())?;
+        .map_err(|_| "本机接口路径无效".to_string())?;
     let mut request = bridge.client.request(method, url).bearer_auth(&info.token);
     if let Some(body) = body {
         request = request.json(&body);
@@ -90,19 +90,19 @@ pub async fn api_request(
     let response = request
         .send()
         .await
-        .map_err(|error| format!("The local background service could not be reached: {error}"))?;
+        .map_err(|error| format!("无法连接本机后台服务：{error}"))?;
     let status = response.status();
     let value: Value = response
         .json()
         .await
-        .map_err(|_| "The background service returned an invalid JSON response".to_string())?;
+        .map_err(|_| "后台服务返回的数据格式无效".to_string())?;
     if status.is_success() {
         Ok(value)
     } else {
         Err(value
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("The background service rejected this request")
+            .unwrap_or("后台服务拒绝了此请求")
             .to_string())
     }
 }
@@ -110,18 +110,18 @@ pub async fn api_request(
 async fn read_daemon_info() -> Result<DaemonInfo, String> {
     let contents = tokio::fs::read(data_dir().join("daemon.json"))
         .await
-        .map_err(|_| "Local background service metadata is not available".to_string())?;
-    let info: DaemonInfo = serde_json::from_slice(&contents)
-        .map_err(|_| "Local background service metadata is invalid".to_string())?;
+        .map_err(|_| "未找到本机后台服务信息".to_string())?;
+    let info: DaemonInfo =
+        serde_json::from_slice(&contents).map_err(|_| "本机后台服务信息格式无效".to_string())?;
     validate_base_url(&info.base_url)?;
     if info.token.is_empty() {
-        return Err("Local background service credentials are missing".into());
+        return Err("缺少本机后台服务凭据".into());
     }
     Ok(info)
 }
 
 fn validate_base_url(base_url: &str) -> Result<Url, String> {
-    let url = Url::parse(base_url).map_err(|_| "Invalid local service address".to_string())?;
+    let url = Url::parse(base_url).map_err(|_| "本机服务地址无效".to_string())?;
     if url.scheme() != "http"
         || url.host_str() != Some("127.0.0.1")
         || !url.username().is_empty()
@@ -131,7 +131,7 @@ fn validate_base_url(base_url: &str) -> Result<Url, String> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err("The service address must be an HTTP loopback address".into());
+        return Err("本机服务必须使用 HTTP 回环地址".into());
     }
     Ok(url)
 }
@@ -141,7 +141,7 @@ fn validate_route(method: &str, path: &str) -> Result<Method, String> {
         ("GET", "/api/v1/snapshot" | "/api/v1/settings") => Ok(Method::GET),
         ("POST", "/api/v1/commands") => Ok(Method::POST),
         ("PUT", "/api/v1/settings") => Ok(Method::PUT),
-        _ => Err("This local API route or method is not allowed".into()),
+        _ => Err("不允许使用此本机接口路径或请求方法".into()),
     }
 }
 
@@ -170,9 +170,7 @@ fn daemon_binary(app: &AppHandle) -> Result<PathBuf, String> {
     candidates
         .into_iter()
         .find(|path| path.is_file())
-        .ok_or_else(|| {
-            "The background service binary is missing. Prepare the desktop sidecar before starting the app.".into()
-        })
+        .ok_or_else(|| "缺少后台服务程序，请先构建桌面附带服务再启动应用。".into())
 }
 
 fn start_detached(binary: &Path) -> Result<(), String> {
@@ -203,7 +201,7 @@ fn start_detached(binary: &Path) -> Result<(), String> {
     }
     let mut child = command
         .spawn()
-        .map_err(|error| format!("Could not start the background service: {error}"))?;
+        .map_err(|error| format!("无法启动后台服务：{error}"))?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
