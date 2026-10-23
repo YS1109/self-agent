@@ -528,7 +528,7 @@ export default function App() {
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-                <small>本地优先 · v0.4.0</small>
+              <small>本地优先 · v0.4.1</small>
               </span>
               <Settings2 size={15} />
             </button>

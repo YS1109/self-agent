@@ -18,7 +18,7 @@ const MAX_LINES: usize = 20_000;
 const MAX_RESULT: usize = 128 * 1024;
 const TURN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn execute(
     binary: &str,
     model: &str,

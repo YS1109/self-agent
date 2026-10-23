@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "本地桌面工作空间与原生窗口主题同步权限。",
+  "description": "本地桌面工作空间、窗口主题和标题栏拖动权限。",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-set-theme",
-    "core:window:allow-set-background-color"
+    "core:window:allow-set-background-color",
+    "core:window:allow-start-dragging"
   ]
 }

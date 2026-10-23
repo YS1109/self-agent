@@ -190,6 +190,26 @@ textarea {
     transform: rotate(360deg);
   }
 }
+.desktop-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  padding: 0 90px;
+  background: var(--bg);
+  color: var(--secondary);
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 500;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.desktop-titlebar > span {
+  pointer-events: none;
+}
+:root[data-desktop-titlebar="macos"] .workbench {
+  height: calc(100dvh - 32px);
+}
 .workbench {
   display: flex;
   height: 100dvh;
