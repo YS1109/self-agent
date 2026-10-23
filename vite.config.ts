@@ -4,6 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { readFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
+import { allowDevelopmentProxy } from "./src/dev-proxy-policy";
 
 function dataDirectory() {
   if (process.env.HARNESS_DATA_DIR) return process.env.HARNESS_DATA_DIR;
@@ -27,12 +28,36 @@ function daemonProxy(): Plugin {
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         if (!req.url?.startsWith("/api/v1/")) return next();
+        if (
+          !allowDevelopmentProxy(
+            req.method ?? "",
+            req.url,
+            req.headers.origin,
+            req.headers["sec-fetch-site"]?.toString(),
+            req.headers["content-type"],
+          )
+        ) {
+          res.statusCode = 403;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({ error: "开发代理仅接受受支持的本机同源请求。" }),
+          );
+          return;
+        }
         try {
           const info = JSON.parse(
             await readFile(join(dataDirectory(), "daemon.json"), "utf8"),
           ) as { base_url: string; token: string };
           const target = new URL(info.base_url);
-          if (target.protocol !== "http:" || target.hostname !== "127.0.0.1")
+          if (
+            target.protocol !== "http:" ||
+            target.hostname !== "127.0.0.1" ||
+            target.username ||
+            target.password ||
+            target.pathname !== "/" ||
+            target.search ||
+            target.hash
+          )
             throw new Error("Invalid daemon endpoint");
           const chunks: Buffer[] = [];
           let size = 0;
@@ -49,6 +74,7 @@ function daemonProxy(): Plugin {
             },
             body: chunks.length ? Buffer.concat(chunks) : undefined,
             signal: AbortSignal.timeout(15_000),
+            redirect: "error",
           });
           res.statusCode = upstream.status;
           res.setHeader("Content-Type", "application/json");
