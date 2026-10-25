@@ -1,7 +1,7 @@
 //! Shared records exchanged by the daemon, desktop bridge, and channel adapters.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -191,6 +191,35 @@ pub struct Plan {
     pub nodes: Vec<PlanNode>,
     #[serde(default)]
     pub used_node_ids: Vec<String>,
+    #[serde(default)]
+    pub layout: BTreeMap<String, NodePosition>,
+    #[serde(default)]
+    pub layout_revision: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodePosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanChange {
+    pub id: String,
+    pub plan_id: String,
+    pub session_id: String,
+    pub base_revision: u32,
+    pub source: SourceContext,
+    pub content: String,
+    pub status: String,
+    #[serde(default)]
+    pub nodes: Vec<PlanNodeInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -250,6 +279,8 @@ pub struct Snapshot {
     pub tasks: Vec<TaskRun>,
     #[serde(default)]
     pub plans: Vec<Plan>,
+    #[serde(default)]
+    pub plan_changes: Vec<PlanChange>,
     pub deliveries: Vec<Delivery>,
     pub events: Vec<RunEvent>,
     pub capabilities: Vec<Capability>,
@@ -298,6 +329,23 @@ pub enum Command {
         expected_revision: u32,
         nodes: Vec<PlanNodeInput>,
     },
+    RequestPlanChange {
+        plan_id: String,
+        expected_revision: u32,
+        content: String,
+    },
+    ApplyPlanChange {
+        change_id: String,
+        expected_revision: u32,
+    },
+    DiscardPlanChange {
+        change_id: String,
+    },
+    SetPlanLayout {
+        plan_id: String,
+        expected_layout_revision: u32,
+        layout: BTreeMap<String, NodePosition>,
+    },
     PausePlan {
         plan_id: String,
         expected_revision: u32,
@@ -330,6 +378,8 @@ pub struct CommandReceipt {
     pub plan_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -366,6 +416,7 @@ mod tests {
             "sessions",
             "tasks",
             "plans",
+            "plan_changes",
             "deliveries",
             "events",
             "capabilities",
@@ -390,6 +441,7 @@ mod tests {
         }))
         .unwrap();
         assert!(snapshot.plans.is_empty());
+        assert!(snapshot.plan_changes.is_empty());
         assert_eq!(snapshot.tasks[0].task_kind, "worker");
         assert!(snapshot.tasks[0].plan_id.is_none());
         assert!(snapshot.tasks[0].node_id.is_none());

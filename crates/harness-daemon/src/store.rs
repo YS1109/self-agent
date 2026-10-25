@@ -31,6 +31,7 @@ impl Store {
              CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS plan_changes(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS coordinator_jobs(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS commands(id TEXT PRIMARY KEY, envelope TEXT NOT NULL, receipt TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS selections(source TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -80,6 +81,19 @@ impl Store {
                 plan["agents"] = json!(default_agents());
                 plan["default_agent_id"] = json!(default_agent_id());
                 put(&tx, "plans", &plan)?;
+            }
+            if plan.get("layout").is_none() {
+                plan["layout"] = json!({});
+                plan["layout_revision"] = json!(0);
+                put(&tx, "plans", &plan)?;
+            }
+        }
+        // An interrupted suggestion may be generated again, but can never apply itself.
+        for mut change in rows(&tx, "plan_changes")? {
+            if change["status"] == "running" {
+                change["status"] = json!("queued");
+                change["updated_at"] = json!(now());
+                put(&tx, "plan_changes", &change)?;
             }
         }
         // Coordinator requests may be retried; project mutations are never replayed.
@@ -143,6 +157,7 @@ impl Store {
         let shell_enabled = std::env::var("HARNESS_ALLOW_COMMANDS").as_deref() == Ok("1");
         Ok(json!({
             "sessions":sessions, "tasks":tasks, "plans":plans, "events":events,
+            "plan_changes":rows(&self.db,"plan_changes")?,
             "deliveries":rows(&self.db,"deliveries")?, "selections":rows(&self.db,"selections")?,
             "capabilities":[
                 {"id":"main","name":"主智能体","kind":"agent","description":"异步理解目标、生成计划并回顾子任务结果，执行过程中仍可管理会话","enabled":true},
@@ -308,127 +323,181 @@ impl Store {
                     "后台任务已排队",
                 ));
             }
-            "update_plan" => {
+            "request_plan_change" => {
+                let id = text(command, "plan_id")?;
+                let plan = record(&tx, "plans", id)?;
+                check_revision(&plan, command)?;
+                ensure_changeable(&plan)?;
+                let content = bounded_text(command, "content", 64 * 1024)?;
+                if rows(&tx, "plan_changes")?
+                    .iter()
+                    .filter(|change| {
+                        matches!(change["status"].as_str(), Some("queued" | "running"))
+                    })
+                    .count()
+                    >= MAX_ACTIVE_TASKS
+                {
+                    bail!("待生成的计划调整已达到 32 个，请等待或放弃部分建议");
+                }
+                if plan["execution_mode"] == "native" && !settings.configured() {
+                    bail!(CONFIGURATION_HINT);
+                }
+                let change_id = new_id();
+                let job_id = new_id();
+                let (agents, default_id) = role_snapshot(&plan)?;
+                put(
+                    &tx,
+                    "plan_changes",
+                    &json!({
+                        "id":change_id,"plan_id":id,"session_id":plan["session_id"],
+                        "base_revision":plan["revision"],"source":source,"content":content,
+                        "status":"queued","nodes":[],"created_at":now(),"updated_at":now()
+                    }),
+                )?;
+                put(
+                    &tx,
+                    "coordinator_jobs",
+                    &json!({
+                        "id":job_id,"kind":"change","change_id":change_id,"plan_id":id,
+                        "plan_snapshot":plan,"session_id":plan["session_id"],"source":source,
+                        "content":content,"execution_mode":plan["execution_mode"],
+                        "agents":agents,"default_agent_id":default_id,"status":"pending",
+                        "created_at":now(),"updated_at":now()
+                    }),
+                )?;
+                let mut session = record(&tx, "sessions", text(&plan, "session_id")?)?;
+                append_message(&mut session, "user", content, plan["task_id"].as_str())?;
+                put(&tx, "sessions", &session)?;
+                receipt["plan_id"] = json!(id);
+                receipt["session_id"] = plan["session_id"].clone();
+                receipt["job_id"] = json!(job_id);
+                receipt["change_id"] = json!(change_id);
+                produced = Some(plan_event(
+                    &plan,
+                    "plan_change_queued",
+                    "主智能体正在生成计划调整建议，当前执行继续；建议确认后才会应用",
+                ));
+            }
+            "apply_plan_change" => {
+                let change_id = text(command, "change_id")?;
+                let mut change = record(&tx, "plan_changes", change_id)?;
+                if change["status"] != "ready" {
+                    bail!("只有待确认的调整建议可以应用");
+                }
+                let id = text(&change, "plan_id")?;
+                let plan = record(&tx, "plans", id)?;
+                check_revision(&plan, command)?;
+                if change["base_revision"] != plan["revision"] {
+                    bail!("计划版本已变化，此建议已过期，请根据当前计划重新生成");
+                }
+                let plan = apply_plan_edit(
+                    &tx,
+                    id,
+                    &json!({
+                        "expected_revision":command["expected_revision"],"nodes":change["nodes"]
+                    }),
+                )?;
+                change["status"] = json!("applied");
+                change["updated_at"] = json!(now());
+                put(&tx, "plan_changes", &change)?;
+                receipt["plan_id"] = plan["id"].clone();
+                receipt["session_id"] = plan["session_id"].clone();
+                receipt["change_id"] = json!(change_id);
+                produced = Some(plan_event(
+                    &plan,
+                    "plan_change_applied",
+                    "调整建议已应用，执行历史已保留",
+                ));
+            }
+            "discard_plan_change" => {
+                let change_id = text(command, "change_id")?;
+                let mut change = record(&tx, "plan_changes", change_id)?;
+                if !matches!(
+                    change["status"].as_str(),
+                    Some("queued" | "running" | "ready" | "failed")
+                ) {
+                    bail!("此调整建议已经处理");
+                }
+                change["status"] = json!("discarded");
+                change["updated_at"] = json!(now());
+                put(&tx, "plan_changes", &change)?;
+                for mut job in rows(&tx, "coordinator_jobs")? {
+                    if job["change_id"] == change_id
+                        && matches!(job["status"].as_str(), Some("pending" | "running"))
+                    {
+                        job["status"] = json!("cancelled");
+                        job["updated_at"] = json!(now());
+                        put(&tx, "coordinator_jobs", &job)?;
+                    }
+                }
+                receipt["plan_id"] = change["plan_id"].clone();
+                receipt["session_id"] = change["session_id"].clone();
+                receipt["change_id"] = json!(change_id);
+                produced = Some(event(
+                    change["session_id"].as_str().map(str::to_owned),
+                    None,
+                    "plan_change_discarded",
+                    "调整建议已放弃",
+                ));
+            }
+            "set_plan_layout" => {
                 let id = text(command, "plan_id")?;
                 let mut plan = record(&tx, "plans", id)?;
-                check_revision(&plan, command)?;
-                if plan["status"] != "draft" {
-                    bail!("只有草稿计划可以编辑");
+                let expected = command["expected_layout_revision"]
+                    .as_u64()
+                    .context("布局版本必须为非负整数")?;
+                if expected != plan["layout_revision"].as_u64().unwrap_or(0) {
+                    bail!("画布布局已变化，请刷新后重新保存");
                 }
-                let (agents, default_id) = role_snapshot(&plan)?;
-                let nodes = validate_nodes(
-                    command.get("nodes").context("缺少计划节点")?,
-                    &[],
-                    false,
-                    &agents,
-                    &default_id,
-                )?;
-                plan["nodes"] = json!(nodes);
-                touch_plan(&mut plan);
+                let layout = command["layout"]
+                    .as_object()
+                    .context("画布布局必须是节点位置对象")?;
+                if layout.len() > MAX_NODES {
+                    bail!("画布布局不能超过 12 个节点");
+                }
+                for (node_id, position) in layout {
+                    if !plan["nodes"]
+                        .as_array()
+                        .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == *node_id))
+                    {
+                        bail!("布局包含不存在的节点：{node_id}");
+                    }
+                    for axis in ["x", "y"] {
+                        if position[axis]
+                            .as_f64()
+                            .is_none_or(|value| !value.is_finite() || value.abs() > 100_000.0)
+                        {
+                            bail!("节点坐标必须是 -100000 到 100000 之间的有限数值");
+                        }
+                    }
+                }
+                plan["layout"] = json!(layout);
+                plan["layout_revision"] = json!(expected + 1);
                 put(&tx, "plans", &plan)?;
                 receipt["plan_id"] = json!(id);
                 receipt["session_id"] = plan["session_id"].clone();
-                produced = Some(plan_event(&plan, "plan_updated", "计划草稿已保存"));
+                produced = Some(plan_event(&plan, "plan_layout_updated", "画布布局已保存"));
             }
-            "patch_plan" => {
+            "update_plan" | "patch_plan" => {
                 let id = text(command, "plan_id")?;
-                let mut plan = record(&tx, "plans", id)?;
-                check_revision(&plan, command)?;
-                if !matches!(
-                    plan["status"].as_str(),
-                    Some("running" | "paused" | "waiting_input" | "reviewing")
-                ) {
-                    bail!("此计划当前不能调整后续节点");
-                }
-                let old = plan["nodes"]
-                    .as_array()
-                    .context("计划节点数据无效")?
-                    .clone();
-                let (agents, default_id) = role_snapshot(&plan)?;
-                let mut nodes = validate_nodes_with_history(
-                    command.get("nodes").context("缺少计划节点")?,
-                    &[],
-                    false,
-                    &old,
-                    &agents,
-                    &default_id,
-                )?;
-                let mut used = used_node_ids(&plan);
-                let mut replaced = Vec::new();
-                for previous in &old {
-                    let current = nodes.iter_mut().find(|node| node["id"] == previous["id"]);
-                    let editable =
-                        matches!(previous["status"].as_str(), Some("pending" | "queued"));
-                    if !editable
-                        && current.as_ref().is_none_or(|node| {
-                            node_definition(node, &default_id)
-                                != node_definition(previous, &default_id)
-                        })
-                    {
-                        bail!("已开始或已结束的节点不能修改或移除：{}", previous["id"]);
-                    }
-                    if let Some(current) = current {
-                        if node_definition(current, &default_id)
-                            == node_definition(previous, &default_id)
-                        {
-                            *current = previous.clone();
-                            continue;
-                        }
-                    }
-                    if previous["status"] == "queued" {
-                        replaced.push(record(&tx, "tasks", text(previous, "task_id")?)?);
-                    }
-                }
-                for node in &nodes {
-                    let id = text(node, "id")?;
-                    if !old.iter().any(|old| old["id"] == id) {
-                        if used.iter().any(|used| used == id) {
-                            bail!("已移除的历史节点 ID 不能复用：{id}");
-                        }
-                        used.push(id.to_string());
-                    }
-                }
-                if used.len() > MAX_NODES {
-                    bail!("计划累计创建节点不能超过 12 个，移除节点不会返还预算");
-                }
-                if matches!(plan["status"].as_str(), Some("waiting_input" | "reviewing"))
-                    || (plan["status"] == "paused"
-                        && matches!(
-                            plan["paused_from_status"].as_str(),
-                            Some("waiting_input" | "reviewing")
-                        ))
-                {
-                    if plan["round"].as_u64().unwrap_or(0) >= MAX_ROUNDS {
-                        bail!("计划已达到 3 轮上限，请新建计划继续处理");
-                    }
-                    plan["round"] = json!(plan["round"].as_u64().unwrap_or(0) + 1);
-                }
-                invalidate_reviews(&tx, id)?;
-                plan["nodes"] = json!(nodes);
-                plan["used_node_ids"] = json!(used);
-                if plan["status"] != "paused" {
-                    plan["status"] = json!("running");
-                } else {
-                    plan["paused_from_status"] = json!("running");
-                }
-                plan["error"] = Value::Null;
-                touch_plan(&mut plan);
-                put(&tx, "plans", &plan)?;
-                for mut task in replaced {
-                    task["status"] = json!("cancelled");
-                    task["error"] = json!("后续计划已调整，此排队任务由新节点版本替代。");
-                    terminal_steps(&mut task, false);
-                    complete_transaction(&tx, &mut task)?;
-                }
-                set_parent_waiting(&tx, &plan, plan["status"] == "paused")?;
-                advance_plans(&tx)?;
                 let plan = record(&tx, "plans", id)?;
+                if kind == "update_plan" && plan["status"] != "draft" {
+                    bail!("只有草稿计划可以编辑");
+                }
+                if kind == "patch_plan" && plan["status"] == "draft" {
+                    bail!("草稿计划请使用编辑草稿指令");
+                }
+                let plan = apply_plan_edit(&tx, id, command)?;
                 receipt["plan_id"] = json!(id);
                 receipt["session_id"] = plan["session_id"].clone();
                 produced = Some(plan_event(
                     &plan,
-                    "plan_patched",
-                    "后续计划已调整，执行历史已保留",
+                    if kind == "patch_plan" {
+                        "plan_patched"
+                    } else {
+                        "plan_updated"
+                    },
+                    "计划已保存，执行历史已保留",
                 ));
             }
             "pause_plan" | "resume_plan" => {
@@ -743,6 +812,16 @@ impl Store {
                 put(&tx, "coordinator_jobs", &job)?;
                 continue;
             }
+            if job["kind"] == "change" {
+                if !change_target_active(&tx, &job)? {
+                    discard_change_job(&tx, &mut job)?;
+                    continue;
+                }
+                let mut change = record(&tx, "plan_changes", text(&job, "change_id")?)?;
+                change["status"] = json!("running");
+                change["updated_at"] = json!(now());
+                put(&tx, "plan_changes", &change)?;
+            }
             job["status"] = json!("running");
             job["updated_at"] = json!(now());
             put(&tx, "coordinator_jobs", &job)?;
@@ -756,7 +835,8 @@ impl Store {
     pub fn coordinator_job_active(&self, job_id: &str) -> Result<bool> {
         let job = record(&self.db, "coordinator_jobs", job_id)?;
         Ok(job["status"] == "running"
-            && (job["kind"] != "review" || review_target_current(&self.db, &job)?))
+            && (job["kind"] != "review" || review_target_current(&self.db, &job)?)
+            && (job["kind"] != "change" || change_target_active(&self.db, &job)?))
     }
 
     pub fn coordinator_context(&self, job: &Value) -> Result<Value> {
@@ -780,7 +860,13 @@ impl Store {
             .collect();
         let plan = job["plan_id"]
             .as_str()
-            .map(|id| record(&self.db, "plans", id))
+            .map(|id| {
+                if job["kind"] == "change" {
+                    Ok(job["plan_snapshot"].clone())
+                } else {
+                    record(&self.db, "plans", id)
+                }
+            })
             .transpose()?;
         let (agents, default_id) = role_snapshot(job)?;
         Ok(
@@ -799,6 +885,61 @@ impl Store {
         let mut job = record(&tx, "coordinator_jobs", job_id)?;
         if job["status"] != "running" {
             return Ok(Vec::new());
+        }
+        if job["kind"] == "change" {
+            if !change_target_active(&tx, &job)? {
+                discard_change_job(&tx, &mut job)?;
+                tx.commit()?;
+                return Ok(Vec::new());
+            }
+            let mut change = record(&tx, "plan_changes", text(&job, "change_id")?)?;
+            let result = result.and_then(|value| {
+                if value["action"] != "change" {
+                    bail!("主智能体未返回计划调整建议");
+                }
+                let message = bounded_text(&value, "message", 64 * 1024)?.to_string();
+                let (plan, _) = prepare_plan_edit(job["plan_snapshot"].clone(), &value["nodes"])?;
+                let (_, default_id) = role_snapshot(&plan)?;
+                let nodes: Vec<_> = plan["nodes"]
+                    .as_array()
+                    .context("计划节点数据无效")?
+                    .iter()
+                    .map(|node| node_definition(node, &default_id))
+                    .collect();
+                Ok((message, json!(nodes)))
+            });
+            let item = match result {
+                Ok((message, nodes)) => {
+                    change["status"] = json!("ready");
+                    change["nodes"] = nodes;
+                    change["message"] = json!(message);
+                    job["status"] = json!("completed");
+                    event(
+                        change["session_id"].as_str().map(str::to_owned),
+                        None,
+                        "plan_change_ready",
+                        "计划调整建议已生成，请检查差异后应用；已有计划尚未改变",
+                    )
+                }
+                Err(error) => {
+                    change["status"] = json!("failed");
+                    change["error"] = json!(format!("生成计划调整建议失败：{error}"));
+                    job["status"] = json!("failed");
+                    event(
+                        change["session_id"].as_str().map(str::to_owned),
+                        None,
+                        "plan_change_failed",
+                        "生成计划调整建议失败，请检查错误后重试",
+                    )
+                }
+            };
+            change["updated_at"] = json!(now());
+            job["updated_at"] = json!(now());
+            put(&tx, "plan_changes", &change)?;
+            put(&tx, "coordinator_jobs", &job)?;
+            persist_event(&tx, &item)?;
+            tx.commit()?;
+            return Ok(vec![item]);
         }
         if job["kind"] == "review" && !review_target_current(&tx, &job)? {
             job["status"] = json!("cancelled");
@@ -1122,6 +1263,147 @@ fn complete_transaction(tx: &Transaction<'_>, task: &mut Value) -> Result<RunEve
     append_message(&mut session, "assistant", result, Some(task_id))?;
     put(tx, "sessions", &session)?;
     Ok(item)
+}
+
+fn ensure_changeable(plan: &Value) -> Result<()> {
+    if !matches!(
+        plan["status"].as_str(),
+        Some("draft" | "running" | "paused" | "waiting_input" | "reviewing")
+    ) {
+        bail!("此计划已经结束，不能调整；请新建目标");
+    }
+    Ok(())
+}
+fn change_target_active(db: &Connection, job: &Value) -> Result<bool> {
+    let change = record(db, "plan_changes", text(job, "change_id")?)?;
+    let plan = record(db, "plans", text(job, "plan_id")?)?;
+    Ok(
+        matches!(change["status"].as_str(), Some("queued" | "running"))
+            && ensure_changeable(&plan).is_ok(),
+    )
+}
+fn discard_change_job(tx: &Transaction<'_>, job: &mut Value) -> Result<()> {
+    let mut change = record(tx, "plan_changes", text(job, "change_id")?)?;
+    if matches!(change["status"].as_str(), Some("queued" | "running")) {
+        change["status"] = json!("discarded");
+        change["error"] = json!("计划已结束或建议已放弃，迟到的模型结果不会应用");
+        change["updated_at"] = json!(now());
+        put(tx, "plan_changes", &change)?;
+    }
+    job["status"] = json!("cancelled");
+    job["updated_at"] = json!(now());
+    put(tx, "coordinator_jobs", job)
+}
+
+fn prepare_plan_edit(mut plan: Value, proposed: &Value) -> Result<(Value, Vec<String>)> {
+    if plan["status"] == "draft" {
+        let (agents, default_id) = role_snapshot(&plan)?;
+        plan["nodes"] = json!(validate_nodes(proposed, &[], false, &agents, &default_id)?);
+        return Ok((plan, Vec::new()));
+    }
+    if !matches!(
+        plan["status"].as_str(),
+        Some("running" | "paused" | "waiting_input" | "reviewing")
+    ) {
+        bail!("此计划当前不能调整后续节点");
+    }
+    let old = plan["nodes"]
+        .as_array()
+        .context("计划节点数据无效")?
+        .clone();
+    let (agents, default_id) = role_snapshot(&plan)?;
+    let mut nodes = validate_nodes_with_history(proposed, &[], false, &old, &agents, &default_id)?;
+    let mut used = used_node_ids(&plan);
+    let mut replaced = Vec::new();
+    for previous in &old {
+        let current = nodes.iter_mut().find(|node| node["id"] == previous["id"]);
+        let editable = matches!(previous["status"].as_str(), Some("pending" | "queued"));
+        if !editable
+            && current.as_ref().is_none_or(|node| {
+                node_definition(node, &default_id) != node_definition(previous, &default_id)
+            })
+        {
+            bail!("已开始或已结束的节点不能修改或移除：{}", previous["id"]);
+        }
+        if let Some(current) = current {
+            if node_definition(current, &default_id) == node_definition(previous, &default_id) {
+                *current = previous.clone();
+                continue;
+            }
+        }
+        if previous["status"] == "queued" {
+            replaced.push(text(previous, "task_id")?.to_string());
+        }
+    }
+    for node in &nodes {
+        let id = text(node, "id")?;
+        if !old.iter().any(|old| old["id"] == id) {
+            if used.iter().any(|used| used == id) {
+                bail!("已移除的历史节点 ID 不能复用：{id}");
+            }
+            used.push(id.to_string());
+        }
+    }
+    if used.len() > MAX_NODES {
+        bail!("计划累计创建节点不能超过 12 个，移除节点不会返还预算");
+    }
+    if matches!(plan["status"].as_str(), Some("waiting_input" | "reviewing"))
+        || (plan["status"] == "paused"
+            && matches!(
+                plan["paused_from_status"].as_str(),
+                Some("waiting_input" | "reviewing")
+            ))
+    {
+        if plan["round"].as_u64().unwrap_or(0) >= MAX_ROUNDS {
+            bail!("计划已达到 3 轮上限，请新建计划继续处理");
+        }
+        plan["round"] = json!(plan["round"].as_u64().unwrap_or(0) + 1);
+    }
+    plan["nodes"] = json!(nodes);
+    plan["used_node_ids"] = json!(used);
+    if plan["status"] != "paused" {
+        plan["status"] = json!("running");
+    } else {
+        plan["paused_from_status"] = json!("running");
+    }
+    plan["error"] = Value::Null;
+    Ok((plan, replaced))
+}
+fn apply_plan_edit(tx: &Transaction<'_>, id: &str, command: &Value) -> Result<Value> {
+    let plan = record(tx, "plans", id)?;
+    check_revision(&plan, command)?;
+    let was_draft = plan["status"] == "draft";
+    let (mut plan, replaced) =
+        prepare_plan_edit(plan, command.get("nodes").context("缺少计划节点")?)?;
+    if !was_draft {
+        invalidate_reviews(tx, id)?;
+    }
+    if let Some(layout) = plan["layout"].as_object() {
+        let mut layout = layout.clone();
+        layout.retain(|node_id, _| {
+            plan["nodes"]
+                .as_array()
+                .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == *node_id))
+        });
+        if plan["layout"] != json!(layout) {
+            plan["layout_revision"] = json!(plan["layout_revision"].as_u64().unwrap_or(0) + 1);
+            plan["layout"] = json!(layout);
+        }
+    }
+    touch_plan(&mut plan);
+    put(tx, "plans", &plan)?;
+    for task_id in replaced {
+        let mut task = record(tx, "tasks", &task_id)?;
+        task["status"] = json!("cancelled");
+        task["error"] = json!("后续计划已调整，此排队任务由新节点版本替代。");
+        terminal_steps(&mut task, false);
+        complete_transaction(tx, &mut task)?;
+    }
+    if !was_draft {
+        set_parent_waiting(tx, &plan, plan["status"] == "paused")?;
+        advance_plans(tx)?;
+    }
+    record(tx, "plans", id)
 }
 
 fn check_revision(plan: &Value, command: &Value) -> Result<()> {
@@ -1628,9 +1910,25 @@ fn cancel_plan(tx: &Transaction<'_>, plan_id: &str) -> Result<Vec<RunEvent>> {
         if job["plan_id"] == plan_id
             && matches!(job["status"].as_str(), Some("pending" | "running"))
         {
+            if job["kind"] == "change" {
+                discard_change_job(tx, &mut job)?;
+                continue;
+            }
             job["status"] = json!("cancelled");
             job["updated_at"] = json!(now());
             put(tx, "coordinator_jobs", &job)?;
+        }
+    }
+    for mut change in rows(tx, "plan_changes")? {
+        if change["plan_id"] == plan_id
+            && matches!(
+                change["status"].as_str(),
+                Some("queued" | "running" | "ready")
+            )
+        {
+            change["status"] = json!("discarded");
+            change["updated_at"] = json!(now());
+            put(tx, "plan_changes", &change)?;
         }
     }
     touch_plan(&mut plan);
@@ -1765,7 +2063,7 @@ fn apply_outcome(
             let plan = json!({"id":new_id(),"session_id":job["session_id"],"task_id":null,"title":title,"source":job["source"],
                 "agents":agents,"default_agent_id":default_id,
                 "execution_mode":job["execution_mode"],"status":"draft","revision":1,"round":0,"max_rounds":MAX_ROUNDS,
-                "created_at":now(),"updated_at":now(),"nodes":nodes});
+                "created_at":now(),"updated_at":now(),"nodes":nodes,"layout":{},"layout_revision":0});
             put(tx, "plans", &plan)?;
             append_plan_message(tx, &plan, &message)?;
             produced.push(plan_event(
@@ -3455,5 +3753,236 @@ mod tests {
         assert_eq!(bounded["nodes"].as_array().unwrap().len(), 1);
         assert_eq!(bounded["used_node_ids"].as_array().unwrap().len(), 12);
         assert!(bounded["summary"].as_str().unwrap().contains("12"));
+    }
+    fn request_change(store: &mut Store, plan: &Value) -> Value {
+        send(
+            store,
+            json!({"type":"request_plan_change","plan_id":plan["id"],
+            "expected_revision":plan["revision"],"content":"先补测试，再继续实现"}),
+        )
+    }
+
+    fn complete_change(store: &mut Store, job: &Value, nodes: Value) {
+        store
+            .complete_coordinator_job(
+                job["id"].as_str().unwrap(),
+                Ok(json!({"action":"change","message":"增加测试要求，请确认","nodes":nodes})),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn suggestions_are_durable_explicitly_applied_and_keep_original_callback_source() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let original_session = session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[])]));
+        let id = plan["id"].as_str().unwrap();
+        session(&mut store); // Source selection now points elsewhere.
+        let mut desktop = source();
+        desktop["channel_id"] = json!("desktop");
+        let envelope = json!({"command_id":new_id(),"source":desktop,"command":{
+            "type":"request_plan_change","plan_id":id,"expected_revision":plan["revision"],"content":"增加测试要求"}});
+        let receipt = store.command(envelope.clone(), &config()).unwrap().0;
+        assert_eq!(store.command(envelope, &config()).unwrap().0, receipt);
+        assert_eq!(receipt["session_id"], original_session);
+        assert_eq!(
+            store.snapshot().unwrap()["plan_changes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let job = store.claim_coordinator_job().unwrap().unwrap();
+        let mut nodes = json!([node("a", &[])]);
+        nodes[0]["objective"] = json!("执行前先补测试");
+        complete_change(&mut store, &job, nodes);
+        let ready = store.snapshot().unwrap()["plan_changes"][0].clone();
+        assert_eq!(ready["status"], "ready");
+        assert_eq!(ready["source"], desktop);
+        assert_eq!(current_plan(&store, id), plan);
+        send(
+            &mut store,
+            json!({"type":"apply_plan_change","change_id":receipt["change_id"],"expected_revision":plan["revision"]}),
+        );
+        let changed = current_plan(&store, id);
+        assert_eq!(changed["nodes"][0]["objective"], "执行前先补测试");
+        assert_eq!(changed["source"], source());
+        assert_eq!(
+            store.snapshot().unwrap()["plan_changes"][0]["status"],
+            "applied"
+        );
+        start(&mut store, &changed);
+        finish_workers(&mut store);
+        assert_eq!(
+            store.snapshot().unwrap()["deliveries"][0]["target"],
+            source()
+        );
+    }
+
+    #[test]
+    fn stale_suggestions_never_overwrite_newer_plan_or_execution_history() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[]), node("b", &["a"])]));
+        let receipt = request_change(&mut store, &plan);
+        let job = store.claim_coordinator_job().unwrap().unwrap();
+        start(&mut store, &plan);
+        let task = store.claim_task().unwrap().unwrap();
+        complete_change(&mut store, &job, json!([node("a", &[]), node("b", &["a"])]));
+        assert_eq!(
+            store.snapshot().unwrap()["plan_changes"][0]["status"],
+            "ready"
+        );
+        let current = current_plan(&store, plan["id"].as_str().unwrap());
+        assert!(store.command(json!({"command_id":new_id(),"source":source(),"command":{
+            "type":"apply_plan_change","change_id":receipt["change_id"],"expected_revision":current["revision"]
+        }}),&config()).is_err());
+        assert_eq!(current_plan(&store, plan["id"].as_str().unwrap()), current);
+        assert_eq!(
+            record(&store.db, "tasks", task["id"].as_str().unwrap()).unwrap()["status"],
+            "running"
+        );
+    }
+
+    #[test]
+    fn running_suggestion_does_not_block_controls_and_cancel_discards_late_reply() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[]), node("b", &["a"])]));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        let running = current_plan(&store, id);
+        request_change(&mut store, &running);
+        let job = store.claim_coordinator_job().unwrap().unwrap();
+        assert!(store
+            .coordinator_job_active(job["id"].as_str().unwrap())
+            .unwrap());
+        let child = store.claim_task().unwrap().unwrap();
+        control(&mut store, id, "pause_plan");
+        assert_eq!(current_plan(&store, id)["status"], "paused");
+        send(&mut store, json!({"type":"cancel_plan","plan_id":id}));
+        assert!(!store
+            .coordinator_job_active(job["id"].as_str().unwrap())
+            .unwrap());
+        complete_change(&mut store, &job, json!([node("a", &[])]));
+        assert_eq!(
+            store.snapshot().unwrap()["plan_changes"][0]["status"],
+            "discarded"
+        );
+        assert_eq!(current_plan(&store, id)["status"], "cancelled");
+        assert!(store
+            .finish(child["id"].as_str().unwrap(), Ok("迟到结果".into()))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn failed_or_discarded_suggestion_never_mutates_plan_and_history_edits_are_rejected() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[]), node("b", &["a"])]));
+        let id = plan["id"].as_str().unwrap();
+        start(&mut store, &plan);
+        store.claim_task().unwrap().unwrap();
+        let before = current_plan(&store, id);
+        request_change(&mut store, &before);
+        let job = store.claim_coordinator_job().unwrap().unwrap();
+        let mut nodes = before["nodes"].clone();
+        nodes[0]["objective"] = json!("非法修改已开始节点");
+        complete_change(&mut store, &job, nodes);
+        assert_eq!(
+            store.snapshot().unwrap()["plan_changes"][0]["status"],
+            "failed"
+        );
+        assert_eq!(current_plan(&store, id), before);
+        let receipt = request_change(&mut store, &before);
+        let job = store.claim_coordinator_job().unwrap().unwrap();
+        send(
+            &mut store,
+            json!({"type":"discard_plan_change","change_id":receipt["change_id"]}),
+        );
+        complete_change(&mut store, &job, before["nodes"].clone());
+        assert_eq!(
+            store.snapshot().unwrap()["plan_changes"][1]["status"],
+            "discarded"
+        );
+        assert_eq!(current_plan(&store, id), before);
+    }
+
+    #[test]
+    fn suggestion_restart_retries_generation_and_preserves_ready_without_autoapply() {
+        let dir = std::env::temp_dir().join(new_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let plan;
+        let ready_id;
+        let pending_id;
+        {
+            let mut store = Store::open(&path).unwrap();
+            session(&mut store);
+            plan = draft(&mut store, json!([node("a", &[])]));
+            ready_id = request_change(&mut store, &plan)["change_id"].clone();
+            let job = store.claim_coordinator_job().unwrap().unwrap();
+            complete_change(&mut store, &job, plan["nodes"].clone());
+            pending_id = request_change(&mut store, &plan)["change_id"].clone();
+            store.claim_coordinator_job().unwrap().unwrap();
+        }
+        {
+            let mut store = Store::open(&path).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(snapshot["plan_changes"][0]["id"], ready_id);
+            assert_eq!(snapshot["plan_changes"][0]["status"], "ready");
+            assert_eq!(snapshot["plan_changes"][1]["status"], "queued");
+            assert_eq!(current_plan(&store, plan["id"].as_str().unwrap()), plan);
+            let job = store.claim_coordinator_job().unwrap().unwrap();
+            assert_eq!(job["change_id"], pending_id);
+            complete_change(&mut store, &job, plan["nodes"].clone());
+            assert_eq!(
+                store.snapshot().unwrap()["plan_changes"][1]["status"],
+                "ready"
+            );
+            assert_eq!(current_plan(&store, plan["id"].as_str().unwrap()), plan);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn layout_has_separate_revision_and_validates_coordinates_and_node_ids() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("a", &[])]));
+        let id = plan["id"].as_str().unwrap();
+        send(
+            &mut store,
+            json!({"type":"set_plan_layout","plan_id":id,"expected_layout_revision":0,"layout":{"a":{"x":100,"y":-200}}}),
+        );
+        let current = current_plan(&store, id);
+        assert_eq!(current["revision"], plan["revision"]);
+        assert_eq!(current["layout_revision"], 1);
+        assert_eq!(current["updated_at"], plan["updated_at"]);
+        assert!(store.snapshot().unwrap()["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        for (revision, layout) in [
+            (0, json!({})),
+            (1, json!({"unknown":{"x":0,"y":0}})),
+            (1, json!({"a":{"x":100_001,"y":0}})),
+            (1, json!({"a":{"x":"0","y":0}})),
+            (1, json!({"a":{"x":null,"y":0}})),
+        ] {
+            assert!(store.command(json!({"command_id":new_id(),"source":source(),"command":{
+                "type":"set_plan_layout","plan_id":id,"expected_layout_revision":revision,"layout":layout
+            }}),&config()).is_err());
+            assert_eq!(current_plan(&store, id), current);
+        }
+        send(&mut store, json!({"type":"cancel_plan","plan_id":id}));
+        let cancelled = current_plan(&store, id);
+        send(
+            &mut store,
+            json!({"type":"set_plan_layout","plan_id":id,"expected_layout_revision":1,"layout":{"a":{"x":0,"y":0}}}),
+        );
+        assert_eq!(current_plan(&store, id)["revision"], cancelled["revision"]);
+        assert_eq!(current_plan(&store, id)["layout_revision"], 2);
     }
 }

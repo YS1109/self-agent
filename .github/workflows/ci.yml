@@ -33,6 +33,7 @@ jobs:
       - run: python scripts/orchestration_smoke.py
       - run: python scripts/agents_smoke.py
       - run: python scripts/runtime_smoke.py
+      - run: python scripts/plan_change_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}

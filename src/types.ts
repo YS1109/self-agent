@@ -71,6 +71,21 @@ export interface PlanNode {
   resolved_by?: string | null;
 }
 export type EditablePlanNode = Pick<PlanNode, "id" | "title" | "objective" | "depends_on" | "agent_id" | "repairs" | "verifies" | "acceptance_command">;
+export type PlanLayout = Record<string, { x: number; y: number }>;
+export interface PlanChange {
+  id: string;
+  plan_id: string;
+  session_id: string;
+  base_revision: number;
+  source: SourceContext;
+  content: string;
+  status: "queued" | "running" | "ready" | "applied" | "failed" | "discarded";
+  nodes: EditablePlanNode[];
+  message?: string | null;
+  error?: string | null;
+  created_at: string;
+  updated_at: string;
+}
 export interface Plan {
   id: string;
   session_id: string;
@@ -91,6 +106,8 @@ export interface Plan {
   default_agent_id?: string | null;
   used_node_ids?: string[];
   paused_from_status?: string | null;
+  layout?: PlanLayout;
+  layout_revision?: number;
 }
 export interface Delivery {
   id: string;
@@ -127,6 +144,7 @@ export interface Snapshot {
   capabilities: Capability[];
   selections: { source: SourceContext; session_id: string }[];
   plans: Plan[];
+  plan_changes: PlanChange[];
 }
 export interface Settings {
   api_key_configured?: boolean;
@@ -146,6 +164,10 @@ export type Command =
   | { type: "cancel_task"; task_id: string }
   | { type: "update_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
   | { type: "patch_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
+  | { type: "set_plan_layout"; plan_id: string; expected_layout_revision: number; layout: PlanLayout }
+  | { type: "request_plan_change"; plan_id: string; expected_revision: number; content: string }
+  | { type: "apply_plan_change"; change_id: string; expected_revision: number }
+  | { type: "discard_plan_change"; change_id: string }
   | { type: "pause_plan" | "resume_plan"; plan_id: string; expected_revision: number }
   | { type: "start_plan"; plan_id: string; expected_revision: number }
   | { type: "cancel_plan"; plan_id: string }
@@ -157,6 +179,7 @@ export interface Receipt {
   task_id?: string;
   plan_id?: string;
   job_id?: string;
+  change_id?: string;
 }
 export const DESKTOP_SOURCE: SourceContext = {
   channel_id: "desktop",
@@ -176,6 +199,7 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   capabilities: [],
   selections: [],
   plans: [],
+  plan_changes: [],
 };
 export const activeTask = (status: string) =>
   status === "queued" || status === "running" || status === "paused" || status === "waiting_input";

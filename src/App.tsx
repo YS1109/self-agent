@@ -47,12 +47,14 @@ import {
 } from "lucide-react";
 import { api, dispatch } from "./api";
 import { PlanPanel } from "./components/plan-panel";
+import { PlanChanges } from "./components/plan-changes";
 import { ExecutionEvidence } from "./components/execution-evidence";
 import { Status } from "./components/status";
 import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/agent-settings";
 import { syncNativeTheme, type AppTheme } from "./theme";
 import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./labels";
 import { Button } from "./components/ui/button";
+import { discardCleanPlanDraft, hasUnsavedPlanDraft, selectedSessionPlan, updatePlanLayouts, type PlanDraft, type PlanLayoutDraft } from "./plan-state";
 import {
   activeTask,
   DESKTOP_SOURCE,
@@ -196,7 +198,9 @@ export default function App() {
   const [panel, setPanel] = useState<Panel | null>(null);
   const [activity, setActivity] = useState(false);
   const [taskId, setTaskId] = useState<string>();
-  const [planId, setPlanId] = useState<string>();
+  const [planIds, setPlanIds] = useState<Record<string, string>>({});
+  const [planDrafts, setPlanDrafts] = useState<Record<string, PlanDraft>>({});
+  const [planLayouts, setPlanLayouts] = useState<Record<string, PlanLayoutDraft>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [settings, setSettings] = useState<Settings>({
     base_url: "",
@@ -216,7 +220,9 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [codexStatus, setCodexStatus] = useState("");
   const [checkingCodex, setCheckingCodex] = useState(false);
-  const [remoteText, setRemoteText] = useState("");
+  const [inputModes, setInputModes] = useState<Record<string, "goal" | "change">>({});
+  const [remotePlanIds, setRemotePlanIds] = useState<Record<string, string>>({});
+  const [remoteDrafts, setRemoteDrafts] = useState<Record<string, string>>({});
   const [remoteSource, setRemoteSource] =
     useState<SourceContext>(REMOTE_SOURCE);
   const [remoteReceipt, setRemoteReceipt] = useState("");
@@ -227,6 +233,13 @@ export default function App() {
   const session = snapshot.sessions.find((s) => s.id === sessionId);
   const tasks = snapshot.tasks.filter((t) => t.session_id === sessionId);
   const plans = (snapshot.plans ?? []).filter((p) => p.session_id === sessionId);
+  const selectedPlan = selectedSessionPlan(snapshot.plans, sessionId, planIds);
+  const planId = selectedPlan?.id;
+  const selectPlan = (id: string) => {
+    if (sessionId) setPlanIds((current) => ({ ...current, [sessionId]: id }));
+  };
+  const inputModeKey = `desktop:${sessionId ?? ""}`;
+  const inputMode = inputModes[inputModeKey] ?? "goal";
   const selectedTask = tasks.find((t) => t.id === taskId) ?? tasks[0];
   const running = snapshot.tasks.filter(
     (t) => t.task_kind !== "plan" && ["queued", "running"].includes(t.status),
@@ -239,11 +252,17 @@ export default function App() {
   const remoteSelection =
     snapshot.selections.find((s) => sameSource(s.source, remoteSource))
       ?.session_id ?? "";
+  const remoteKey = `${remoteSource.channel_id}:${remoteSource.actor_id}:${remoteSource.conversation_id}:${remoteSelection}`;
+  const remotePlans = snapshot.plans.filter((item) => item.session_id === remoteSelection);
+  const remotePlan = remotePlans.find((item) => item.id === remotePlanIds[remoteKey]) ?? remotePlans[0];
+  const remoteMode = inputModes[remoteKey] ?? "goal";
+  const currentRemoteText = remoteDrafts[remoteKey] ?? "";
+  const changeable = (status?: string) => !!status && ["draft", "running", "paused", "reviewing", "waiting_input"].includes(status);
 
   async function refresh() {
     try {
       const value = await api<Snapshot>("GET", "/snapshot");
-      setSnapshot({ ...value, plans: value.plans ?? [] });
+      setSnapshot({ ...value, plans: value.plans ?? [], plan_changes: value.plan_changes ?? [] });
       setConnected(true);
       setConnectionError("");
     } catch (error) {
@@ -315,10 +334,20 @@ export default function App() {
   }, []);
 
   async function command(value: Command, source = DESKTOP_SOURCE) {
+    const applyingChange = value.type === "apply_plan_change" ? snapshot.plan_changes.find((item) => item.id === value.change_id) : undefined;
+    const applyingPlan = applyingChange ? snapshot.plans.find((item) => item.id === applyingChange.plan_id) : undefined;
+    if (applyingPlan && hasUnsavedPlanDraft(applyingPlan, planDrafts)) {
+      setNotice("该计划在桌面还有未保存的结构修改，请先保存或重新加载草稿，再应用调整建议。");
+      return undefined;
+    }
     setBusy(true);
     setNotice("");
     try {
       const receipt = await dispatch(source, value);
+      if (applyingPlan) {
+        setPlanDrafts((current) => discardCleanPlanDraft(applyingPlan, current));
+        setPlanLayouts((current) => updatePlanLayouts(applyingPlan, applyingPlan.nodes, current, current[applyingPlan.id]));
+      }
       await refresh();
       return receipt;
     } catch (error) {
@@ -344,11 +373,14 @@ export default function App() {
   }
   async function send(run: boolean) {
     if (!session || !draft.trim()) return;
+    if (!run && inputMode === "change" && (!selectedPlan || !changeable(selectedPlan.status))) return;
     const key = draftKey;
     const receipt = await command(
       run
         ? { type: "start_task", session_id: session.id, title: draft.trim() }
-        : {
+        : inputMode === "change" && selectedPlan ? {
+            type: "request_plan_change", plan_id: selectedPlan.id, expected_revision: selectedPlan.revision, content: draft.trim(),
+          } : {
             type: "send_message",
             session_id: session.id,
             content: draft.trim(),
@@ -359,8 +391,10 @@ export default function App() {
       if (receipt.task_id) setTaskId(receipt.task_id);
       if (!run) {
         setPanel("plan");
-        setPlanId(receipt.plan_id);
-        setNotice(settings.execution_mode !== "demo" && !settings.configured
+        const targetPlanId = receipt.plan_id ?? selectedPlan?.id;
+        if (targetPlanId) setPlanIds((current) => ({ ...current, [session.id]: targetPlanId }));
+        setNotice(inputMode === "change" ? "补充要求已接收，主智能体会异步生成调整建议。结构化管理指令仍可使用，请审阅后应用。"
+          : settings.execution_mode !== "demo" && !settings.configured
           ? "请先在设置中配置模型服务。指令已保存，主智能体会提示配置要求。"
           : "目标已接收，主智能体正在后台处理；生成计划后可在右侧审阅。" );
       }
@@ -390,18 +424,21 @@ export default function App() {
     }
   }
   async function remoteSend(run: boolean) {
-    if (!remoteText.trim()) return;
+    if (!currentRemoteText.trim() || !remoteSelection) return;
+    if (!run && remoteMode === "change" && (!remotePlan || !changeable(remotePlan.status))) return;
+    const key = remoteKey;
     const receipt = await command(
       run
-        ? { type: "start_task", title: remoteText.trim() }
-        : { type: "send_message", content: remoteText.trim() },
+        ? { type: "start_task", session_id: remoteSelection, title: currentRemoteText.trim() }
+        : remoteMode === "change" && remotePlan ? { type: "request_plan_change", plan_id: remotePlan.id, expected_revision: remotePlan.revision, content: currentRemoteText.trim() }
+        : { type: "send_message", session_id: remoteSelection, content: currentRemoteText.trim() },
       remoteSource,
     );
     if (receipt) {
       setRemoteReceipt(
         `已接收 · ${receipt.command_id.slice(0, 8)}${receipt.task_id ? ` · 任务 ${receipt.task_id.slice(0, 8)}` : ""}`,
       );
-      setRemoteText((current) => current === remoteText ? "" : current);
+      setRemoteDrafts((current) => current[key] === currentRemoteText ? { ...current, [key]: "" } : current);
     }
   }
   async function checkCodex() {
@@ -479,7 +516,6 @@ export default function App() {
                           session_id: s.id,
                         });
                         setTaskId(undefined);
-                        setPlanId(undefined);
                         if (window.innerWidth < 760) setSidebar(false);
                       }}
                     >
@@ -528,7 +564,7 @@ export default function App() {
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-              <small>本地优先 · v0.4.1</small>
+              <small>本地优先 · v0.5.0</small>
               </span>
               <Settings2 size={15} />
             </button>
@@ -719,7 +755,7 @@ export default function App() {
                     <section className="tasks-section">
                       <div className="section-label"><Network size={13} />编排计划<span>{plans.length}</span></div>
                       {plans.map((plan) => (
-                        <button key={plan.id} className={`task-card ${planId === plan.id && panel === "plan" ? "task-selected" : ""}`} onClick={() => { setPlanId(plan.id); setPanel("plan"); }}>
+                        <button key={plan.id} className={`task-card ${planId === plan.id && panel === "plan" ? "task-selected" : ""}`} onClick={() => { selectPlan(plan.id); setPanel("plan"); }}>
                           <div className="task-icon"><Network size={18} /></div>
                           <div className="task-card-content">
                             <div className="task-card-top"><span>主智能体编排</span><Status status={plan.status} /></div>
@@ -753,6 +789,16 @@ export default function App() {
               )}
             </div>
             <div className="composer-area">
+              {session && <div className="instruction-scope">
+                <label>指令用途<select aria-label="桌面指令用途" value={inputMode} onChange={(event) => setInputModes((current) => ({ ...current, [inputModeKey]: event.target.value as "goal" | "change" }))}>
+                  <option value="goal">新目标</option><option value="change">补充当前计划</option>
+                </select></label>
+                {inputMode === "change" && <label>目标计划<select aria-label="桌面目标计划" value={selectedPlan?.id ?? ""} onChange={(event) => selectPlan(event.target.value)}>
+                  {!plans.length && <option value="">暂无计划</option>}
+                  {plans.map((item) => <option key={item.id} value={item.id}>{item.title} · v{item.revision}{changeable(item.status) ? "" : " · 已结束"}</option>)}
+                </select></label>}
+                <span className="instruction-target" title={session.title}>会话：{session.title}</span>
+              </div>}
               <div className="composer-context">
                 <span>
                   <span
@@ -771,7 +817,7 @@ export default function App() {
                   aria-label="向主智能体 发送指令"
                   placeholder={
                     session
-                      ? "告诉主智能体你的目标，或补充新的指令…"
+                      ? inputMode === "change" ? "例如：先补回归测试，再继续修改界面。生成建议后审阅应用…" : "告诉主智能体你的新目标…"
                       : "先创建一个会话，开始编排你的工作…"
                   }
                   value={draft}
@@ -806,17 +852,17 @@ export default function App() {
                   <div className="composer-submit">
                     <Button
                       size="small"
-                      disabled={!connected || !session || !draft.trim() || busy}
+                      disabled={!connected || !session || !draft.trim() || busy || (inputMode === "change" && !changeable(selectedPlan?.status))}
                       onClick={() => void send(false)}
                       title="发送目标给主智能体（⌘/Ctrl + Enter）"
                     >
                       <MessageSquare size={13} />
-                      <span>发送目标</span>
+                      <span>{inputMode === "change" ? "生成调整建议" : "发送目标"}</span>
                     </Button>
                     <Button
                       variant="ghost"
                       size="small"
-                      disabled={!connected || !session || !draft.trim() || busy}
+                      disabled={!connected || !session || !draft.trim() || busy || inputMode === "change"}
                       onClick={() => void send(true)}
                       title={`由默认角色「${settings.agents.find((agent) => agent.id === settings.default_agent_id)?.name ?? "编码助手"}」直接执行`}
                     >
@@ -827,7 +873,7 @@ export default function App() {
                 </div>
               </div>
               <div className="composer-footnote">
-                <span>发送目标 → 审阅计划 → 启动执行</span>
+                <span>{inputMode === "change" ? "补充要求 → 审阅差异 → 应用到后续任务" : "发送目标 → 审阅计划 → 启动执行"}</span>
                 <span>⌘ ↵ 发送</span>
               </div>
             </div>
@@ -874,8 +920,11 @@ export default function App() {
               </div>
               {panel === "plan" ? (
                 <PlanPanel
-                  plans={plans} selectedId={planId} onSelect={setPlanId}
+                  plans={plans} selectedId={planId} onSelect={selectPlan}
                   connected={connected} busy={busy} onCommand={command}
+                  changes={snapshot.plan_changes}
+                  drafts={planDrafts} setDrafts={setPlanDrafts}
+                  layouts={planLayouts} setLayouts={setPlanLayouts}
                 />
               ) : panel === "changes" ? (
                 <EmptyPanel
@@ -1340,30 +1389,47 @@ export default function App() {
             <p className="help-text">
               独立于桌面会话选择。任务保存派发时的回传位置。
             </p>
+            <div className="instruction-scope remote-instruction-scope">
+              <label>指令用途<select aria-label="远程指令用途" value={remoteMode} onChange={(event) => setInputModes((current) => ({ ...current, [remoteKey]: event.target.value as "goal" | "change" }))}>
+                <option value="goal">新目标</option><option value="change">补充当前计划</option>
+              </select></label>
+              <label>目标计划<select aria-label="远程目标计划" value={remotePlan?.id ?? ""} onChange={(event) => setRemotePlanIds((current) => ({ ...current, [remoteKey]: event.target.value }))}>
+                {!remotePlans.length && <option value="">暂无计划</option>}
+                {remotePlans.map((item) => <option key={item.id} value={item.id}>{item.title} · v{item.revision}</option>)}
+              </select></label>
+            </div>
+            {remotePlan && <div className="remote-plan-progress">
+              <strong>{remotePlan.title}</strong><Status status={remotePlan.status} />
+              <p>已完成 {remotePlan.nodes.filter((node) => node.status === "completed").length}/{remotePlan.nodes.length} 个任务 · 版本 {remotePlan.revision}</p>
+              <div className="remote-actions">
+                <Button size="small" variant="secondary" disabled={busy || !connected} onClick={() => void refresh()}><RefreshCw size={12} />查询进度</Button>
+                {["running", "reviewing", "waiting_input", "paused"].includes(remotePlan.status) && <Button size="small" variant="secondary" disabled={busy || !connected} onClick={() => void command({ type: remotePlan.status === "paused" ? "resume_plan" : "pause_plan", plan_id: remotePlan.id, expected_revision: remotePlan.revision }, remoteSource)}>{remotePlan.status === "paused" ? "恢复派发" : "暂停派发"}</Button>}
+              </div>
+            </div>}
             <textarea
               className="remote-input"
               aria-label="远程指令内容"
-              value={remoteText}
-              onChange={(e) => setRemoteText(e.target.value)}
-              placeholder="模拟手机或通讯工具发来的指令…"
+              value={currentRemoteText}
+              onChange={(e) => setRemoteDrafts((current) => ({ ...current, [remoteKey]: e.target.value }))}
+              placeholder={remoteMode === "change" ? "补充对此计划的要求，生成调整建议后审阅应用…" : "模拟手机或通讯工具发来的新目标…"}
               rows={4}
             />
             <div className="remote-actions">
               <Button
                 size="small"
                 disabled={
-                  !connected || busy || !remoteSelection || !remoteText.trim()
+                  !connected || busy || !remoteSelection || !currentRemoteText.trim() || (remoteMode === "change" && !changeable(remotePlan?.status))
                 }
                 onClick={() => void remoteSend(false)}
               >
                 <Send size={13} />
-                发送目标
+                {remoteMode === "change" ? "生成调整建议" : "发送目标"}
               </Button>
               <Button
                 variant="secondary"
                 size="small"
                 disabled={
-                  !connected || busy || !remoteSelection || !remoteText.trim()
+                  !connected || busy || !remoteSelection || !currentRemoteText.trim() || remoteMode === "change"
                 }
                 onClick={() => void remoteSend(true)}
               >
@@ -1377,6 +1443,7 @@ export default function App() {
                 {remoteReceipt}
               </p>
             )}
+            {remotePlan && <PlanChanges plan={remotePlan} changes={snapshot.plan_changes} busy={busy} connected={connected} localDirty={hasUnsavedPlanDraft(remotePlan, planDrafts)} onCommand={(value) => command(value, remoteSource)} />}
           </div>
           <div className="delivery-section">
             <div className="section-label">

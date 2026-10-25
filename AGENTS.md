@@ -4,4 +4,4 @@
 - 用户明确不喜欢绿色。界面采用中性灰底色和蓝色强调，不使用绿色作为品牌色、成功色、图连线或图标颜色；明暗主题保持一致。
 - 桌面布局参考 Codex 的会话工作台。保持主对话可用，耗时模型请求和子任务不得阻塞结构化管理指令。
 - 计划、任务结果和回调状态以 Rust 后台的持久化记录为准。演示模式必须明确标记，不得把模拟步骤描述为真实项目操作。
-- 当前阶段协议见 `docs/protocol-v3.md`，角色与执行器见 `docs/protocol-v2.md`，基础编排协议见 `docs/protocol-v1-draft.md`，实现边界见 `docs/implementation-status.md`。新增能力同步更新说明并验证相关行为。
+- 当前阶段协议见 `docs/protocol-v4.md`，运行控制与验收见 `docs/protocol-v3.md`，角色与执行器见 `docs/protocol-v2.md`，基础编排协议见 `docs/protocol-v1-draft.md`，实现边界见 `docs/implementation-status.md`。新增能力同步更新说明并验证相关行为。

@@ -20,6 +20,9 @@ const SYSTEM_PROMPT: &str = r#"你是本地编程工作台的主 Agent。默认�
 若只是讨论或提问，输出 {"action":"reply","message":"中文回答"}。
 若用户提出可执行目标，输出 {"action":"plan","message":"中文说明","title":"计划标题","nodes":[{"id":"step-1","title":"任务标题","objective":"完整可独立执行的目标、必要上下文和验证要求","depends_on":[]}]}。
 计划先形成草稿供用户审阅，不能声称已经启动。节点数为 1 到 12，ID 唯一，依赖必须存在且不能成环。将适合并行的独立任务拆开，只为真实先后关系添加依赖。若信息不足，先回复澄清事项。
+当 kind=change：
+用户要调整当前计划，不是新建计划。输出 {"action":"change","message":"调整原因与影响","nodes":[完整调整后的全部节点]}。
+基于 plan 中的版本生成建议。必须保留所有已开始或已结束节点的 ID、标题、目标、角色、依赖及修复验收字段；仅可修改或移除 pending/queued 节点，或新增节点。不得改变执行历史，不得声称建议已应用。完整节点列表包含保留节点，保持依赖无环、角色有效、累计不超过 12 节点；不得复用 used_node_ids 中已经移除的 ID。将用户新增约束写入相关后续任务的 objective。若无法安全调整，说明原因并保留原节点，等待用户选择。
 当 kind=review：
 仅根据实际子任务结果判断。所有节点完成或历史失败已有效验收解决，且目标已达成时输出 {"action":"complete","message":"真实结果、验证和限制的中文总结"}。
 仍有可执行的修复或补充时输出 {"action":"extend","message":"补充原因","nodes":[{"id":"新的唯一ID","title":"任务标题","objective":"包含修复背景和验证要求的完整目标","depends_on":[]}]}。
@@ -96,7 +99,7 @@ pub fn spawn(state: Arc<AppState>) {
 
 async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Value> {
     let kind = job["kind"].as_str().context("主 Agent 作业类型缺失")?;
-    if !matches!(kind, "message" | "review") {
+    if !matches!(kind, "message" | "review" | "change") {
         bail!("主 Agent 作业类型无效");
     }
     let mode = job["execution_mode"]
@@ -194,6 +197,7 @@ fn parse_response(kind: &str, body: &Value) -> Result<Value> {
     let actions: &[&str] = match kind {
         "message" => &["plan", "reply"],
         "review" => &["complete", "extend", "wait_input"],
+        "change" => &["change"],
         _ => bail!("主 Agent 作业类型无效"),
     };
     if !actions.contains(&action) {
@@ -205,7 +209,7 @@ fn parse_response(kind: &str, body: &Value) -> Result<Value> {
         required_text(&output, "title", 1024)?;
         validated["title"] = output["title"].clone();
     }
-    if matches!(action, "plan" | "extend") {
+    if matches!(action, "plan" | "extend" | "change") {
         let nodes = output["nodes"]
             .as_array()
             .context("主 Agent 计划缺少任务节点")?;
@@ -307,6 +311,22 @@ fn redact(value: &mut Value, secret: &str) {
 }
 
 fn demo(kind: &str, context: &Value) -> Value {
+    if kind == "change" {
+        let mut nodes = context["plan"]["nodes"].clone();
+        if let Some(node) = nodes.as_array_mut().and_then(|nodes| {
+            nodes
+                .iter_mut()
+                .rev()
+                .find(|node| matches!(node["status"].as_str(), Some("pending" | "queued")))
+        }) {
+            node["objective"] = json!(format!(
+                "{}\n演示补充要求：{}。仅模拟调整，不执行真实项目操作。",
+                node["objective"].as_str().unwrap_or(""),
+                context["job"]["content"].as_str().unwrap_or("")
+            ));
+        }
+        return json!({"action":"change","message":"这是演示调整建议：将补充要求写入最后一个可编辑任务，确认后才会应用；没有进行真实模型推理或项目操作。","nodes":nodes});
+    }
     if kind == "review" {
         let has_failure = context["plan"]["nodes"].as_array().is_some_and(|nodes| {
             nodes.iter().any(|node| {
@@ -349,6 +369,26 @@ mod tests {
         let body = response(json!({"action":"complete","message":"完成"}));
         assert!(parse_response("message", &body).is_err());
         assert!(parse_response("review", &body).is_ok());
+    }
+
+    #[test]
+    fn plan_changes_use_separate_stage_and_preserve_complete_node_definitions() {
+        let body = response(json!({
+            "action":"change","message":"调整后续任务，等待确认",
+            "nodes":[{"id":"a","title":"检查","objective":"先补测试","depends_on":[],"agent_id":"coder",
+                "repairs":[],"verifies":[],"acceptance_command":null}]
+        }));
+        assert_eq!(
+            parse_response("change", &body).unwrap()["nodes"][0]["objective"],
+            "先补测试"
+        );
+        assert!(parse_response("message", &body).is_err());
+        assert!(parse_response("review", &body).is_err());
+        assert!(parse_response(
+            "change",
+            &response(json!({"action":"reply","message":"直接回复"}))
+        )
+        .is_err());
     }
 
     #[test]

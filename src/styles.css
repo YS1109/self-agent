@@ -2508,3 +2508,89 @@ textarea {
 .plan-graph .react-flow__controls button:hover { background: var(--surface-2); }
 @media (min-width: 1121px) { .work-panel { width: 400px; flex-basis: 400px; } }
 @media (min-width: 1500px) { .work-panel { width: 460px; flex-basis: 460px; } }
+
+/* 编排画布与对话共享计划草稿，布局有独立的保存状态。 */
+.plan-canvas-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 15px; font-size: 11px; color: var(--secondary); }
+.plan-canvas > .help-text { margin-bottom: 12px; line-height: 1.9; }
+.plan-layout-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 0; }
+.plan-graph-inspector { margin-top: 10px; }
+.plan-graph .react-flow__node.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-light); }
+.plan-graph .react-flow__node:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.plan-graph .react-flow__edge.selected .react-flow__edge-path,
+.plan-graph .react-flow__edge:focus-visible .react-flow__edge-path { stroke-width: 3; }
+.plan-edge-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.plan-edge-actions > span { flex: 1 1 160px; color: var(--secondary); font-size: 11px; overflow-wrap: anywhere; }
+.plan-graph .react-flow__handle { width: 9px; height: 9px; background: var(--accent); border: 2px solid var(--surface); }
+.plan-graph .react-flow__attribution { background: var(--surface); color: var(--muted); font-size: 8px; }
+.work-panel:has(.plan-panel-expanded) { width: 100%; flex: 1 1 100%; }
+.main-content:has(.plan-panel-expanded) > .conversation { display: none; }
+.plan-panel-expanded {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 310px;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-areas: "heading heading" "summary summary" "canvas inspector" "footer footer";
+  gap: 10px 16px;
+  overflow: hidden;
+  padding: 12px 16px;
+}
+.plan-panel-expanded > :is(.plan-selector, .plan-overview, .plan-explanation, .plan-runtime-controls, .plan-attention, .plan-summary, .plan-view-tabs) { display: none; }
+.plan-panel-expanded > .plan-canvas-heading { grid-area: heading; margin: 0; min-width: 0; }
+.plan-panel-expanded .plan-canvas-heading > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--ink); }
+.plan-expanded-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-width: 0; font-size: 10px; color: var(--secondary); }
+.plan-panel-expanded > .plan-expanded-summary { grid-area: summary; }
+.plan-expanded-summary select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; max-width: 250px; min-width: 0; font-size: 11px; }
+.plan-expanded-summary > .button { margin-left: auto; }
+.plan-panel-expanded > .plan-canvas { grid-area: canvas; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.plan-panel-expanded .plan-canvas > .help-text { margin-bottom: 8px; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+.plan-panel-expanded .plan-graph-container { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.plan-panel-expanded .plan-graph { height: auto; min-height: 0; flex: 1; }
+.plan-panel-expanded .plan-edge-actions { flex-shrink: 0; }
+.plan-panel-expanded .plan-layout-actions { padding: 8px 0 0; flex-shrink: 0; }
+.plan-panel-expanded > .plan-graph-inspector { grid-area: inspector; margin: 0; min-width: 0; min-height: 0; overflow-y: auto; padding: 0 4px 4px 0; overscroll-behavior: contain; }
+.plan-panel-expanded .plan-graph-inspector > .section-label { margin-bottom: 10px; }
+.plan-expanded-context { font-size: 11px; color: var(--secondary); line-height: 1.8; margin-bottom: 12px; }
+.plan-expanded-context > summary { cursor: pointer; color: var(--accent); }
+.plan-expanded-context > p { white-space: pre-wrap; margin-top: 8px; }
+.plan-panel-expanded > .plan-footer { grid-area: footer; min-width: 0; }
+.plan-panel-expanded .plan-actions { position: static; padding: 9px 0 0; margin-top: 0; }
+.plan-panel-expanded .plan-save-note, .plan-panel-expanded .plan-validation { margin-top: 5px; }
+@media (max-width: 960px) {
+  :root[data-desktop-titlebar="macos"] .work-panel { top: 32px; }
+}
+@media (max-width: 760px) {
+  :root[data-desktop-titlebar="macos"] .sidebar { top: 32px; }
+}
+.instruction-scope { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+.instruction-scope > label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 10px; min-width: 0; }
+.instruction-scope select { border: 1px solid var(--line); background: var(--surface); color: var(--secondary); padding: 6px 8px; border-radius: 6px; font-size: 11px; max-width: 250px; min-width: 0; }
+.instruction-target { color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; padding-bottom: 7px; }
+.remote-instruction-scope { margin-top: 15px; }
+.remote-instruction-scope > label { width: 100%; }
+.remote-instruction-scope select { width: 100%; max-width: none; }
+.remote-plan-progress { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 12px 0; font-size: 11px; }
+.remote-plan-progress > strong { display: block; margin-bottom: 8px; overflow-wrap: anywhere; }
+.remote-plan-progress > p { color: var(--secondary); font-size: 10px; margin: 9px 0; }
+.plan-changes { margin-top: 20px; min-width: 0; }
+.plan-change { padding: 13px; border: 1px solid var(--line); border-radius: 9px; margin-top: 12px; background: var(--bg); font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
+.plan-change-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+.plan-change-heading > strong { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+.plan-change-heading > span { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.plan-change-prompt { white-space: pre-wrap; color: var(--secondary); margin-bottom: 7px; }
+.plan-change > p:not(:first-child) { margin-bottom: 7px; }
+.plan-change-counts { display: flex; gap: 12px; color: var(--accent); margin: 12px 0; font-size: 10px; }
+.plan-change-detail { border-top: 1px solid var(--line); padding: 8px 0; }
+.plan-change-detail > summary { cursor: pointer; }
+.plan-change-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--secondary); font-size: 10px; line-height: 1.9; padding: 9px 0; }
+.plan-change > .button { margin: 9px 6px 0 0; }
+@media (max-width: 1120px) {
+  .plan-panel-expanded { grid-template-columns: minmax(0, 1fr) 280px; gap: 10px 12px; }
+  .instruction-scope select { max-width: 190px; }
+}
+@media (max-width: 760px) {
+  .plan-panel-expanded { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(180px, 1fr) minmax(130px, .7fr) auto; grid-template-areas: "heading" "summary" "canvas" "inspector" "footer"; gap: 8px; padding: 10px; }
+  .plan-expanded-summary select { max-width: 180px; }
+  .plan-expanded-summary > .plan-expanded-round { display: none; }
+  .instruction-target { width: 100%; max-width: 100%; padding-bottom: 0; }
+  .instruction-scope { gap: 7px; }
+  .instruction-scope select { max-width: 170px; }
+}
