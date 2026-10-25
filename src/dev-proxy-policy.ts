@@ -7,6 +7,8 @@ const routes: Record<string, string> = {
   "GET /api/v1/snapshot": "GET",
   "GET /api/v1/settings": "GET",
   "POST /api/v1/commands": "POST",
+  "POST /api/v1/models": "POST",
+  "GET /api/v1/codex/status": "GET",
   "PUT /api/v1/settings": "PUT",
 };
 

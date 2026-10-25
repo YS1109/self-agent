@@ -1,0 +1,33 @@
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vitest";
+import { ModelSelect, QuickModelSelect, modelLabel, modelOptions, type ModelCatalog } from "./model-select";
+
+const catalog: ModelCatalog = { models: [{ id: "gateway/coder", name: "编码模型" }], loading: false, error: "", refresh: vi.fn() };
+describe("模型下拉选择", () => {
+  it("显示真实列表，已有自定义值未在列表中时保留，不擅自替换", () => {
+    expect(modelOptions(catalog.models, "custom/model").map((item) => item.id)).toEqual(["custom/model", "gateway/coder"]);
+    expect(modelOptions(catalog.models, "gateway/coder")).toHaveLength(1);
+    const html = renderToStaticMarkup(<ModelSelect label="主智能体模型" value="custom/model" onChange={vi.fn()} catalog={catalog} />);
+    expect(html).toContain("<select");
+    expect(html).toContain('value="custom/model" selected=""');
+    expect(html).toContain("编码模型");
+    expect(html).toContain("自定义模型 ID");
+  });
+  it("执行角色提供继承选项，获取失败仍保留当前模型及手动入口", () => {
+    const html = renderToStaticMarkup(<ModelSelect label="执行模型" value="" onChange={vi.fn()} emptyLabel="继承主智能体模型" catalog={{ ...catalog, models: [], error: "模型列表获取失败" }} />);
+    expect(html).toContain("继承主智能体模型");
+    expect(html).toContain("模型列表获取失败");
+    expect(html).toContain("自定义模型 ID");
+  });
+  it("对话输入区直接提供模型下拉并保留设置入口", () => {
+    const html = renderToStaticMarkup(<QuickModelSelect value="gateway/coder" catalog={catalog} disabled={false} onChange={vi.fn()} onSettings={vi.fn()} />);
+    expect(html).toContain('aria-label="当前主智能体模型"');
+    expect(html).toContain('value="gateway/coder" selected=""');
+    expect(html).toContain("模型设置／刷新列表");
+  });
+  it("疑似误填的密钥不作为模型标签直接展示", () => {
+    const key = "sk-" + "a".repeat(40);
+    expect(modelLabel(key)).not.toContain(key);
+    expect(modelOptions([], key)[0].name).not.toContain(key);
+  });
+});

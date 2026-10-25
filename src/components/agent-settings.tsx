@@ -1,6 +1,7 @@
 import { Plus, Trash2, Users } from "lucide-react";
 import type { AgentProfile, Settings } from "../types";
 import { Button } from "./ui/button";
+import { ModelSelect, type ModelCatalog } from "./model-select";
 
 export const DEFAULT_AGENT: AgentProfile = {
   id: "coder",
@@ -20,11 +21,14 @@ export function normalizeSettings(settings: Settings): Settings {
 }
 
 export function AgentSettings({
-  settings, onChange, disabled,
+  settings, onChange, disabled, nativeModels, codexModels, codexPathChanged,
 }: {
   settings: Settings;
   onChange: (settings: Settings) => void;
   disabled: boolean;
+  nativeModels: ModelCatalog;
+  codexModels: ModelCatalog;
+  codexPathChanged: boolean;
 }) {
   const agents = settings.agents;
   const update = (id: string, values: Partial<AgentProfile>) =>
@@ -63,7 +67,10 @@ export function AgentSettings({
                   <option value="codex">Codex 本机 CLI</option>
                 </select>
               </label>
-              <label>执行模型<input value={agent.model} placeholder={agent.executor === "codex" ? "留空使用 Codex 本机配置" : "留空继承主智能体模型"} onChange={(event) => update(agent.id, { model: event.target.value })} /></label>
+              <ModelSelect key={agent.executor} label={`角色 ${index + 1} · 执行模型`} value={agent.model} onChange={(model) => update(agent.id, { model })}
+                catalog={agent.executor === "codex" ? codexModels : nativeModels} disabled={disabled || (agent.executor === "codex" && codexPathChanged)}
+                emptyLabel={agent.executor === "codex" ? "使用 Codex 本机默认模型" : "继承主智能体模型"}
+                hint={agent.executor === "codex" && codexPathChanged ? "CLI 路径已修改，请先保存设置再获取列表。" : undefined} />
             </div>
             <label>角色指令<textarea value={agent.instructions} rows={3} placeholder="描述角色职责、执行约束和结果要求" onChange={(event) => update(agent.id, { instructions: event.target.value })} /></label>
           </fieldset>

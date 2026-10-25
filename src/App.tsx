@@ -51,6 +51,7 @@ import { PlanChanges } from "./components/plan-changes";
 import { ExecutionEvidence } from "./components/execution-evidence";
 import { Status } from "./components/status";
 import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/agent-settings";
+import { ModelSelect, QuickModelSelect, useModelCatalog } from "./components/model-select";
 import { syncNativeTheme, type AppTheme } from "./theme";
 import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./labels";
 import { Button } from "./components/ui/button";
@@ -220,6 +221,10 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [codexStatus, setCodexStatus] = useState("");
   const [checkingCodex, setCheckingCodex] = useState(false);
+  const quickModels = useModelCatalog({ base_url: settings.base_url }, connected && !!settings.base_url);
+  const nativeModels = useModelCatalog({ base_url: settingsForm.base_url, ...(apiKey ? { api_key: apiKey } : {}) }, connected && modal === "settings" && !!settingsForm.base_url);
+  const codexModels = useModelCatalog({ executor: "codex" }, connected && modal === "settings"
+    && settingsForm.codex_binary === settings.codex_binary && settingsForm.agents.some((agent) => agent.executor === "codex"));
   const [inputModes, setInputModes] = useState<Record<string, "goal" | "change">>({});
   const [remotePlanIds, setRemotePlanIds] = useState<Record<string, string>>({});
   const [remoteDrafts, setRemoteDrafts] = useState<Record<string, string>>({});
@@ -416,7 +421,21 @@ export default function App() {
       });
       setSettings(normalizeSettings(value));
       setApiKey("");
+      quickModels.refresh();
       setModal(null);
+    } catch (error) {
+      setNotice(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function selectModel(model: string) {
+    if (!model || busy) return;
+    setBusy(true);
+    setNotice("");
+    try {
+      const value = await api<Settings>("PUT", "/settings", { model });
+      setSettings(normalizeSettings(value));
     } catch (error) {
       setNotice(errorMessage(error));
     } finally {
@@ -564,7 +583,7 @@ export default function App() {
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-              <small>本地优先 · v0.5.0</small>
+              <small>本地优先 · v0.5.1</small>
               </span>
               <Settings2 size={15} />
             </button>
@@ -835,14 +854,8 @@ export default function App() {
                 />
                 <div className="composer-toolbar">
                   <div className="composer-options">
-                    <button
-                      className="model-picker"
-                      onClick={() => setModal("settings")}
-                    >
-                      <Sparkles size={13} />
-                      <span>{settings.model || "配置模型"}</span>
-                      <ChevronDown size={12} />
-                    </button>
+                    <QuickModelSelect value={settings.model} catalog={quickModels} disabled={busy || !connected}
+                      onChange={(model) => void selectModel(model)} onSettings={() => setModal("settings")} />
                     <span
                       className={`mode-pill ${settings.execution_mode === "demo" ? "mode-demo" : ""}`}
                     >
@@ -1222,16 +1235,8 @@ export default function App() {
               }
             />
           </label>
-          <label>
-            主智能体 · 模型名称
-            <input
-              placeholder="输入网关支持的模型 ID"
-              value={settingsForm.model}
-              onChange={(e) =>
-                setSettingsForm((s) => ({ ...s, model: e.target.value }))
-              }
-            />
-          </label>
+          <ModelSelect label="主智能体 · 模型" value={settingsForm.model} catalog={nativeModels} disabled={busy}
+            onChange={(model) => setSettingsForm((current) => ({ ...current, model }))} />
           <label>
             访问密钥{" "}
             <span className="field-note">
@@ -1254,7 +1259,8 @@ export default function App() {
               Chat Completions。
             </p>
           </div>
-          <AgentSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy} />
+          <AgentSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy}
+            nativeModels={nativeModels} codexModels={codexModels} codexPathChanged={settingsForm.codex_binary !== settings.codex_binary} />
           <div className="codex-check">
             <Button type="button" size="small" variant="secondary" disabled={busy || checkingCodex || !connected || settingsForm.codex_binary !== settings.codex_binary} onClick={() => void checkCodex()}>
               {checkingCodex ? <Loader2 size={13} className="spin" /> : <Terminal size={13} />}检测 Codex

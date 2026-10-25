@@ -1,5 +1,6 @@
 mod codex;
 mod coordinator;
+mod models;
 pub mod profiles;
 pub mod provider;
 pub mod store;
@@ -144,6 +145,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/commands", post(command))
         .route("/api/v1/settings", get(settings).put(update_settings))
         .route("/api/v1/codex/status", get(codex_status))
+        .route("/api/v1/models", post(models::discover))
         .route("/api/v1/events", get(events))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
@@ -286,24 +288,7 @@ async fn update_settings(
     if !matches!(updated.execution_mode.as_str(), "native" | "demo") {
         return Err(ApiError(StatusCode::BAD_REQUEST, "执行模式无效".into()));
     }
-    let url = reqwest::Url::parse(&updated.base_url)
-        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "模型服务地址无效".into()))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "模型服务地址必须使用 HTTP 或 HTTPS".into(),
-        ));
-    }
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "模型服务地址不能包含凭证、查询参数或片段，请在 API 密钥字段填写凭证".into(),
-        ));
-    }
+    models::service_url(&updated.base_url)?;
     state.store.lock().unwrap().save_settings(&updated)?;
     *settings = updated;
     Ok(Json(settings.public()))

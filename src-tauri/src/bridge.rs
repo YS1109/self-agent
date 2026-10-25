@@ -152,7 +152,7 @@ fn validate_route(method: &str, path: &str) -> Result<Method, String> {
         ("GET", "/api/v1/snapshot" | "/api/v1/settings" | "/api/v1/codex/status") => {
             Ok(Method::GET)
         }
-        ("POST", "/api/v1/commands") => Ok(Method::POST),
+        ("POST", "/api/v1/commands" | "/api/v1/models") => Ok(Method::POST),
         ("PUT", "/api/v1/settings") => Ok(Method::PUT),
         _ => Err("不允许使用此本机接口路径或请求方法".into()),
     }
@@ -244,6 +244,7 @@ mod tests {
     fn bridge_accepts_only_known_method_and_route_pairs() {
         assert!(validate_route("GET", "/api/v1/snapshot").is_ok());
         assert!(validate_route("POST", "/api/v1/commands").is_ok());
+        assert!(validate_route("POST", "/api/v1/models").is_ok());
         assert!(validate_route("PUT", "/api/v1/settings").is_ok());
         assert!(validate_route("GET", "/api/v1/codex/status").is_ok());
         for (method, path) in [

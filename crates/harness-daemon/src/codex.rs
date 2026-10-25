@@ -3,7 +3,7 @@
 
 use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use harness_core::CommandEvidence;
 use serde_json::{json, Value};
 use tokio::{
@@ -17,6 +17,86 @@ const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const MAX_LINES: usize = 20_000;
 const MAX_RESULT: usize = 128 * 1024;
 const TURN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+pub(crate) async fn list_models(binary: &str) -> Result<Vec<Value>> {
+    let mut command = Command::new(binary);
+    command
+        .args(["app-server", "--listen", "stdio://"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    crate::prepend_binary_directory(&mut command, binary);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let mut child = command
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("无法获取 Codex 模型，请检查 CLI 路径和安装状态"))?;
+    let process_id = child.id();
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let result = timeout(Duration::from_secs(12), async {
+        send(&mut stdin, json!({"id":1,"method":"initialize","params":{
+            "clientInfo":{"name":"self_agent","version":env!("CARGO_PKG_VERSION")},
+            "capabilities":{"experimentalApi":false}
+        }})).await?;
+        let mut reader = BufReader::new(stdout);
+        let mut expected = 1u64;
+        let mut total = 0usize;
+        let mut rows = Vec::new();
+        let mut cursors = HashSet::new();
+        loop {
+            let mut line = Vec::new();
+            let length = (&mut reader).take((MAX_LINE + 1) as u64).read_until(b'\n', &mut line).await?;
+            total += length;
+            if length == 0 || length > MAX_LINE || total > 2 * 1024 * 1024 {
+                bail!("Codex 模型列表连接已关闭或响应超出限制");
+            }
+            let response: Value = serde_json::from_slice(&line)
+                .map_err(|_| anyhow::anyhow!("Codex 模型列表响应格式无效"))?;
+            if response["method"].is_string() {
+                if response.get("id").is_some() {
+                    bail!("获取 Codex 模型列表时出现了不支持的交互请求");
+                }
+                continue;
+            }
+            if response["id"].as_u64() != Some(expected) {
+                continue;
+            }
+            if response.get("error").is_some() {
+                bail!("Codex 模型列表请求失败，请检查 CLI 版本和登录状态");
+            }
+            if expected == 1 {
+                send(&mut stdin, json!({"method":"initialized"})).await?;
+                expected = 2;
+                send(&mut stdin, json!({"id":expected,"method":"model/list","params":{"limit":100,"includeHidden":false}})).await?;
+                continue;
+            }
+            let page = response["result"]["data"].as_array()
+                .context("Codex 模型列表响应缺少 data 数组")?;
+            rows.extend(page.iter().cloned());
+            if rows.len() > 2000 {
+                bail!("Codex 模型列表超过 2000 项限制");
+            }
+            let Some(cursor) = response["result"]["nextCursor"].as_str() else {
+                return crate::models::normalize_models(&rows, true);
+            };
+            if cursor.is_empty() || !cursors.insert(cursor.to_owned()) || cursors.len() > 20 {
+                bail!("Codex 模型列表分页无效");
+            }
+            expected += 1;
+            send(&mut stdin, json!({"id":expected,"method":"model/list","params":{"limit":100,"includeHidden":false,"cursor":cursor}})).await?;
+        }
+    }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("获取 Codex 模型列表超时，请重试或使用本机默认模型")));
+    drop(stdin);
+    stop(&mut child, process_id).await;
+    result
+}
 
 #[cfg(all(test, unix))]
 async fn execute(
@@ -552,6 +632,15 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[tokio::test]
+    async fn model_catalog_paginates_without_starting_a_thread() {
+        let models = list_models(&fixture()).await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["id"], "fixture-coder");
+        assert_eq!(models[1]["id"], "fixture-reviewer");
+        assert!(models.iter().all(|model| model["id"] != "internal-id"));
     }
 
     async fn run(mode: &str, root: &Path) -> Result<String> {

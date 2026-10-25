@@ -16,6 +16,21 @@ class ModelFixture(BaseHTTPRequestHandler):
     def log_message(self, *_arguments):
         pass
 
+    def do_GET(self):
+        if self.path != "/v1/models":
+            self.send_error(404)
+            return
+        assert self.headers.get("Authorization") == "Bearer fixture-not-a-real-secret"
+        response = json.dumps({"data": [
+            {"id": "local-contract-fixture"}, {"id": "another-fixture"},
+            {"id": "local-contract-fixture"}, {"invalid": "ignored"},
+        ]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
     def do_POST(self):
         if self.path != "/v1/chat/completions":
             self.send_error(404)
@@ -91,6 +106,14 @@ def main():
                         "execution_mode": "native",
                     },
                 )
+                saved = daemon.request("GET", "/api/v1/settings")
+                models = daemon.request("POST", "/api/v1/models", {})
+                assert [model["id"] for model in models["models"]] == [
+                    "another-fixture", "local-contract-fixture",
+                ]
+                assert daemon.request("GET", "/api/v1/settings") == saved
+                assert "fixture-not-a-real-secret" not in json.dumps(models)
+                print("PASS authenticated model discovery returns real IDs, deduplicates, preserves settings")
                 session_id = daemon.command(
                     {
                         "type": "create_session",

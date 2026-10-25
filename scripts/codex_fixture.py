@@ -23,7 +23,21 @@ init = receive("initialize")
 assert init["params"]["capabilities"]["experimentalApi"] is False
 send({"id": init["id"], "result": {"userAgent": "local-fixture"}})
 receive("initialized")
-thread = receive("thread/start")
+thread = json.loads(sys.stdin.readline())
+if thread["method"] == "model/list":
+    assert thread["params"] == {"limit": 100, "includeHidden": False}
+    send({"id": thread["id"], "result": {"data": [
+        {"id": "internal-id", "model": "fixture-coder", "displayName": "本地编码模型"},
+        {"id": "hidden", "model": "fixture-hidden", "hidden": True},
+    ], "nextCursor": "page-two"}})
+    page = receive("model/list")
+    assert page["params"]["cursor"] == "page-two"
+    send({"id": page["id"], "result": {"data": [
+        {"model": "fixture-coder", "displayName": "本地编码模型"},
+        {"model": "fixture-reviewer", "displayName": "本地验证模型"},
+    ], "nextCursor": None}})
+    raise SystemExit(0)
+assert thread["method"] == "thread/start"
 params = thread["params"]
 root = Path.cwd().resolve()
 mode = params["model"]

@@ -3,6 +3,8 @@ import { allowDevelopmentProxy } from "./dev-proxy-policy";
 
 describe("development proxy boundary", () => {
   it("accepts the workbench's same-origin JSON commands", () => {
+    expect(allowDevelopmentProxy("POST", "/api/v1/models", "http://127.0.0.1:1420", "same-origin", "application/json")).toBe(true);
+    expect(allowDevelopmentProxy("GET", "/api/v1/codex/status", undefined, "same-origin", undefined)).toBe(true);
     expect(
       allowDevelopmentProxy(
         "POST",
