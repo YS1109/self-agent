@@ -40,7 +40,10 @@ def wait_for(check, timeout=15, description="condition"):
 
 class Daemon:
     def __init__(self, directory, extra_env=None):
-        self.directory = Path(directory)
+        # A fixture selects its existing directory once, as the owner does.
+        # macOS exposes temporary directories through /var -> /private/var;
+        # the production data-dir guard deliberately refuses linked ancestors.
+        self.directory = Path(directory).resolve()
         self.port = available_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.token = ""

@@ -6,12 +6,14 @@ mod context;
 mod continuation;
 mod coordinator;
 mod execution_control;
+pub mod maintenance;
 mod model_config;
 mod models;
 pub mod profiles;
 mod project_files;
 pub mod provider;
 mod qq;
+mod reliability;
 mod steering;
 pub mod store;
 
@@ -196,6 +198,8 @@ pub struct AppState {
     pub workspace_gates: Mutex<HashMap<PathBuf, Arc<Semaphore>>>,
     pub capability_probe_root: PathBuf,
     pub capability_probe_gate: Arc<Semaphore>,
+    pub(crate) storage_lease: Option<Arc<maintenance::DataLease>>,
+    pub(crate) backup_gate: Arc<Semaphore>,
     pub(crate) qq_stop: tokio::sync::watch::Sender<bool>,
     pub(crate) qq_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -209,20 +213,52 @@ impl AppState {
         )
     }
 
+    pub fn open_managed(
+        lease: Arc<maintenance::DataLease>,
+        token: String,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_vault_and_lease(
+            &lease.database_path(),
+            token,
+            Arc::new(capabilities::vault::Vault::system(32)?),
+            Some(lease.clone()),
+        )
+    }
+
     pub(crate) fn open_with_vault(
         path: &std::path::Path,
         token: String,
         vault: Arc<capabilities::vault::Vault>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_vault_and_lease(path, token, vault, None)
+    }
+    pub(crate) fn open_with_vault_and_lease(
+        path: &std::path::Path,
+        token: String,
+        vault: Arc<capabilities::vault::Vault>,
+        storage_lease: Option<Arc<maintenance::DataLease>>,
+    ) -> anyhow::Result<Arc<Self>> {
         let (events, _) = broadcast::channel(256);
-        let store = store::Store::open(path)?;
+        let store = if let Some(lease) = &storage_lease {
+            if path != lease.database_path() {
+                anyhow::bail!("后台数据库与已锁定目录不一致");
+            }
+            lease.open_store()?
+        } else {
+            store::Store::open(path)?
+        };
         let settings = store.load_settings()?;
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
-        let capability_probe_root = std::fs::canonicalize(parent)?.join("capability-probes");
-        std::fs::create_dir_all(&capability_probe_root)?;
+        let capability_probe_root = if let Some(lease) = &storage_lease {
+            lease.guard.probe_directory()?
+        } else {
+            let root = std::fs::canonicalize(parent)?.join("capability-probes");
+            std::fs::create_dir_all(&root)?;
+            root
+        };
         // Reject a preexisting linked probe directory instead of following it.
         project_files::ScopedProject::open(&capability_probe_root)?;
         Ok(Arc::new(Self {
@@ -235,6 +271,8 @@ impl AppState {
             workspace_gates: Mutex::new(HashMap::new()),
             capability_probe_root,
             capability_probe_gate: Arc::new(Semaphore::new(2)),
+            storage_lease,
+            backup_gate: Arc::new(Semaphore::new(2)),
             qq_stop: tokio::sync::watch::channel(false).0,
             qq_worker: Mutex::new(None),
         }))
@@ -269,6 +307,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let private = Router::new()
         .route("/api/v1/snapshot", get(snapshot))
         .merge(capabilities::credential_api::routes())
+        .merge(reliability::api::routes())
         .route("/api/v1/qq", get(qq::api::snapshot))
         .route(
             "/api/v1/qq/commands",

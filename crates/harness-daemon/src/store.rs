@@ -19,6 +19,7 @@ mod decisions;
 pub(crate) mod execution;
 pub(crate) mod providers;
 pub(crate) mod qq;
+pub(crate) mod reliability;
 mod steering;
 
 const MAX_NODES: usize = 12;
@@ -34,14 +35,13 @@ pub struct Store {
     db: Connection,
 }
 
-impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
-        let db = Connection::open(path)?;
-        db.busy_timeout(Duration::from_secs(3))?;
+/// Trusted application baseline. All current schema creation and legacy event
+/// conversion share one ledger transaction; adapters cannot migrate outside it.
+pub(crate) fn prepare_database(db: &mut Connection) -> Result<()> {
+    crate::reliability::storage::migrate(db, |tx| {
+        let db: &Connection = tx;
         db.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+            "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS plan_changes(id TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -58,10 +58,11 @@ impl Store {
              CREATE TABLE IF NOT EXISTS execution_requests(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, body TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS execution_requests_task ON execution_requests(task_id);",
         )?;
-        capabilities::migrate(&db)?;
-        capability_credentials::migrate(&db)?;
-        providers::migrate(&db)?;
-        qq::migrate(&db)?;
+        capabilities::migrate(db)?;
+        capability_credentials::migrate(db)?;
+        providers::migrate(db)?;
+        qq::migrate(db)?;
+        crate::reliability::jobs::migrate(tx)?;
         // One atomic migration preserves legacy UUIDs and insertion order. An
         // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
         let has_sequence = db
@@ -72,15 +73,45 @@ impl Store {
             .any(|name| name == "sequence");
         if !has_sequence {
             db.execute_batch(
-                "BEGIN IMMEDIATE;
-                 CREATE TABLE events_v7(sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                "CREATE TABLE events_v7(sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                      id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
                  INSERT INTO events_v7(id,body) SELECT id,body FROM events ORDER BY rowid;
                  DROP TABLE events;
-                 ALTER TABLE events_v7 RENAME TO events;
-                 COMMIT;",
+                 ALTER TABLE events_v7 RENAME TO events;",
             )?;
         }
+        reliability::validate_records(db)?;
+        Ok(())
+    })?;
+    reliability::validate_records(db)
+}
+
+impl Store {
+    pub fn open(path: &Path) -> Result<Self> {
+        // Even a read of a hot journal on a read/write connection can mutate
+        // storage. Refuse incompatible files using read-only inspection first.
+        if path.exists() {
+            let readonly = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            crate::reliability::storage::preflight(&readonly)?;
+        }
+        let db = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        Self::from_connection(db)
+    }
+    pub(crate) fn from_connection(mut db: Connection) -> Result<Self> {
+        crate::reliability::storage::preflight(&db)?;
+        db.busy_timeout(Duration::from_secs(3))?;
+        db.execute_batch("PRAGMA foreign_keys=ON;")?;
+        prepare_database(&mut db)?;
+        db.execute_batch("PRAGMA journal_mode=WAL;")?;
         let mut store = Self { db };
         store.recover()?;
         Ok(store)
@@ -131,6 +162,7 @@ impl Store {
 
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
+        crate::reliability::jobs::recover_interrupted(&tx)?;
         capabilities::recover(&tx)?;
         capability_credentials::recover(&tx)?;
         providers::recover(&tx)?;

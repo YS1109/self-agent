@@ -44,6 +44,7 @@ jobs:
       - run: python scripts/execution_control_smoke.py
       - run: python scripts/capabilities_smoke.py
       - run: python scripts/qq_smoke.py
+      - run: python scripts/reliability_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}

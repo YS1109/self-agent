@@ -1010,7 +1010,7 @@ mod tests {
         controls.capabilities.mcp_servers = servers;
         controls.capabilities.skills = skills;
         controls.permissions.managed_tools = harness_core::PermissionMode::Allow;
-        let mut value = json!({"id":id,"session_id":"fixture-session","status":"running","task_kind":"main","agent":{"executor":"native"},"controls":controls,"supplements":[]});
+        let mut value = json!({"id":id,"session_id":"fixture-session","title":"能力夹具任务","status":"running","task_kind":"main","agent":{"id":"fixture","name":"夹具","instructions":"本地测试","executor":"native","model":"fixture"},"execution_mode":"native","source":{"channel_id":"desktop","actor_id":"owner","conversation_id":"fixture"},"created_at":now(),"updated_at":now(),"steps":[],"controls":controls,"supplements":[]});
         let tx = store.db.transaction().unwrap();
         put(&tx,"sessions",&json!({"id":"fixture-session","title":"fixture","project_path":std::env::temp_dir(),"messages":[],"created_at":now(),"updated_at":now()})).unwrap();
         snapshot_task_capabilities(&tx, &mut value).unwrap();

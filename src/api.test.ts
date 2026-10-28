@@ -186,3 +186,22 @@ describe("QQ owner transport",()=>{
   fetcher.mockResolvedValue({ok:false,json:async()=>({error:"SECRET_CANARY"})});await expect(qqCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
  });
 });
+
+describe("owner reliability transport", () => {
+  it("uses only exact backup and diagnostic routes, never retries or leaks private errors", async () => {
+    const { reliabilityClient } = await import("./api"); const id = "11111111-1111-4111-8111-111111111111";
+    vi.stubGlobal("window", {}); const fetcher = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }); vi.stubGlobal("fetch", fetcher); const signal = new AbortController().signal;
+    await reliabilityClient.status(signal); await reliabilityClient.receipt(id, signal); await reliabilityClient.diagnostics(signal);
+    expect(fetcher.mock.calls.map(call => [call[0], call[1].method])).toEqual([["/api/v1/reliability", "GET"], [`/api/v1/reliability/backups/${id}`, "GET"], ["/api/v1/reliability/diagnostics", "GET"]]);
+    fetcher.mockRejectedValue(new Error("/PRIVATE_DESTINATION SECRET"));
+    await expect(reliabilityClient.backup({ id, parent: "/private/backups", name: "one" }, signal)).rejects.not.toThrow("PRIVATE");
+    expect(fetcher).toHaveBeenCalledTimes(4); expect(fetcher.mock.calls[3][0]).toBe("/api/v1/reliability/backups"); expect(JSON.parse(fetcher.mock.calls[3][1].body)).toEqual({ id, parent: "/private/backups", name: "one" });
+    expect(() => reliabilityClient.receipt("../diagnostics?secret=x", signal)).toThrow(); expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(JSON.stringify(fetcher.mock.calls)).not.toMatch(/bearer|authorization/i);
+  });
+  it("desktop reliability uses private Rust bridge with no renderer daemon credential", async () => {
+    const { reliabilityClient } = await import("./api"); vi.stubGlobal("window", { __TAURI_INTERNALS__: {} }); const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher); invoke.mockResolvedValue({});
+    await reliabilityClient.diagnostics(new AbortController().signal);
+    expect(invoke).toHaveBeenCalledWith("api_request", { method: "GET", path: "/api/v1/reliability/diagnostics", body: null }); expect(fetcher).not.toHaveBeenCalled();
+  });
+});

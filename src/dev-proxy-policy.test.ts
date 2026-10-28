@@ -149,3 +149,14 @@ it("limits QQ methods and canonical routes without broad credential proxy",()=>{
  for(const [method,path] of [["GET","/api/v1/qq"],["POST","/api/v1/qq/commands"],["GET",`/api/v1/qq/commands/${id}`],["GET",`/api/v1/qq/credential-operations/${id}`],["POST",`/api/v1/qq/credentials/${id}`],["DELETE",`/api/v1/qq/credentials/${id}`],["POST",`/api/v1/qq/credentials/cleanup/${id}`]]){expect(allowDevelopmentProxy(method,path,undefined,"same-origin","application/json")).toBe(true);expect(allowDevelopmentProxy(method,path+"?owner=provider",undefined,"same-origin","application/json")).toBe(false);expect(allowDevelopmentProxy(method,path,"https://evil.invalid","cross-site","application/json")).toBe(false);}
  for(const method of ["GET","PUT","PATCH"]){expect(allowDevelopmentProxy(method,`/api/v1/qq/credentials/${id}`,undefined,"same-origin","application/json")).toBe(false);}expect(allowDevelopmentProxy("DELETE",`/api/v1/qq/credentials/${id}`,undefined,"same-origin","text/plain")).toBe(false);
 });
+
+it("owner backup routes are exact, read-only recovery/diagnostics cannot restore or control lifecycle", () => {
+  const id = "94a846e4-7ac2-46d7-ac1d-fde573fd6e12";
+  for (const [method, path] of [["GET", "/api/v1/reliability"], ["GET", "/api/v1/reliability/diagnostics"], ["POST", "/api/v1/reliability/backups"], ["GET", `/api/v1/reliability/backups/${id}`]]) {
+    expect(allowDevelopmentProxy(method, path, undefined, "same-origin", "application/json")).toBe(true);
+    expect(allowDevelopmentProxy(method, path, "https://outside.invalid", "cross-site", "application/json")).toBe(false);
+    expect(allowDevelopmentProxy(method, path + "?path=/private", undefined, "same-origin", "application/json")).toBe(false);
+  }
+  for (const [method, path] of [["GET", "/api/v1/reliability/backups"], ["POST", `/api/v1/reliability/backups/${id}`], ["DELETE", `/api/v1/reliability/backups/${id}`], ["POST", "/api/v1/reliability/diagnostics"], ["POST", "/api/v1/reliability/restore"], ["POST", "/api/v1/reliability/stop"], ["GET", "/api/v1/reliability/backups/../snapshot"], ["GET", `/api/v1/reliability/backups/${id.toUpperCase()}`]]) expect(allowDevelopmentProxy(method, path, undefined, "same-origin", "application/json")).toBe(false);
+  expect(allowDevelopmentProxy("POST", "/api/v1/reliability/backups", undefined, "same-origin", "text/plain")).toBe(false);
+});

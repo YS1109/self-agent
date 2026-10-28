@@ -1,3 +1,4 @@
+mod maintenance;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -12,6 +13,12 @@ const HELP: &str = r#"Self Agent 命令行客户端
 
 用法：self-agent-cli [--data-dir 目录] [--conversation 来源会话] [--command-id 幂等ID] [--wait 秒] [--follow] [--controls JSON文件|-] 命令 [参数]
 
+  diagnostics                      导出固定字段脱敏诊断（不读取系统密钥）
+  backups                          查看备份功能与持久操作记录
+  backup <目标父目录> <新名称>      创建私有备份；--wait可等待，POST不重试
+  backup-status <操作ID>           只读查询原备份操作
+  backup-inspect <备份目录>         离线校验并显示备份摘要
+  restore <备份目录> --confirm-sha256 <摘要>  离线恢复，拒绝活跃后台
   sessions                         列出会话
   create <标题> <项目绝对路径>       创建并选择会话
   select <会话ID>                   选择此命令来源的默认会话
@@ -992,6 +999,9 @@ async fn follow_loop(
 }
 
 async fn run(options: Options) -> Result<()> {
+    if maintenance::run(&options).await? {
+        return Ok(());
+    }
     let command = command(&options)?;
     let capability_request = capability_body(&options)?;
     let cleanup_request = cleanup_resolution_request(&options)?;

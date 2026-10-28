@@ -297,7 +297,27 @@ fn qq_route(method: &str, path: &str) -> bool {
             .is_some_and(scoped_uuid)
 }
 
+fn reliability_route(method: &str, path: &str) -> bool {
+    (method == "GET"
+        && matches!(
+            path,
+            "/api/v1/reliability" | "/api/v1/reliability/diagnostics"
+        ))
+        || (method == "POST" && path == "/api/v1/reliability/backups")
+        || (method == "GET"
+            && path
+                .strip_prefix("/api/v1/reliability/backups/")
+                .is_some_and(scoped_uuid))
+}
+
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
+    if reliability_route(method, path) {
+        return Ok(if method == "GET" {
+            Method::GET
+        } else {
+            Method::POST
+        });
+    }
     if qq_route(method, path) {
         return Ok(match method {
             "GET" => Method::GET,
@@ -544,5 +564,38 @@ mod qq_route_tests {
             assert!(validate_route(method, &format!("/api/v1/qq/credentials/{id}")).is_err());
         }
         assert!(validate_route("POST", "/api/v1/qq/credentials/../providers").is_err());
+    }
+}
+
+#[cfg(test)]
+mod reliability_route_tests {
+    use super::*;
+    #[test]
+    fn owner_backup_and_allowlisted_diagnostics_have_no_online_restore() {
+        let id = "94a846e4-7ac2-46d7-ac1d-fde573fd6e12";
+        for (method, path) in [
+            ("GET", "/api/v1/reliability".to_string()),
+            ("GET", "/api/v1/reliability/diagnostics".to_string()),
+            ("POST", "/api/v1/reliability/backups".to_string()),
+            ("GET", format!("/api/v1/reliability/backups/{id}")),
+        ] {
+            assert!(validate_route(method, &path).is_ok());
+            assert!(validate_route(method, &format!("{path}?path=private")).is_err());
+        }
+        for (method, path) in [
+            ("GET", "/api/v1/reliability/backups".to_string()),
+            ("POST", "/api/v1/reliability/diagnostics".to_string()),
+            ("POST", format!("/api/v1/reliability/backups/{id}")),
+            ("DELETE", format!("/api/v1/reliability/backups/{id}")),
+            ("POST", "/api/v1/reliability/restore".to_string()),
+            ("POST", "/api/v1/reliability/stop".to_string()),
+            ("GET", "/api/v1/reliability/backups/../snapshot".to_string()),
+            (
+                "GET",
+                format!("/api/v1/reliability/backups/{}", id.to_uppercase()),
+            ),
+        ] {
+            assert!(validate_route(method, &path).is_err());
+        }
     }
 }

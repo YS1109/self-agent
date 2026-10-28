@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 harness-core = { path = "../harness-core" }
+harness-daemon = { path = "../harness-daemon" }
 reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

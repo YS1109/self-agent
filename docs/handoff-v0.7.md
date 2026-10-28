@@ -160,3 +160,11 @@ python3 scripts/web_stream_smoke.py
 
 
 MCP 环境凭据后续切片见 protocol-v9 附节与 acceptance-mcp-credentials-v0.8：独立 slots/ref、固定 task / probe scope、一次性 vault 操作和实际进程 env；不能在设置中手填 refs，也不能复用 Provider 凭据。秘密 JSON 文本需语义处理，匹配模式每次复用而非逐字段重新编译。命名服务 `675c326d` 精确 CI 两轮各6/6已成功，MCP env 的新提交仍独立跟踪。QQ 共享接线工作树与 1.0 新 reliability 模块由各自负责人持有，不能把未验收内容混入本切片提交。
+
+## 1.0 存储维护交接（第一应用切片）
+
+真实 Store 启动与离线恢复统一经过数据目录独占锁、只读版本检查及 schema ledger；不再把 guard 检查后的路径字符串当作目录身份保证。备份意图先持久化，再由独立 worker 导出一致 SQLite 影像，HTTP 断连后只读查询 UUID。恢复只离线、必须显式确认摘要，并撤销所有旧执行/远端/凭据操作权威；原始历史结果不改写成成功或重放。
+
+后续 gateway schema 必须明确提高 ledger 版本并加事务恢复撤权 helper，不能只往当前 schema 1 偷添表。生命周期和更新独立模块暂未接线；不能在提交中混入并冒充已验收。见 protocol-v12 / acceptance-v1.0；当前仍未运行真实 GUI、真实模型/QQ/系统凭据或实际安装发布。
+
+本切片独立候选冻结门禁通过：core 7 / daemon 527 / CLI 35 / 前端 222，事件桥 7、维护路由提取 1、Web 代理 3 组、17 个后台 smoke，以及 fmt / Clippy / 构建。独立源码复审闭环；精确 SHA CI 另行跟踪，真实 GUI/系统凭据/外部服务/安装发布仍未验证。

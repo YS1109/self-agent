@@ -28,3 +28,5 @@ pub(crate) fn credential_binding(
 
 pub(crate) mod api;
 pub(crate) mod daemon;
+
+pub(crate) mod restore;

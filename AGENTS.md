@@ -9,3 +9,4 @@
 - 后续分版规划见 `docs/roadmap.md`，0.7 范围与验收见 `docs/iteration-v0.7.md`，0.8 切片计划见 `docs/iteration-v0.8.md`，接手入口见 `docs/handoff-v0.7.md`。这些文档描述待开发目标，不表示能力已经实现；规划不产生部署、外部通讯或扩大权限的授权。
 
 - QQ 开发切片协议见 `docs/protocol-v10.md`，范围见 `docs/iteration-v0.9.md`，模拟门禁与真实平台延期边界见 `docs/acceptance-v0.9.md`；QQ 不是本机管理 API 代理。
+- 1.0 版本化存储、备份恢复及诊断见 `docs/protocol-v12.md`、`docs/iteration-v1.0.md` 与 `docs/acceptance-v1.0.md`。schema 迁移必须显式提高 ledger 版本；恢复需要撤销所有执行、远端及凭据操作权威，不自动重放副作用。独立 lifecycle/update helper 不等于已完成应用生命周期或生产发布。

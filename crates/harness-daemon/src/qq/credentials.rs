@@ -445,6 +445,55 @@ pub(crate) fn recover(tx: &Transaction<'_>) -> Result<()> {
     }
     Ok(())
 }
+/// Offline restore cannot authorize OS deletion using historical references.
+/// Keep original terminal facts, but no restored intent can be claimed/cleaned.
+pub(super) fn invalidate_restored(tx: &Transaction<'_>) -> Result<()> {
+    let entries = {
+        let mut statement = tx.prepare("SELECT id,body FROM qq_credential_operations")?;
+        let rows =
+            statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, body) in entries {
+        let mut op: Operation =
+            serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("QQ 恢复凭据元数据无效"))?;
+        uuid(&id)?;
+        uuid(&op.owner_id)?;
+        configuration::credential_binding_digest(&op.app_id)?;
+        if op.id != id
+            || op.expected_revision > MAX_REV
+            || !matches!(op.kind.as_str(), "set" | "delete" | "cleanup")
+            || !matches!(
+                op.status.as_str(),
+                "pending"
+                    | "inflight"
+                    | "completed"
+                    | "rejected"
+                    | "unknown"
+                    | "orphaned"
+                    | "cleanup_required"
+                    | "cleaned"
+            )
+        {
+            bail!("QQ 恢复凭据元数据不一致");
+        }
+        if let Some(target) = &op.target {
+            uuid(target)?;
+            get(tx, target)?.context("QQ 恢复清理关联缺失")?;
+        }
+        if matches!(op.status.as_str(), "pending" | "inflight") {
+            op.status = "unknown".into();
+            op.reason = Some("restored_no_replay".into());
+        }
+        if op.cleanup_status.as_deref() == Some("pending") {
+            op.cleanup_status = Some("unknown".into());
+        }
+        op.can_cleanup = false;
+        op.updated_at = harness_core::now();
+        put(tx, &op)?;
+    }
+    Ok(())
+}
 #[cfg(test)]
 #[path = "credentials_tests.rs"]
 mod tests;

@@ -1,3 +1,4 @@
+import type { ReliabilityClient } from "./reliability-client";
 import type {QqClient,QqCredentialClient} from "./qq-client";
 import {mcpSlotError,type McpCredentialClient} from "./mcp-credentials-client";
 import { providerUuid, type ProvidersClient } from "./providers-client";
@@ -78,4 +79,12 @@ export const qqCredentialClient:QqCredentialClient={
  deleteCredential:(id,body,signal)=>qqRequest("DELETE",`/qq/credentials/${qqId(id)}`,body,signal),
  cleanupCredential:(id,body,signal)=>qqRequest("POST",`/qq/credentials/cleanup/${qqId(id)}`,body,signal),
  operation:(id,signal)=>qqRequest("GET",`/qq/credential-operations/${qqId(id)}`,undefined,signal),
+};
+
+async function reliabilityRequest<T>(method:string,path:string,body:unknown,signal:AbortSignal):Promise<T>{try{return await api<T>(method,path,body,signal);}catch{throw new Error("备份或诊断请求未确认；请只读检查原操作，未回显路径或底层错误。");}}
+export const reliabilityClient:ReliabilityClient={
+ status:signal=>reliabilityRequest("GET","/reliability",undefined,signal),
+ backup:(body,signal)=>reliabilityRequest("POST","/reliability/backups",body,signal),
+ receipt:(id,signal)=>{if(!providerUuid(id))throw new Error("备份操作标识无效");return reliabilityRequest("GET",`/reliability/backups/${id}`,undefined,signal);},
+ diagnostics:signal=>reliabilityRequest("GET","/reliability/diagnostics",undefined,signal),
 };
