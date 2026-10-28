@@ -58,7 +58,7 @@ class Model(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             self.respond()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass  # The cancelled executor closes its model stream.
         except Exception as error:
             with self.lock:
