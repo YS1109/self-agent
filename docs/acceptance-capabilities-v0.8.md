@@ -35,3 +35,10 @@
 - Windows/Unix 的进程清理不是文件或网络沙箱，不承诺约束刻意逃逸的恶意程序；仅应配置受信任本机程序。
 
 最终发布时记录冻结测试计数、远端 SHA/树、PR 与对应 CI；历史成功提交不能替代新提交验证。
+
+
+## 首次 Windows 实际 CI 与修复
+
+`c8780b9137aa5f95119fa48e15c2c984d0befd3c` 的 push/PR 两轮 Windows Rust 均观察到 **220 通过、1 失败**：固定根路径仍可被 rename。其余 Windows Job、取消/背压、双协议、环境、junction 拒绝等实际夹具通过，不能因此忽略失败项。根因是仅请求 `FILE_READ_ATTRIBUTES` 的句柄不建立预期的读访问共享约束。
+
+修复将路径锁句柄访问改为 `GENERIC_READ`，仍不允许 share-delete/share-write，保留原失败断言和 nofollow/句柄生命周期；权限不足会安全拒绝，而不是放松检查。该两处源码 hunk 经独立静态复审，隔离 Linux MCP 10 项、Windows target 全目标 Clippy、格式检查通过。修复提交的实际 Windows CI 在发布后单独跟踪，不能把交叉编译当成已修复的运行证据。

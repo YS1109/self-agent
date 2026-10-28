@@ -29,8 +29,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         CreateFileW, GetDriveTypeW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, OPEN_EXISTING,
     },
     System::{
         JobObjects::{
@@ -383,7 +382,10 @@ fn lock_path(
         let handle = owned(unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                FILE_READ_ATTRIBUTES,
+                // Metadata-only FILE_READ_ATTRIBUTES handles do not participate
+                // in Windows share-access checks. Real read access is required
+                // for this handle's deny-write/delete flags to block renames.
+                GENERIC_READ,
                 FILE_SHARE_READ,
                 null(),
                 OPEN_EXISTING,
