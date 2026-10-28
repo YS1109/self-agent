@@ -65,7 +65,7 @@ class Model(BaseHTTPRequestHandler):
                 message = {"content": "迟到结果"}
             else:
                 message = {"content": "完成：" + goal}
-        self.answer({"choices": [{"message": {"role": "assistant", **message}}]})
+        self.answer({"choices": [{"message": {"role": "assistant", **message}, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]})
 
 
 def main():

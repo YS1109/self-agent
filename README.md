@@ -8,6 +8,8 @@
 
 ## 当前版本
 
+**0.7 开发分支首切片（未发布）**：已打通 Native 流式回复、统一工具/用量事件、持久游标与断线补发，以及 `self-agent-cli --follow run ...` / `follow TASK_ID`。详见 [事件与恢复协议](docs/protocol-v6.md)。Codex 通知映射、桌面事件桥、Codex thread 续接和 Native 跨任务摘要复用仍待后续切片；运行版本号暂不变。
+
 当前版本 **0.6.0** 增加主智能体直接执行、可调界面缩放、自定义模型 Endpoint、模型上下文与子角色覆盖，以及无头命令行客户端：
 
 - 桌面默认直接进入主 Agent 工具循环；同会话依次执行，带入前序对话与真实结果。
@@ -37,11 +39,11 @@
 
 远程编排的计划先形成草稿供你审阅，启动后在预算内自动继续。执行中可以调整未开始的节点，已有运行及终态记录保留。失败、取消或阻塞节点需要关联修复与验收任务，并取得实际成功命令证据后，整个计划才允许完成；失败历史仍保留。建议先暂停派发、保存后续调整，再恢复执行。
 
-外部 MCP / Skills 的应用内管理、真实通讯平台和移动端尚未接通。Native 主任务、原生子任务及远程规划与回顾仍使用非流式 Chat Completions；Codex 主任务和子任务通过独立 stdio 协议运行。
+外部 MCP / Skills 的应用内管理、真实通讯平台和移动端尚未接通。本开发分支 Native 主任务与原生子任务使用流式 Chat Completions（同一响应可兼容 JSON，不重试）；远程规划与回顾仍为非流式；Codex 主任务和子任务通过独立 stdio 协议运行。
 
 ## 后续规划与接手
 
-下一阶段为 **0.7：持续会话与实时执行体验**，核心是流式输出与事件恢复、Codex 会话续接及原生摘要复用，随后完善执行中补充要求和代码改动查看。这些能力尚未实现，当前可运行版本仍为 0.6.0。
+下一阶段为 **0.7：持续会话与实时执行体验**，核心是流式输出与事件恢复、Codex 会话续接及原生摘要复用，随后完善执行中补充要求和代码改动查看。本开发分支已完成上述 Native/HTTP/CLI 首切片，其余能力仍未交付，完整 0.7 尚未发布。
 
 完整的 0.7 至 1.0 分版目标、依赖与验收见 [分版路线图](docs/roadmap.md)。接手开发先读 [0.7 交接记录](docs/handoff-v0.7.md)，再按 [0.7 迭代计划](docs/iteration-v0.7.md) 推进。后续自主执行、MCP / Skills、真实通讯、H5、候选 App 与稳定发布均已分开记录；平台和上线日期未定的项目明确标注待确认。
 
@@ -158,11 +160,12 @@ python3 scripts/agents_smoke.py
 python3 scripts/runtime_smoke.py
 python3 scripts/plan_change_smoke.py
 python3 scripts/headless_smoke.py
+python3 scripts/streaming_smoke.py
 pnpm test
 pnpm build:web
 ```
 
-八组 HTTP / CLI smoke 使用独立临时目录与本地端口，覆盖鉴权、指令去重、执行期间管理消息、回传目标、取消、重启、真实文件与命令、计划版本冲突、DAG、依赖结果、追加任务、预算、角色快照、混合执行器、暂停恢复、修复验收、持久化调整建议和独立布局版本。默认采用本地确定性 HTTP / stdio fixture，不消耗云端模型额度。可额外运行 `python3 scripts/runtime_smoke.py --real-codex` 验证真实执行器，或显式配置 `HARNESS_BASE_URL / HARNESS_MODEL / HARNESS_API_KEY` 后运行 `python3 scripts/plan_change_smoke.py --live` 验证真实主模型与 Codex 的联合闭环；这些选项会调用已配置模型。Codex 可执行夹具仅在 Unix 运行，Windows 使用原生角色完成 HTTP 链路验证。
+原八组 HTTP / CLI smoke 和新增流式 smoke 使用独立临时目录与本地端口，覆盖鉴权、指令去重、执行期间管理消息、回传目标、取消、重启、真实文件与命令、计划版本冲突、DAG、依赖结果、追加任务、预算、角色快照、混合执行器、暂停恢复、修复验收、持久化调整建议和独立布局版本。默认采用本地确定性 HTTP / stdio fixture，不消耗云端模型额度。可额外运行 `python3 scripts/runtime_smoke.py --real-codex` 验证真实执行器，或显式配置 `HARNESS_BASE_URL / HARNESS_MODEL / HARNESS_API_KEY` 后运行 `python3 scripts/plan_change_smoke.py --live` 验证真实主模型与 Codex 的联合闭环；这些选项会调用已配置模型。Codex 可执行夹具仅在 Unix 运行，Windows 使用原生角色完成 HTTP 链路验证。
 
 构建当前平台桌面安装包：
 

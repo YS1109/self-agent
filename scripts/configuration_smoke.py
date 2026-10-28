@@ -61,7 +61,7 @@ class Provider(BaseHTTPRequestHandler):
             message = {"content": json.dumps({
                 "action": "reply", "message": "连接正常 fixture-actor-token",
             })}
-        self.respond({"choices": [{"message": {"role": "assistant", **message}}]})
+        self.respond({"choices": [{"message": {"role": "assistant", **message}, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]})
 
 
 def main():

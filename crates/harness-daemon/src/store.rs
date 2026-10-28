@@ -1,7 +1,7 @@
 use std::{collections::HashSet, path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use harness_core::{new_id, now, CommandEvidence, ModelContextConfig, RunEvent};
+use harness_core::{new_id, now, CommandEvidence, ExecutionEvent, ModelContextConfig, RunEvent};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
@@ -14,6 +14,9 @@ use crate::{
 const MAX_NODES: usize = 12;
 const MAX_ROUNDS: u64 = 3;
 const MAX_ACTIVE_TASKS: usize = 32;
+const RETAINED_EVENTS: u64 = 20_000;
+const MAX_EVENT_BYTES: usize = 32 * 1024;
+const MAX_STREAM_TEXT: usize = 256 * 1024;
 const CONFIGURATION_HINT: &str =
     "请先在设置中配置兼容 Chat Completions 的模型和服务地址，或明确切换到演示模式。";
 
@@ -39,6 +42,25 @@ impl Store {
              CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, task_id TEXT UNIQUE NOT NULL, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS settings(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
         )?;
+        // One atomic migration preserves legacy UUIDs and insertion order. An
+        // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
+        let has_sequence = db
+            .prepare("PRAGMA table_info(events)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "sequence");
+        if !has_sequence {
+            db.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE events_v7(sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
+                 INSERT INTO events_v7(id,body) SELECT id,body FROM events ORDER BY rowid;
+                 DROP TABLE events;
+                 ALTER TABLE events_v7 RENAME TO events;
+                 COMMIT;",
+            )?;
+        }
         let mut store = Self { db };
         store.recover()?;
         Ok(store)
@@ -158,19 +180,17 @@ impl Store {
         tasks.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
         let mut plans = rows(&self.db, "plans")?;
         plans.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
-        let mut events = rows(&self.db, "events")?;
-        events.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
-        let events: Vec<_> = events
-            .into_iter()
-            .rev()
-            .take(300)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let event_cursor = self.event_cursor()?;
+        let mut events = read_events(
+            &self.db,
+            "SELECT sequence,body FROM events ORDER BY sequence DESC LIMIT ?1",
+            300,
+        )?;
+        events.reverse();
         let shell_enabled = std::env::var("HARNESS_ALLOW_COMMANDS").as_deref() == Ok("1");
         Ok(json!({
             "sessions":sessions, "tasks":tasks, "plans":plans, "events":events,
+            "event_cursor":event_cursor,
             "plan_changes":rows(&self.db,"plan_changes")?,
             "deliveries":rows(&self.db,"deliveries")?, "selections":rows(&self.db,"selections")?,
             "capabilities":[
@@ -185,6 +205,91 @@ impl Store {
                 {"id":"skills","name":"本地技能","kind":"skill","description":"计划支持限定范围的 SKILL.md 发现","enabled":false}
             ]
         }))
+    }
+
+    pub fn event_cursor(&self) -> Result<u64> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// A cursor is exclusive. The boundary just before the first retained row
+    /// is still valid; anything earlier needs an authoritative snapshot.
+    pub fn validate_event_cursor(&self, after: u64) -> Result<()> {
+        let latest = self.event_cursor()?;
+        let oldest: Option<u64> =
+            self.db
+                .query_row("SELECT MIN(sequence) FROM events", [], |row| row.get(0))?;
+        if after > latest
+            || oldest.is_some_and(|first| after < first.saturating_sub(1))
+            || (oldest.is_none() && after < latest)
+        {
+            bail!("事件游标已失效，请重新获取快照");
+        }
+        Ok(())
+    }
+
+    pub fn events_after(&self, after: u64) -> Result<Vec<RunEvent>> {
+        self.validate_event_cursor(after)?;
+        read_events(
+            &self.db,
+            "SELECT sequence,body FROM events WHERE sequence>?1 ORDER BY sequence LIMIT 128",
+            after,
+        )
+    }
+
+    pub fn execution_event(&mut self, task_id: &str, data: ExecutionEvent) -> Result<RunEvent> {
+        if serde_json::to_vec(&data)?.len() > MAX_EVENT_BYTES {
+            bail!("执行事件超过 32 KiB 限制");
+        }
+        let tx = self.db.transaction()?;
+        let mut task = record(&tx, "tasks", task_id)?;
+        if task["status"] != "running" || task["task_kind"] == "plan" {
+            bail!("任务已停止，忽略迟到的执行输出");
+        }
+        if let ExecutionEvent::AssistantDelta { text } = &data {
+            let mut output = task["stream_output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let remaining = MAX_STREAM_TEXT.saturating_sub(output.len());
+            let mut end = text.len().min(remaining);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            output.push_str(&text[..end]);
+            task["stream_output"] = json!(output);
+            if end < text.len() {
+                task["stream_output_truncated"] = json!(true);
+            } else if task.get("stream_output_truncated").is_none() {
+                task["stream_output_truncated"] = json!(false);
+            }
+            put(&tx, "tasks", &task)?;
+        }
+        let label = match &data {
+            ExecutionEvent::AssistantDelta { .. } => "回复增量",
+            ExecutionEvent::ToolStarted { .. } => "工具开始执行",
+            ExecutionEvent::ToolFinished { .. } => "工具执行结束",
+            ExecutionEvent::Usage { .. } => "模型服务用量",
+            ExecutionEvent::ContextCompaction { .. } => "上下文压缩状态",
+        };
+        let mut item = event(
+            Some(text(&task, "session_id")?.into()),
+            Some(task_id.into()),
+            data.kind(),
+            label,
+        );
+        item.data = Some(data);
+        persist_event(&tx, &item)?;
+        item.sequence = tx.query_row(
+            "SELECT sequence FROM events WHERE id=?1",
+            [&item.id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(item)
     }
 
     pub fn project_path(&self, session_id: &str) -> Result<String> {
@@ -871,6 +976,9 @@ impl Store {
     pub fn progress(&mut self, task_id: &str, detail: &str) -> Result<RunEvent> {
         let tx = self.db.transaction()?;
         let mut task = record(&tx, "tasks", task_id)?;
+        if task["status"] != "running" {
+            bail!("任务已停止，忽略迟到的执行进度");
+        }
         if task["status"] == "running" && task["task_kind"] != "plan" {
             task["steps"][0]["status"] = json!("completed");
             task["steps"][1]["status"] = json!("running");
@@ -1216,11 +1324,35 @@ fn put(db: &Connection, table: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 fn persist_event(db: &Connection, item: &RunEvent) -> Result<()> {
-    db.execute(
-        "INSERT OR IGNORE INTO events(id,body) VALUES(?1,?2)",
+    let inserted = db.execute(
+        "INSERT INTO events(id,body) SELECT ?1,?2 WHERE NOT EXISTS (SELECT 1 FROM events WHERE id=?1)",
         params![item.id, serde_json::to_string(item)?],
     )?;
+    // A duplicate must not consume AUTOINCREMENT values or skip a cleanup
+    // boundary. The indexed range delete keeps retention bounded even when
+    // transactions persist the same terminal event more than once.
+    let sequence = db.last_insert_rowid().max(0) as u64;
+    if inserted != 0 && sequence > RETAINED_EVENTS {
+        db.execute(
+            "DELETE FROM events WHERE sequence<=?1",
+            [sequence - RETAINED_EVENTS],
+        )?;
+    }
     Ok(())
+}
+
+fn read_events(db: &Connection, sql: &str, parameter: u64) -> Result<Vec<RunEvent>> {
+    let mut statement = db.prepare(sql)?;
+    let rows = statement.query_map([parameter], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.map(|row| {
+        let (sequence, body) = row?;
+        let mut event: RunEvent = serde_json::from_str(&body)?;
+        event.sequence = sequence;
+        Ok(event)
+    })
+    .collect()
 }
 fn select(db: &Connection, source: &Value, session_id: &str) -> Result<()> {
     db.execute("INSERT INTO selections(source,body) VALUES(?1,?2) ON CONFLICT(source) DO UPDATE SET body=excluded.body",params![serde_json::to_string(source)?,serde_json::to_string(&json!({"source":source,"session_id":session_id}))?])?;
@@ -2310,6 +2442,162 @@ fn apply_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_events_migrate_in_order_and_cursors_survive_restart() {
+        let path = std::env::temp_dir().join(format!("self-agent-events-{}.sqlite", new_id()));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE events(id TEXT PRIMARY KEY, body TEXT NOT NULL);")
+            .unwrap();
+        for id in ["old-b", "old-a"] {
+            db.execute(
+                "INSERT INTO events(id,body) VALUES(?1,?2)",
+                params![
+                    id,
+                    json!({"id":id,"kind":"legacy","message":"旧事件","created_at":"same"})
+                        .to_string()
+                ],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let store = Store::open(&path).unwrap();
+        let events = store.events_after(0).unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["old-b", "old-a"]
+        );
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(store.snapshot().unwrap()["event_cursor"], 2);
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        session(&mut store);
+        assert_eq!(store.event_cursor().unwrap(), 3);
+        assert_eq!(store.events_after(2).unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streaming_snapshot_and_event_commit_atomically_and_reject_late_output() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let receipt = send(&mut store, json!({"type":"run_agent","content":"目标"}));
+        let id = receipt["task_id"].as_str().unwrap();
+        store.claim_task().unwrap().unwrap();
+        let before = store.event_cursor().unwrap();
+        let delta = || ExecutionEvent::AssistantDelta {
+            text: "中文回复".into(),
+        };
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER reject_delta BEFORE INSERT ON events
+            WHEN json_extract(NEW.body,'$.kind')='assistant_delta'
+            BEGIN SELECT RAISE(ABORT,'fixture'); END;",
+            )
+            .unwrap();
+        assert!(store.execution_event(id, delta()).is_err());
+        assert!(record(&store.db, "tasks", id).unwrap()["stream_output"].is_null());
+        assert_eq!(store.event_cursor().unwrap(), before);
+        store.db.execute_batch("DROP TRIGGER reject_delta").unwrap();
+        let event = store.execution_event(id, delta()).unwrap();
+        assert_eq!(event.sequence, before + 1);
+        assert_eq!(
+            store.events_after(before).unwrap()[0].sequence,
+            event.sequence
+        );
+        assert_eq!(
+            record(&store.db, "tasks", id).unwrap()["stream_output"],
+            "中文回复"
+        );
+        send(&mut store, json!({"type":"cancel_task","task_id":id}));
+        let cancelled_cursor = store.event_cursor().unwrap();
+        assert!(store.execution_event(id, delta()).is_err());
+        assert!(store.progress(id, "迟到进度").is_err());
+        assert!(store.finish(id, Ok("迟到成功".into())).unwrap().is_none());
+        assert_eq!(store.event_cursor().unwrap(), cancelled_cursor);
+        let terminal = store
+            .events_after(before)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "task_cancelled")
+            .count();
+        assert_eq!(terminal, 1);
+    }
+
+    #[test]
+    fn pruned_or_future_cursors_require_snapshot_and_sequences_are_not_reused() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        for _ in 0..(RETAINED_EVENTS + 128) {
+            persist_event(&store.db, &event(None, None, "fixture", "事件")).unwrap();
+        }
+        let latest = store.event_cursor().unwrap();
+        let count: u64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert!(count <= RETAINED_EVENTS + 127);
+        assert!(store.events_after(0).is_err());
+        assert!(store.events_after(latest + 1).is_err());
+        assert!(store.events_after(latest).unwrap().is_empty());
+        let first: u64 = store
+            .db
+            .query_row("SELECT MIN(sequence) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(store.events_after(first - 1).unwrap()[0].sequence, first);
+        store.db.execute("DELETE FROM events", []).unwrap();
+        session(&mut store);
+        assert!(store.event_cursor().unwrap() > latest);
+    }
+
+    #[test]
+    fn duplicate_event_persistence_cannot_skip_retention_cleanup() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        for _ in 0..(RETAINED_EVENTS + 256) {
+            let item = event(None, None, "fixture", "重复提交");
+            persist_event(&store.db, &item).unwrap();
+            persist_event(&store.db, &item).unwrap();
+        }
+        let count: u64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, RETAINED_EVENTS);
+        assert_eq!(store.event_cursor().unwrap(), RETAINED_EVENTS + 256);
+        assert!(store.events_after(0).is_err());
+    }
+
+    #[test]
+    fn stream_snapshot_is_bounded_on_utf8_boundaries() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let receipt = send(&mut store, json!({"type":"run_agent","content":"目标"}));
+        let id = receipt["task_id"].as_str().unwrap();
+        store.claim_task().unwrap().unwrap();
+        for _ in 0..100 {
+            store
+                .execution_event(
+                    id,
+                    ExecutionEvent::AssistantDelta {
+                        text: "中".repeat(1000),
+                    },
+                )
+                .unwrap();
+        }
+        let task = record(&store.db, "tasks", id).unwrap();
+        assert!(task["stream_output"].as_str().unwrap().len() <= MAX_STREAM_TEXT);
+        assert_eq!(task["stream_output_truncated"], true);
+        assert!(store
+            .execution_event(
+                id,
+                ExecutionEvent::AssistantDelta {
+                    text: "x".repeat(MAX_EVENT_BYTES),
+                }
+            )
+            .is_err());
+    }
     fn source() -> Value {
         json!({"channel_id":"simulator","actor_id":"owner","conversation_id":"remote-1"})
     }

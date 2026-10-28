@@ -38,6 +38,8 @@ export interface TaskRun {
   created_at: string;
   updated_at: string;
   result?: string;
+  stream_output?: string;
+  stream_output_truncated?: boolean;
   error?: string;
   source: SourceContext;
   steps: TaskStep[];
@@ -125,13 +127,21 @@ export interface Delivery {
   updated_at: string;
   error?: string;
 }
+export type ExecutionEvent =
+  | { kind: "assistant_delta"; text: string }
+  | { kind: "tool_started"; call_id: string; name: string }
+  | { kind: "tool_finished"; call_id: string; name: string; success: boolean; output: string }
+  | { kind: "usage"; input_tokens: number | null; output_tokens: number | null }
+  | { kind: "context_compaction"; state: string };
 export interface RunEvent {
   id: string;
+  sequence?: number;
   session_id?: string;
   task_id?: string;
   kind: string;
   message: string;
   created_at: string;
+  data?: ExecutionEvent;
 }
 export interface Capability {
   id: string;
@@ -141,6 +151,7 @@ export interface Capability {
   enabled: boolean;
 }
 export interface Snapshot {
+  event_cursor?: number;
   sessions: Session[];
   tasks: TaskRun[];
   deliveries: Delivery[];

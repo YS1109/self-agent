@@ -67,7 +67,7 @@ class ChangeModel(Model):
                   "nodes": nodes}
         encoded = json.dumps({"choices": [{"message": {
             "role": "assistant", "content": json.dumps(output, ensure_ascii=False),
-        }}]}).encode()
+        }, "finish_reason": "stop"}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))

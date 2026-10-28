@@ -134,6 +134,10 @@ pub struct TaskRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_output: Option<String>,
+    #[serde(default)]
+    pub stream_output_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub source: SourceContext,
     pub steps: Vec<TaskStep>,
@@ -275,6 +279,10 @@ pub struct Delivery {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunEvent {
     pub id: String,
+    /// Database commit order. Legacy records deserialize as zero; wire events
+    /// are hydrated from the journal and always carry a positive sequence.
+    #[serde(default)]
+    pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +290,46 @@ pub struct RunEvent {
     pub kind: String,
     pub message: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<ExecutionEvent>,
+}
+
+/// Executor-neutral evidence. This is observable output, never hidden reasoning.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionEvent {
+    AssistantDelta {
+        text: String,
+    },
+    ToolStarted {
+        call_id: String,
+        name: String,
+    },
+    ToolFinished {
+        call_id: String,
+        name: String,
+        success: bool,
+        output: String,
+    },
+    Usage {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    },
+    ContextCompaction {
+        state: String,
+    },
+}
+
+impl ExecutionEvent {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AssistantDelta { .. } => "assistant_delta",
+            Self::ToolStarted { .. } => "tool_started",
+            Self::ToolFinished { .. } => "tool_finished",
+            Self::Usage { .. } => "usage",
+            Self::ContextCompaction { .. } => "context_compaction",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -301,6 +349,8 @@ pub struct SessionSelection {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub event_cursor: u64,
     pub sessions: Vec<Session>,
     pub tasks: Vec<TaskRun>,
     #[serde(default)]

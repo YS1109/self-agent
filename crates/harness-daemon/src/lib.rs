@@ -17,8 +17,8 @@ use std::{
 };
 
 use axum::{
-    extract::{Request, State},
-    http::StatusCode,
+    extract::{Query, Request, State},
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
@@ -426,25 +426,91 @@ async fn command(
     Ok(Json(receipt))
 }
 
+#[derive(Default, Deserialize)]
+struct EventQuery {
+    after: Option<String>,
+}
+
+fn event_cursor(query: Option<&str>, header: Option<&str>) -> anyhow::Result<Option<u64>> {
+    fn parse(value: &str) -> anyhow::Result<u64> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            anyhow::bail!("事件游标必须是非负整数");
+        }
+        value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("事件游标超出范围"))
+    }
+    let query = query.map(parse).transpose()?;
+    let header = header.map(parse).transpose()?;
+    if query.is_some() && header.is_some() && query != header {
+        anyhow::bail!("事件游标参数与 Last-Event-ID 不一致");
+    }
+    Ok(query.or(header))
+}
+
 async fn events(
     State(state): State<Arc<AppState>>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    Query(query): Query<EventQuery>,
+    headers: HeaderMap,
+) -> Response {
+    // Subscribe before reading the cursor. Notifications are only wake-ups;
+    // committed SQLite rows are always the source of both replay and live data.
     let mut receiver = state.events.subscribe();
+    let initial = (|| -> anyhow::Result<u64> {
+        let header = headers
+            .get("last-event-id")
+            .map(|value| value.to_str())
+            .transpose()?;
+        let requested = event_cursor(query.after.as_deref(), header)?;
+        let store = state.store.lock().unwrap();
+        let cursor = requested.unwrap_or(store.event_cursor()?);
+        store.validate_event_cursor(cursor)?;
+        Ok(cursor)
+    })();
+    let mut cursor = match initial {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error":error.to_string(),"code":"snapshot_required"})),
+            )
+                .into_response()
+        }
+    };
     let stream = async_stream::stream! {
         loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    yield Ok(Event::default().id(event.id.clone())
-                        .event("run_event").json_data(event).unwrap());
+            let batch = { state.store.lock().unwrap().events_after(cursor) };
+            match batch {
+                Ok(batch) if !batch.is_empty() => {
+                    for event in batch {
+                        cursor = event.sequence;
+                        yield Ok::<Event, Infallible>(Event::default().id(cursor.to_string())
+                            .event("run_event").json_data(event).unwrap());
+                    }
+                    // A fast producer cannot make this response monopolize the runtime.
+                    tokio::task::yield_now().await;
+                    continue;
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    yield Ok(Event::default().event("resync").data("snapshot_required"));
+                Ok(_) => {}
+                Err(_) => {
+                    yield Ok(Event::default().event("resync")
+                        .data("snapshot_required"));
+                    break;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+            }
+            tokio::select! {
+                result = receiver.recv() => {
+                    if matches!(result, Err(broadcast::error::RecvError::Closed)) { break; }
+                    // Lagged notifications are harmless: replay resumes from SQLite.
+                }
+                // Some existing transactions commit several events but publish one.
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
             }
         }
     };
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 pub fn spawn_workers(state: Arc<AppState>) {
@@ -643,15 +709,27 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 tracing::error!(%error, "无法保存命令执行证据");
             }
         };
+        let state_for_events = state.clone();
+        let task_for_events = task_id.clone();
+        let execution_event = move |data| -> anyhow::Result<()> {
+            let event = state_for_events
+                .store
+                .lock()
+                .unwrap()
+                .execution_event(&task_for_events, data)?;
+            state_for_events.publish(event);
+            Ok(())
+        };
         match agent.executor.as_str() {
             "native" => {
-                provider::execute_with_context(
+                provider::execute_with_context_events(
                     &settings,
                     &root,
                     input,
                     progress,
                     is_cancelled,
                     evidence,
+                    execution_event,
                 )
                 .await
             }
@@ -734,17 +812,31 @@ pub fn event(
 ) -> RunEvent {
     RunEvent {
         id: new_id(),
+        sequence: 0,
         session_id,
         task_id,
         kind: kind.into(),
         message: message.into(),
         created_at: now(),
+        data: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_numeric_event_cursors_and_header_agreement() {
+        assert_eq!(event_cursor(None, None).unwrap(), None);
+        assert_eq!(event_cursor(Some("0"), None).unwrap(), Some(0));
+        assert_eq!(event_cursor(None, Some("42")).unwrap(), Some(42));
+        assert_eq!(event_cursor(Some("42"), Some("42")).unwrap(), Some(42));
+        assert!(event_cursor(Some("42"), Some("43")).is_err());
+        for value in ["", "-1", "+1", "uuid", "1.1", "18446744073709551616"] {
+            assert!(event_cursor(Some(value), None).is_err());
+        }
+    }
 
     #[test]
     fn rejects_credential_models_and_clears_credentials_when_service_changes() {

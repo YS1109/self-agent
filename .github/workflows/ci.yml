@@ -36,6 +36,7 @@ jobs:
       - run: python scripts/runtime_smoke.py
       - run: python scripts/plan_change_smoke.py
       - run: python scripts/headless_smoke.py
+      - run: python scripts/streaming_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}
