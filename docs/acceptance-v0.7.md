@@ -42,3 +42,5 @@
 第四切片隔离冻结门禁通过：core 5、daemon 195、CLI 19、前端 105 项；格式、全目标 Clippy、daemon/CLI/Web 构建和十二个后台 smoke 脚本通过。隔离工作树的前端直接使用已安装的 Vitest/tsc/Vite，与 package scripts 等价；pnpm 的自动依赖状态检查试图写不可用的 home 缓存，未继续该安装动作。独立静态复审无剩余阻塞项。真实模型和 GUI 未运行，跨平台 CI 按本切片提交另记；不称整版已完成。
 
 第三切片修复 `365942c3` 的 Windows smoke 已通过换行断言，随后发现取消连接以 ConnectionAbortedError（10053）结束的预期差异；`7142474c89e33e4c8a0b6fa473b5dcf9b1182708` 单行补齐该异常类别，意外异常仍记录失败。该精确提交的 push `40746966975` / PR `40746977940` 均已成功，两次各六项三平台检查；第四切片仍须自己的 CI。
+
+第四切片 `83603bc8` 的三平台 Rust 门禁在 Rust 1.99.1 新增 Clippy 检查 `chunks_exact_to_as_chunks` 处失败（本地工具链 1.96 未报此 lint）。修复改用相同 20 字节固定数组分块，不放宽长度/顺序校验；独立格式、Clippy 与 24 项改动/Git 回归重跑后，修复提交 CI 另行跟踪。

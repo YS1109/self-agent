@@ -230,8 +230,11 @@ impl Reader<'_> {
             }
             let names_start = 8 + 1024;
             let mut previous = None;
-            for oid in bytes[names_start..names_start + count * 20].chunks_exact(20) {
-                if previous.is_some_and(|p: &[u8]| p >= oid) {
+            for oid in bytes[names_start..names_start + count * 20]
+                .as_chunks::<20>()
+                .0
+            {
+                if previous.is_some_and(|p: &[u8; 20]| p >= oid) {
                     return Err("git_pack_index_order");
                 }
                 previous = Some(oid);
