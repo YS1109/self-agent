@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { api } from "../api";
 import { Button } from "./ui/button";
+import { Select } from "./ui/select";
 
 export interface ModelOption { id: string; name: string }
 export interface ModelCatalog {
@@ -58,15 +59,14 @@ export function ModelSelect({ label, value, onChange, catalog, disabled = false,
     <div className="model-field">
       <label htmlFor={id}>{label}</label>
       <div className="model-select-row">
-        <select id={id} value={custom ? CUSTOM : value} disabled={disabled} onChange={(event) => {
-          const selected = event.target.value;
+        <Select id={id} aria-label={label} value={custom ? CUSTOM : value} disabled={disabled} onValueChange={(selected) => {
           setCustom(selected === CUSTOM);
           if (selected !== CUSTOM) onChange(selected);
-        }}>
-          <option value="">{emptyLabel}</option>
-          {modelOptions(catalog.models, value).map((model) => <option key={model.id} value={model.id}>{modelLabel(model.name)}</option>)}
-          <option value={CUSTOM}>自定义模型 ID…</option>
-        </select>
+        }} options={[
+          { value: "", label: emptyLabel },
+          ...modelOptions(catalog.models, value).map((model) => ({ value: model.id, label: modelLabel(model.name) })),
+          { value: CUSTOM, label: "自定义模型 ID…" },
+        ]} />
         <Button type="button" variant="secondary" size="icon" disabled={disabled || catalog.loading} onClick={catalog.refresh} aria-label={`刷新${label}列表`} title="从当前服务重新获取模型列表">
           {catalog.loading ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />}
         </Button>
@@ -85,11 +85,12 @@ export function QuickModelSelect({ value, catalog, disabled, onChange, onSetting
   onChange: (value: string) => void; onSettings: () => void;
 }) {
   return (
-    <select className="model-picker" aria-label="当前主智能体模型" value={value} disabled={disabled} title={catalog.error || "选择主智能体模型；新设置用于后续请求"}
-      onChange={(event) => event.target.value === CUSTOM ? onSettings() : onChange(event.target.value)}>
-      <option value="" disabled>{catalog.loading ? "正在获取模型…" : "请选择模型"}</option>
-      {modelOptions(catalog.models, value).map((model) => <option key={model.id} value={model.id}>{modelLabel(model.name)}</option>)}
-      <option value={CUSTOM}>模型设置／刷新列表…</option>
-    </select>
+    <Select className="model-picker" aria-label="当前主智能体模型" value={value} disabled={disabled} title={catalog.error || "选择主智能体模型；新设置用于后续请求"}
+      onValueChange={(next) => next === CUSTOM ? onSettings() : onChange(next)}
+      options={[
+        { value: "", disabled: true, label: catalog.loading ? "正在获取模型…" : "请选择模型" },
+        ...modelOptions(catalog.models, value).map((model) => ({ value: model.id, label: modelLabel(model.name) })),
+        { value: CUSTOM, label: "模型设置／刷新列表…" },
+      ]} />
   );
 }

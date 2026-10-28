@@ -7,6 +7,8 @@ import { Button } from "./ui/button";
 import { Status } from "./status";
 import { PlanChanges } from "./plan-changes";
 import { ExecutionEvidence } from "./execution-evidence";
+import { Select } from "./ui/select";
+import { agentModelLabel } from "../agent-model";
 
 export function PlanGraph({ plan, editableNodes, layout, selectedId, disabled, expanded = false, onSelect, onMove, onConnect, onRemoveEdge }: {
   plan: Plan; editableNodes?: EditablePlanNode[]; layout: PlanLayout; selectedId?: string; disabled: boolean;
@@ -20,14 +22,16 @@ export function PlanGraph({ plan, editableNodes, layout, selectedId, disabled, e
   const nodes: Node[] = items.map((node, index) => {
     const status = plan.status === "draft" ? "pending" : plan.nodes.find((item) => item.id === node.id)?.status ?? "pending";
     const locked = !canEditPlanNode(plan, node.id);
+    const agent = plan.agents?.find((item) => item.id === (node.agent_id || plan.default_agent_id));
     return {
       id: node.id, selected: node.id === selectedId,
       position: layout[node.id] ?? positions.get(node.id)!,
       data: { label: (
         <div className="flow-node-content">
           <span className="flow-step">任务 {String(index + 1).padStart(2, "0")}{locked ? " · 已锁定" : ""}</span>
-          <strong>{node.title || "未命名任务"}</strong>
-          {(plan.agents?.length ?? 0) > 0 && <span className="flow-agent">{plan.agents?.find((agent) => agent.id === (node.agent_id || plan.default_agent_id))?.name ?? "默认角色"}</span>}
+          <strong title={node.title || "未命名任务"}>{node.title || "未命名任务"}</strong>
+          {(plan.agents?.length ?? 0) > 0 && <span className="flow-agent">{agent?.name ?? "默认角色"}</span>}
+          {agent && <span className="flow-model" title={`模型预设：${agentModelLabel(agent)}`}>预设：{agentModelLabel(agent)}</span>}
           <Status status={status} />
         </div>
       ) },
@@ -179,18 +183,18 @@ export function PlanPanel({
         </Button>
       </div>
       {expanded && <div className="plan-expanded-summary">
-        <select aria-label="画布目标计划" value={plan.id} onChange={(event) => onSelect(event.target.value)}>
-          {plans.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
-        </select>
+        <Select aria-label="画布目标计划" value={plan.id} onValueChange={onSelect}
+          options={plans.map((item) => ({ value: item.id, label: item.title }))}
+        />
         <Status status={plan.status} /><span>版本 {plan.revision}</span><span className="plan-expanded-round">{plan.nodes.length} 个任务 · 回顾 {plan.round}/{plan.max_rounds}</span>
         {plan.execution_mode === "demo" && <span>演示 · 不修改项目</span>}
         {active && <Button variant="secondary" size="small" disabled={busy || !connected} onClick={() => void onCommand({ type: plan.status === "paused" ? "resume_plan" : "pause_plan", plan_id: plan.id, expected_revision: plan.revision })}>{plan.status === "paused" ? <Play size={12} /> : <Pause size={12} />}{plan.status === "paused" ? "恢复派发" : "暂停派发"}</Button>}
       </div>}
       <div className="plan-selector">
         <label htmlFor="plan-selection">会话计划</label>
-        <select id="plan-selection" value={plan.id} onChange={(event) => onSelect(event.target.value)}>
-          {plans.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
-        </select>
+        <Select id="plan-selection" value={plan.id} onValueChange={onSelect}
+          options={plans.map((item) => ({ value: item.id, label: item.title }))}
+        />
       </div>
       <div className="plan-overview">
         <div className="plan-overview-top"><Status status={plan.status} /><span>版本 {plan.revision}</span></div>
@@ -265,6 +269,8 @@ export function PlanPanel({
             const nodeEditable = editable && canEditPlanNode(plan, node.id);
             const result = plan.nodes.find((item) => item.id === node.id);
             const failureTargets = repairTargets(plan, node.id);
+            const defaultAgent = plan.agents?.find((agent) => agent.id === plan.default_agent_id);
+            const nodeAgent = plan.agents?.find((agent) => agent.id === (node.agent_id || plan.default_agent_id));
             const titleFor = (id: string) => plan.nodes.find((item) => item.id === id)?.title ?? draft.nodes.find((item) => item.id === id)?.title ?? id;
             return <article className={`plan-editor-node ${nodeEditable ? "" : "plan-node-locked"}`} key={node.id}>
               <div className="plan-editor-heading">
@@ -275,11 +281,15 @@ export function PlanPanel({
               <label>任务标题<input value={node.title} onChange={(event) => changeNode(node.id, { title: event.target.value })} /></label>
               <label>任务描述<textarea value={node.objective} rows={3} onChange={(event) => changeNode(node.id, { objective: event.target.value })} /></label>
               {!!plan.agents?.length && <label>执行角色
-                <select value={node.agent_id || ""} onChange={(event) => changeNode(node.id, { agent_id: event.target.value || undefined })}>
-                  <option value="">计划默认 · {plan.agents.find((agent) => agent.id === plan.default_agent_id)?.name ?? "默认角色"}</option>
-                  {plan.agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · {agent.executor === "codex" ? "Codex CLI" : "原生工具循环"}</option>)}
-                </select>
+                <Select aria-label={`任务 ${index + 1} · 执行角色`} value={node.agent_id || ""} disabled={busy || !nodeEditable}
+                  onValueChange={(value) => changeNode(node.id, { agent_id: value || undefined })}
+                  options={[
+                    { value: "", label: `计划默认 · ${defaultAgent?.name ?? "默认角色"}${defaultAgent ? ` · ${agentModelLabel(defaultAgent)}` : ""}` },
+                    ...plan.agents.map((agent) => ({ value: agent.id, label: `${agent.name} · ${agent.executor === "codex" ? "Codex CLI" : "原生工具循环"} · ${agentModelLabel(agent)}` })),
+                  ]}
+                />
               </label>}
+              {nodeAgent && <p className="help-text node-model-preset">模型预设：{agentModelLabel(nodeAgent)}</p>}
               <div className="dependency-label">依赖任务</div>
               {nodeEditable ? <div className="dependency-options">
                 {draft.nodes.filter((item) => item.id !== node.id).map((item) => <label key={item.id}>

@@ -1,7 +1,9 @@
-import { Plus, Trash2, Users } from "lucide-react";
+import { Bot, Plus, Trash2, Users } from "lucide-react";
+import { agentModelLabel } from "../agent-model";
 import type { AgentProfile, Settings } from "../types";
 import { Button } from "./ui/button";
 import { ModelSelect, type ModelCatalog } from "./model-select";
+import { Select } from "./ui/select";
 
 export const DEFAULT_AGENT: AgentProfile = {
   id: "coder",
@@ -41,16 +43,16 @@ export function AgentSettings({
     });
   };
   return (
-    <section className="agent-settings" aria-label="子智能体角色设置">
+    <section className="agent-settings" aria-label="子智能体模型预设">
       <div className="agent-settings-heading">
-        <div><Users size={16} /><h3>子智能体角色</h3></div>
+        <div><Users size={18} /><h3>子智能体模型预设</h3></div>
         <span>{agents.length} 个角色</span>
       </div>
-      <p className="help-text">主智能体负责规划与回顾，任务由这里的角色执行。新设置用于之后创建的计划，已有计划保留创建时的角色快照。</p>
+      <p className="help-text">为每个角色预设模型、执行器和职责。固定模型后，切换主智能体模型不会改变该角色的预设。新计划与直接任务会保存角色预设，已有计划保留原配置。</p>
       <label>默认执行角色
-        <select disabled={disabled} value={settings.default_agent_id} onChange={(event) => onChange({ ...settings, default_agent_id: event.target.value })}>
-          {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name || "未命名角色"}</option>)}
-        </select>
+        <Select aria-label="默认执行角色" disabled={disabled} value={settings.default_agent_id}
+          onValueChange={(value) => onChange({ ...settings, default_agent_id: value })}
+          options={agents.map((agent) => ({ value: agent.id, label: `${agent.name || "未命名角色"} · ${agentModelLabel(agent)}` }))} />
       </label>
       <div className="agent-settings-list">
         {agents.map((agent, index) => (
@@ -59,27 +61,27 @@ export function AgentSettings({
               <span>角色 {index + 1}{settings.default_agent_id === agent.id ? " · 默认" : ""}</span>
               <Button type="button" size="icon" variant="ghost" disabled={disabled || agents.length <= 1} aria-label={`删除角色 ${agent.name || index + 1}`} onClick={() => remove(agent.id)}><Trash2 size={14} /></Button>
             </div>
+            <div className="agent-model-summary"><Bot size={17} /><span>{agentModelLabel(agent)}</span><small>{agent.model ? "固定模型" : "使用默认模型"}</small></div>
             <label>角色名称<input required value={agent.name} placeholder="例如：编码助手、验证助手" onChange={(event) => update(agent.id, { name: event.target.value })} /></label>
-            <div className="agent-editor-columns">
-              <label>执行器
-                <select value={agent.executor} onChange={(event) => update(agent.id, { executor: event.target.value as AgentProfile["executor"] })}>
-                  <option value="native">原生工具循环</option>
-                  <option value="codex">Codex 本机 CLI</option>
-                </select>
-              </label>
-              <ModelSelect key={agent.executor} label={`角色 ${index + 1} · 执行模型`} value={agent.model} onChange={(model) => update(agent.id, { model })}
+            <ModelSelect key={agent.executor} label={`角色 ${index + 1} · 预设模型`} value={agent.model} onChange={(model) => update(agent.id, { model })}
                 catalog={agent.executor === "codex" ? codexModels : nativeModels} disabled={disabled || (agent.executor === "codex" && codexPathChanged)}
-                emptyLabel={agent.executor === "codex" ? "使用 Codex 本机默认模型" : "继承主智能体模型"}
+                emptyLabel={agent.executor === "codex" ? "使用 Codex 本机默认模型" : "跟随主智能体模型（不固定）"}
                 hint={agent.executor === "codex" && codexPathChanged ? "CLI 路径已修改，请先保存设置再获取列表。" : undefined} />
-            </div>
+            {agent.executor === "native" && !agent.model && settings.model && <Button type="button" variant="secondary" size="small" disabled={disabled}
+              onClick={() => update(agent.id, { model: settings.model })}>固定为当前主模型</Button>}
+            <label>执行器
+              <Select aria-label={`角色 ${index + 1} · 执行器`} value={agent.executor} disabled={disabled}
+                onValueChange={(value) => update(agent.id, { executor: value as AgentProfile["executor"], model: value === "native" ? settings.model : "" })}
+                options={[{ value: "native", label: "原生工具循环" }, { value: "codex", label: "Codex 本机 CLI" }]} />
+            </label>
             <label>角色指令<textarea value={agent.instructions} rows={3} placeholder="描述角色职责、执行约束和结果要求" onChange={(event) => update(agent.id, { instructions: event.target.value })} /></label>
           </fieldset>
         ))}
       </div>
       <Button type="button" variant="secondary" size="small" disabled={disabled || agents.length >= 16} onClick={() => onChange({
         ...settings,
-        agents: [...agents, { id: `agent-${crypto.randomUUID()}`, name: "新角色", instructions: "", executor: "native", model: "" }],
-      })}><Plus size={13} />添加角色</Button>
+        agents: [...agents, { id: `agent-${crypto.randomUUID()}`, name: "新角色", instructions: "", executor: "native", model: settings.model }],
+      })}><Plus size={15} />添加子智能体预设</Button>
       <label className="codex-binary">Codex 可执行文件
         <input required value={settings.codex_binary} placeholder="codex 或本机绝对路径" onChange={(event) => onChange({ ...settings, codex_binary: event.target.value })} />
         <small>使用本机已安装 CLI 的登录状态和配置。请先在终端确认此命令可用并完成登录。当前版本不管理 MCP 服务和 Skills。</small>

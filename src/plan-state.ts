@@ -198,6 +198,6 @@ export function graphPositions(nodes: EditablePlanNode[]) {
     const column = level(node.id);
     const row = rows.get(column) ?? 0;
     rows.set(column, row + 1);
-    return [node.id, { x: row * 260, y: column * 144 }];
+    return [node.id, { x: row * 260, y: column * 220 }];
   }));
 }

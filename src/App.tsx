@@ -56,6 +56,8 @@ import { ProviderSettings } from "./components/provider-settings";
 import { syncNativeTheme, type AppTheme } from "./theme";
 import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./labels";
 import { Button } from "./components/ui/button";
+import { Select } from "./components/ui/select";
+import { agentModelLabel } from "./agent-model";
 import { discardCleanPlanDraft, hasUnsavedPlanDraft, selectedSessionPlan, updatePlanLayouts, type PlanDraft, type PlanLayoutDraft } from "./plan-state";
 import {
   activeTask,
@@ -160,6 +162,7 @@ function TaskCard({
             {done}/{task.steps.length} 步骤
           </span>
         </div>
+        {task.agent && <div className="task-model-preset" title={`模型预设：${agentModelLabel(task.agent)}`}>模型预设：{agentModelLabel(task.agent)}</div>}
         {task.steps.length > 0 && (
           <div className="task-progress">
             <span style={{ width: `${(done / task.steps.length) * 100}%` }} />
@@ -585,7 +588,7 @@ export default function App() {
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-              <small>本地优先 · v0.5.2</small>
+              <small>本地优先 · v0.5.3</small>
               </span>
               <Settings2 size={15} />
             </button>
@@ -811,13 +814,12 @@ export default function App() {
             </div>
             <div className="composer-area">
               {session && <div className="instruction-scope">
-                <label>指令用途<select aria-label="桌面指令用途" value={inputMode} onChange={(event) => setInputModes((current) => ({ ...current, [inputModeKey]: event.target.value as "goal" | "change" }))}>
-                  <option value="goal">新目标</option><option value="change">补充当前计划</option>
-                </select></label>
-                {inputMode === "change" && <label>目标计划<select aria-label="桌面目标计划" value={selectedPlan?.id ?? ""} onChange={(event) => selectPlan(event.target.value)}>
-                  {!plans.length && <option value="">暂无计划</option>}
-                  {plans.map((item) => <option key={item.id} value={item.id}>{item.title} · v{item.revision}{changeable(item.status) ? "" : " · 已结束"}</option>)}
-                </select></label>}
+                <label>指令用途<Select aria-label="桌面指令用途" value={inputMode} onValueChange={(value) => setInputModes((current) => ({ ...current, [inputModeKey]: value as "goal" | "change" }))}
+                  options={[{ value: "goal", label: "新目标" }, { value: "change", label: "补充当前计划" }]}
+                /></label>
+                {inputMode === "change" && <label>目标计划<Select aria-label="桌面目标计划" value={selectedPlan?.id ?? ""} onValueChange={selectPlan}
+                  options={plans.length ? plans.map((item) => ({ value: item.id, label: `${item.title} · v${item.revision}${changeable(item.status) ? "" : " · 已结束"}` })) : [{ value: "", label: "暂无计划" }]}
+                /></label>}
                 <span className="instruction-target" title={session.title}>会话：{session.title}</span>
               </div>}
               <div className="composer-context">
@@ -981,6 +983,7 @@ export default function App() {
                     </span>
                     <code>{selectedTask.id.slice(0, 8)}</code>
                   </div>
+                  {selectedTask.agent && <p className="task-model-preset">模型预设：{agentModelLabel(selectedTask.agent)}</p>}
                   <div className="detail-divider" />
                   <div className="section-label">执行步骤</div>
                   <div className="step-list">
@@ -1323,55 +1326,47 @@ export default function App() {
               </span>
               <div>
                 <strong>本地模拟器 / 所有者</strong>
-                <select
+                <Select
                   aria-label="远程对话"
                   value={remoteSource.conversation_id}
-                  onChange={(e) => {
+                  onValueChange={(value) => {
                     setRemoteSource({
                       ...REMOTE_SOURCE,
-                      conversation_id: e.target.value,
+                      conversation_id: value,
                     });
                     setRemoteReceipt("");
                   }}
-                >
-                  <option value="remote-1">远程对话 1</option>
-                  <option value="remote-2">远程对话 2</option>
-                </select>
+                  options={[{ value: "remote-1", label: "远程对话 1" }, { value: "remote-2", label: "远程对话 2" }]}
+                />
               </div>
               <span className="beta-tag">本地</span>
             </div>
             <label className="remote-label">
               此入口选中的会话
-              <select
+              <Select
+                aria-label="此入口选中的会话"
                 value={remoteSelection}
                 disabled={busy || !connected}
-                onChange={(e) =>
-                  e.target.value &&
+                onValueChange={(value) =>
+                  value &&
                   void command(
-                    { type: "select_session", session_id: e.target.value },
+                    { type: "select_session", session_id: value },
                     remoteSource,
                   )
                 }
-              >
-                <option value="">请选择会话</option>
-                {snapshot.sessions.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.title}
-                  </option>
-                ))}
-              </select>
+                options={[{ value: "", label: "请选择会话" }, ...snapshot.sessions.map((item) => ({ value: item.id, label: item.title }))]}
+              />
             </label>
             <p className="help-text">
               独立于桌面会话选择。任务保存派发时的回传位置。
             </p>
             <div className="instruction-scope remote-instruction-scope">
-              <label>指令用途<select aria-label="远程指令用途" value={remoteMode} onChange={(event) => setInputModes((current) => ({ ...current, [remoteKey]: event.target.value as "goal" | "change" }))}>
-                <option value="goal">新目标</option><option value="change">补充当前计划</option>
-              </select></label>
-              <label>目标计划<select aria-label="远程目标计划" value={remotePlan?.id ?? ""} onChange={(event) => setRemotePlanIds((current) => ({ ...current, [remoteKey]: event.target.value }))}>
-                {!remotePlans.length && <option value="">暂无计划</option>}
-                {remotePlans.map((item) => <option key={item.id} value={item.id}>{item.title} · v{item.revision}</option>)}
-              </select></label>
+              <label>指令用途<Select aria-label="远程指令用途" value={remoteMode} onValueChange={(value) => setInputModes((current) => ({ ...current, [remoteKey]: value as "goal" | "change" }))}
+                options={[{ value: "goal", label: "新目标" }, { value: "change", label: "补充当前计划" }]}
+              /></label>
+              <label>目标计划<Select aria-label="远程目标计划" value={remotePlan?.id ?? ""} onValueChange={(value) => setRemotePlanIds((current) => ({ ...current, [remoteKey]: value }))}
+                options={remotePlans.length ? remotePlans.map((item) => ({ value: item.id, label: `${item.title} · v${item.revision}` })) : [{ value: "", label: "暂无计划" }]}
+              /></label>
             </div>
             {remotePlan && <div className="remote-plan-progress">
               <strong>{remotePlan.title}</strong><Status status={remotePlan.status} />

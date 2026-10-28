@@ -4,6 +4,7 @@ import { api } from "../api";
 import type { Settings } from "../types";
 import { ModelSelect, type ModelCatalog } from "./model-select";
 import { Button } from "./ui/button";
+import { Select } from "./ui/select";
 
 export function ProviderSettings({ settings, saved, onChange, apiKey, onKeyChange, catalog, disabled }: {
   settings: Settings; saved: Settings; onChange: (settings: Settings) => void;
@@ -65,14 +66,14 @@ export function ProviderSettings({ settings, saved, onChange, apiKey, onKeyChang
 
   return <>
     <label>主智能体 · 配置来源
-      <select value={settings.provider_source ?? "manual"} disabled={disabled} onChange={(event) => {
+      <Select aria-label="主智能体 · 配置来源" value={settings.provider_source ?? "manual"} disabled={disabled} onValueChange={(value) => {
         onKeyChange("");
         setSourceError("");
-        onChange({ ...settings, provider_source: event.target.value as "manual" | "local_codex", base_url: "", model: "" });
-      }}>
-        <option value="manual">手动配置模型服务</option>
-        <option value="local_codex">复用本机 Codex 服务配置</option>
-      </select>
+        onChange({ ...settings, provider_source: value as "manual" | "local_codex", base_url: "", model: "" });
+      }} options={[
+        { value: "manual", label: "手动配置模型服务" },
+        { value: "local_codex", label: "复用本机 Codex 服务配置" },
+      ]} />
     </label>
     {local && <div className="form-info"><ShieldCheck size={16} /><p>
       从本机 Codex 的顶层自定义服务配置读取地址、凭据和请求头；重启后自动重新读取，不复制凭据到本应用。
