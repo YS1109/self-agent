@@ -15,12 +15,7 @@ pub(crate) fn check_private_secrets(
     state: &crate::store::capabilities::TaskCapabilityState,
     secrets: &[String],
 ) -> Result<()> {
-    let contains = |text: &str| {
-        secrets
-            .iter()
-            .filter(|secret| !secret.is_empty())
-            .any(|secret| text.contains(secret))
-    };
+    let contains = |text: &str| crate::provider::contains_known_secret(&json!(text), secrets);
     if state.skills.iter().any(|skill| {
         contains(&skill.content) || contains(&skill.source) || contains(&skill.reference.name)
     }) || state.servers.iter().any(|server| {
@@ -50,14 +45,26 @@ pub(crate) fn definitions(servers: &[PinnedMcp]) -> Vec<Value> {
     }))).collect()
 }
 
-pub(crate) fn config(definition: &McpServerDefinition) -> Result<mcp::ServerConfig> {
+pub(crate) fn config_with_environment(
+    definition: &McpServerDefinition,
+    environment: BTreeMap<String, String>,
+) -> Result<mcp::ServerConfig> {
     if !definition.credential_refs.is_empty() {
-        bail!("此切片尚未启用 MCP 凭据引用");
+        bail!("MCP 不接受外部输入的凭据引用");
+    }
+    let slots =
+        crate::store::capability_credentials::canonical_slots(&definition.credential_slots)?;
+    if environment.keys().cloned().collect::<Vec<_>>() != slots
+        || environment
+            .values()
+            .any(|value| value.is_empty() || value.len() > 2048 || value.contains('\0'))
+    {
+        bail!("MCP 环境凭据与固定声明不一致；未启动服务");
     }
     Ok(mcp::ServerConfig {
         program: definition.program.clone().into(),
         args: definition.args.clone(),
-        env: BTreeMap::new(),
+        env: environment,
         mode: match definition.protocol {
             McpProtocolMode::Modern2026 => mcp::ProtocolMode::Modern,
             McpProtocolMode::Legacy2025 => mcp::ProtocolMode::Legacy,
@@ -121,7 +128,12 @@ pub(crate) async fn call(
         "tool":tool.name,"arguments_digest":fingerprint(arguments),"arguments_preview":argument_preview(arguments,secrets),"sandbox":"none"})).await?;
     control.charge(Charge::ExternalCall)?;
     control.charge(Charge::Mutation)?;
-    let configuration = config(&server.definition)?;
+    let environment = if server.definition.credential_slots.is_empty() {
+        BTreeMap::new()
+    } else {
+        control.capability_environment(&server.reference.id, server.reference.revision)?
+    };
+    let configuration = config_with_environment(&server.definition, environment)?;
     let id = control.begin_capability_call(
         &server.reference.id,
         server.reference.revision,
@@ -229,44 +241,11 @@ pub(crate) async fn call(
     Ok(sanitize_result(value, success, secrets))
 }
 
-fn has_secret(value: &Value, secrets: &[String]) -> bool {
-    let contains = |text: &str| {
-        secrets
-            .iter()
-            .filter(|secret| !secret.is_empty())
-            .any(|secret| text.contains(secret))
-    };
-    match value {
-        Value::String(text) => contains(text),
-        Value::Array(items) => items.iter().any(|item| has_secret(item, secrets)),
-        Value::Object(items) => items
-            .iter()
-            .any(|(key, item)| contains(key) || has_secret(item, secrets)),
-        _ => false,
-    }
+pub(super) fn has_secret(value: &Value, secrets: &[String]) -> bool {
+    crate::provider::contains_known_secret(value, secrets)
 }
 fn redact_value(value: &Value, secrets: &[String]) -> Value {
-    match value {
-        Value::String(text) => Value::String(crate::provider::redact_known(text, secrets)),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| redact_value(item, secrets))
-                .collect(),
-        ),
-        Value::Object(items) => Value::Object(
-            items
-                .iter()
-                .map(|(key, item)| {
-                    (
-                        crate::provider::redact_known(key, secrets),
-                        redact_value(item, secrets),
-                    )
-                })
-                .collect(),
-        ),
-        _ => value.clone(),
-    }
+    crate::provider::redact_structured(value, secrets)
 }
 fn argument_preview(arguments: &Value, secrets: &[String]) -> Value {
     let mut text = redact_value(arguments, secrets).to_string();
@@ -288,7 +267,7 @@ fn sanitize_result(value: Value, success: bool, secrets: &[String]) -> Value {
         for item in contents {
             if item["type"] == "text" {
                 if let Some(part) = item["text"].as_str() {
-                    text.push_str(part);
+                    text.push_str(&crate::provider::redact_json_text(part, secrets));
                     text.push('\n');
                 }
             } else {

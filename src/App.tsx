@@ -47,7 +47,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, dispatch, capabilityClient, providersClient } from "./api";
+import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient } from "./api";
 import { useDaemonSnapshot } from "./use-daemon-snapshot";
 import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
 import { TaskSupplements, ContinueTask } from "./components/task-controls";
@@ -1335,7 +1335,7 @@ export default function App() {
         description="查看后台能力并管理 MCP / Skills。配置、发现、授权和实际使用彼此独立。"
         wide
       >
-        {modal === "capabilities" && <CapabilitiesSettings registry={registry} client={capabilityClient} disabled={busy || !connected} onRegistryChange={() => void refresh()} />}
+        {modal === "capabilities" && <CapabilitiesSettings registry={registry} client={capabilityClient} credentialClient={mcpCredentialClient} disabled={busy || !connected} onRegistryChange={() => void refresh()} />}
         <div className="capability-list">
           {snapshot.capabilities.length ? (
             snapshot.capabilities.map((capability) => (

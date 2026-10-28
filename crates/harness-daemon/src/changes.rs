@@ -61,8 +61,9 @@ pub(crate) fn capture(root: &Path, known_secrets: &[String]) -> Result<Baseline>
         .filter(|s| !s.is_empty())
         .cloned()
         .collect();
-    let files = scan(&directory, &secrets);
-    let git = git::observe(&directory, &files, &secrets);
+    let matcher = crate::provider::SecretMatcher::new(&secrets);
+    let files = scan(&directory, &matcher);
+    let git = git::observe(&directory, &files, &matcher);
     Ok(Baseline {
         root,
         directory,
@@ -86,12 +87,13 @@ pub(crate) fn finish(
     if baseline.secrets.iter().map(String::len).sum::<usize>() > 512 * 1024 {
         bail!("敏感值配置超过改动检查预算");
     }
+    let matcher = crate::provider::SecretMatcher::new(&baseline.secrets);
     for (path, state) in &baseline.files.files {
         if state
             .text
             .as_ref()
-            .is_some_and(|text| sensitive_content(text.as_bytes(), &baseline.secrets))
-            || secret_in_path(path, &baseline.secrets)
+            .is_some_and(|text| sensitive_content(text.as_bytes(), &matcher))
+            || secret_in_path(path, &matcher)
         {
             baseline.files.sensitive.insert(path.clone());
         }
@@ -99,14 +101,14 @@ pub(crate) fn finish(
     if root != baseline.root {
         bail!("项目目录已变化，不能与原改动基线比较");
     }
-    let after = scan(&baseline.directory, &baseline.secrets);
+    let after = scan(&baseline.directory, &matcher);
     let hidden: BTreeSet<_> = baseline
         .files
         .sensitive
         .union(&after.sensitive)
         .cloned()
         .collect();
-    let mut current_git = git::observe(&baseline.directory, &after, &baseline.secrets);
+    let mut current_git = git::observe(&baseline.directory, &after, &matcher);
     let mut before_git = baseline.git;
     // A formerly safe file can become sensitive during execution. Never retain
     // its earlier name/status in a report that otherwise excludes that file.
@@ -115,7 +117,7 @@ pub(crate) fn finish(
             entries.retain(|entry| {
                 entry["path"]
                     .as_str()
-                    .is_some_and(|p| !hidden.contains(p) && !secret_in_path(p, &baseline.secrets))
+                    .is_some_and(|p| !hidden.contains(p) && !secret_in_path(p, &matcher))
             });
         }
     }
@@ -347,7 +349,7 @@ fn open_root(root: &Path) -> Result<Dir> {
     Ok(directory)
 }
 
-fn scan(dir: &Dir, secrets: &[String]) -> Scan {
+fn scan(dir: &Dir, secrets: &crate::provider::SecretMatcher) -> Scan {
     let mut scan = Scan {
         complete: true,
         ..Scan::default()
@@ -356,7 +358,13 @@ fn scan(dir: &Dir, secrets: &[String]) -> Scan {
     scan
 }
 
-fn walk(dir: &Dir, prefix: &str, depth: usize, secrets: &[String], scan: &mut Scan) {
+fn walk(
+    dir: &Dir,
+    prefix: &str,
+    depth: usize,
+    secrets: &crate::provider::SecretMatcher,
+    scan: &mut Scan,
+) {
     if depth > MAX_DEPTH || scan.visited >= MAX_FILES {
         scan.complete = false;
         return;
@@ -563,11 +571,10 @@ fn excluded_path(path: &str) -> bool {
             _ => true,
         })
 }
-fn secret_in_path(path: &str, secrets: &[String]) -> bool {
-    secrets
-        .iter()
-        .any(|secret| !secret.is_empty() && path.contains(secret))
+fn secret_in_path(path: &str, secrets: &crate::provider::SecretMatcher) -> bool {
+    secrets.contains_text(path, 0)
 }
+
 fn file_mode(metadata: &cap_std::fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {
@@ -580,18 +587,14 @@ fn file_mode(metadata: &cap_std::fs::Metadata) -> Option<u32> {
         None
     }
 }
-fn sensitive_content(bytes: &[u8], secrets: &[String]) -> bool {
-    secrets.iter().any(|secret| {
-        !secret.is_empty()
+fn sensitive_content(bytes: &[u8], secrets: &crate::provider::SecretMatcher) -> bool {
+    secrets.contains_text(&String::from_utf8_lossy(bytes), 0)
+        || (bytes
+            .windows(b"-----BEGIN".len())
+            .any(|window| window == b"-----BEGIN")
             && bytes
-                .windows(secret.len())
-                .any(|window| window == secret.as_bytes())
-    }) || (bytes
-        .windows(b"-----BEGIN".len())
-        .any(|window| window == b"-----BEGIN")
-        && bytes
-            .windows(b"PRIVATE KEY-----".len())
-            .any(|window| window == b"PRIVATE KEY-----"))
+                .windows(b"PRIVATE KEY-----".len())
+                .any(|window| window == b"PRIVATE KEY-----"))
 }
 
 /// A single exact replacement hunk (with three context lines) avoids an
@@ -682,6 +685,22 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn json_text_credentials_discovered_late_are_excluded_from_interval_reports() {
+        let root = Temp::new();
+        let secret = "known\"私有\\key\n尾";
+        root.write("ordinary.txt", json!({"token":secret}).to_string());
+        let baseline = capture(&root.0, &[]).unwrap();
+        root.write("ordinary.txt", "now harmless");
+        let report = finish(&root.0, baseline, &[secret.into()]).unwrap();
+        let wire = report.to_string();
+        assert!(!wire.contains("ordinary.txt"));
+        assert!(!crate::provider::contains_known_secret(
+            &report,
+            &[secret.into()]
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn changed_root_links_are_rejected_and_interval_keeps_pinned_directory() {
@@ -1121,7 +1140,11 @@ mod tests {
         git(&root.0, &["add", "."]);
         let mut baseline = capture(&root.0, &[]).unwrap();
         baseline.files.files.clear();
-        let observed = git::observe(&baseline.directory, &baseline.files, &[]);
+        let observed = git::observe(
+            &baseline.directory,
+            &baseline.files,
+            &crate::provider::SecretMatcher::new(&[]),
+        );
         assert_eq!(
             observed["entries"][0]["raw_worktree"], "unknown",
             "{observed}"

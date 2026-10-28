@@ -136,3 +136,10 @@ it("allows only exact read-only credential operation recovery",()=> {
  expect(allowDevelopmentProxy("POST",path,undefined,undefined,"application/json")).toBe(false);
  expect(allowDevelopmentProxy("GET",path+"?secret=x",undefined,undefined,undefined)).toBe(false);
 });
+
+it("allows only exact MCP credential method/UUID/slot routes and same origin JSON",()=>{
+ const id="11111111-1111-4111-8111-111111111111",base=`/api/v1/capabilities/mcp/${id}/credentials/TOKEN`;
+ for(const path of [base,base+"/delete",`/api/v1/capability-credential-operations/${id}/cleanup`]){expect(allowDevelopmentProxy("POST",path,undefined,"same-origin","application/json")).toBe(true);expect(allowDevelopmentProxy("GET",path,undefined,"same-origin",undefined)).toBe(false);expect(allowDevelopmentProxy("POST",path,"https://evil.invalid","cross-site","application/json")).toBe(false);}
+ expect(allowDevelopmentProxy("GET",`/api/v1/capability-credential-operations/${id}`,undefined,"same-origin",undefined)).toBe(true);
+ for(const path of [base+"?secret=x",base+"/../PATH",base.replace("TOKEN","token"),base.replace(id,"../bad")])expect(allowDevelopmentProxy("POST",path,undefined,"same-origin","application/json")).toBe(false);
+});

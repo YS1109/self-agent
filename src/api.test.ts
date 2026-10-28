@@ -167,3 +167,13 @@ describe("private daemon transport", () => {
   });
 
 });
+
+describe("MCP scoped credential transport",()=>{
+ it("uses exact scoped routes and suppresses remote error bodies",async()=>{
+  const {mcpCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>null});vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
+  await mcpCredentialClient.setCredential(id,"TOKEN",{id,expected_revision:1,secret:"fixture"},signal);expect(fetcher.mock.calls[0][0]).toBe(`/api/v1/capabilities/mcp/${id}/credentials/TOKEN`);
+  await mcpCredentialClient.deleteCredential(id,"TOKEN",{id,expected_revision:1},signal);await mcpCredentialClient.operation(id,signal);await mcpCredentialClient.cleanupCredential(id,{id},signal);expect(fetcher).toHaveBeenCalledTimes(4);
+  expect(()=>mcpCredentialClient.setCredential(id,"TOKEN/../PATH",{id,expected_revision:1,secret:"fixture"},signal)).toThrow();expect(fetcher).toHaveBeenCalledTimes(4);
+  fetcher.mockResolvedValue({ok:false,json:async()=>({error:"SECRET_CANARY"})});await expect(mcpCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
+ });
+});

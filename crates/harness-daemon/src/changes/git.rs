@@ -363,7 +363,7 @@ fn head(dir: &Dir, budget: &mut Budget) -> R<Option<Oid>> {
     Err("git_ref_depth_exceeded")
 }
 
-pub(super) fn observe(root: &Dir, scan: &Scan, secrets: &[String]) -> Value {
+pub(super) fn observe(root: &Dir, scan: &Scan, secrets: &crate::provider::SecretMatcher) -> Value {
     match observe_inner(root, scan, secrets) {
         Ok(value) => value,
         Err(reason) => {
@@ -371,7 +371,7 @@ pub(super) fn observe(root: &Dir, scan: &Scan, secrets: &[String]) -> Value {
         }
     }
 }
-fn observe_inner(root: &Dir, scan: &Scan, secrets: &[String]) -> R<Value> {
+fn observe_inner(root: &Dir, scan: &Scan, secrets: &crate::provider::SecretMatcher) -> R<Value> {
     match root.symlink_metadata(".git") {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(json!({"state":"not_git","entries":[],"scope":"project_root_metadata_only"}))

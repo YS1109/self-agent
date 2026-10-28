@@ -37,6 +37,11 @@ export function providerMutationProxyPath(path:string):boolean {
   return /^\/api\/v1\/(?:providers\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/(?:credential|credential-delete)|credential-operations\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/cleanup)$/.test(path);
 }
 
+export function mcpCredentialProxyPath(method:string,path:string):boolean {
+ const id="[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+ return method==="GET"?new RegExp(`^/api/v1/capability-credential-operations/${id}$`).test(path):method==="POST"&&(new RegExp(`^/api/v1/capabilities/mcp/${id}/credentials/[A-Z][A-Z0-9_]{0,63}(?:/delete)?$`).test(path)||new RegExp(`^/api/v1/capability-credential-operations/${id}/cleanup$`).test(path));
+}
+
 export function allowDevelopmentProxy(
   method: string,
   path: string,
@@ -44,7 +49,7 @@ export function allowDevelopmentProxy(
   fetchSite: string | undefined,
   contentType: string | undefined,
 ): boolean {
-  if (!Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
+  if (!mcpCredentialProxyPath(method,path) && !Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
   if (fetchSite === "cross-site") return false;
   if (origin && !localOrigins.has(origin)) return false;
   return (

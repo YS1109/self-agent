@@ -10,3 +10,6 @@ pub(crate) mod vault;
 
 pub(crate) mod provider_api;
 pub(crate) mod provider_runtime;
+
+pub(crate) mod credential_api;
+pub(crate) mod credentials;

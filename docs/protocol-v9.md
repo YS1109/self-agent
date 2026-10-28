@@ -42,7 +42,7 @@
 - OS 条目的属性只使用固定命名空间、绑定摘要与随机引用；Provider UUID、用途与规范服务地址共同绑定。原始密钥由不可 Debug/Serialize 的私有类型持有，缓冲采用尽力归零。
 - OS 访问在独立串行工作线程执行，队列最多 32，等待最多 30 秒。某些 OS API 一旦进入不能强制取消；调用超时不等于系统操作停止。后台保留未知结果，停止时只作有截止时间的排空，不声称杀死 OS 调用。
 - 测试替身只在 `cfg(test)` 编译中存在，无生产环境变量或文件开关。测试不读真实 OS 凭据，不登记真实 Provider 或调用付费模型。
-- v8 的 MCP `credential_refs` 仍不接受非空配置；其 env 凭据绑定与 QQ 专用凭据是后续独立接线，不借用模型服务密钥。
+- v8 的 MCP `credential_refs` 仍不接受非空配置；后续切片通过下文声明槽接入独立 env 凭据。QQ 专用凭据保持另一个 scope，不借用模型服务密钥。
 
 ## 执行、上下文与撤权
 
@@ -56,3 +56,40 @@
 ## 验证口径
 
 见 `docs/acceptance-providers-v0.8.md`。本协议描述开发实现；真实系统凭据库解锁、GUI 操作及真实模型服务不可因 mock 测试而标记通过。CI 结果只对其精确 commit 生效。
+
+## 托管 MCP 环境凭据（后续 0.8 切片）
+
+此部分扩展 v8 的 stdio MCP 管理与调用，不授予远程 QQ / H5 配置凭据的权限；不把 Provider 密钥、宿主环境或 Codex 自带凭据借给 MCP。
+
+### 声明与绑定
+
+- `McpServerDefinition.credential_slots` 为最多 8 个不重复、规范排序的槽名，格式为 `[A-Z][A-Z0-9_]{0,63}`。`credential_refs` 仅兼容空对象，客户端不能输入 OS 引用。
+- 声明、设置及 CLI 使用同一 Rust 核心校验；禁止启动/加载/代理/证书/宿主配置变量，包括 PATH、HOME、PSMODULEPATH、CORECLR_*、LD_*、PYTHON*、任意 PROXY 后缀等。前端按同一列表约束并有契约测试。原始 stdio 后端仍再次检查环境，不因凭据 UI 而放松规则。
+- 私有绑定包含 server UUID、槽名、完整配置摘要；摘要覆盖程序、全部参数、协议、规范槽名，以及固定 cwd/env policy。发现使用独立探测目录，实际调用使用任务固定项目；相对参数及所选项目仍是可信程序输入，不是沙箱。
+- 程序/参数/协议/槽集合改变会解除全部旧绑定并保留孤立项清理记录。设置/轮换、解除删除使服务修订递增、旧目录失效；必须再次显式发现，不把旧 key 发给新程序，也不假定新 key 看到相同工具。
+- 公开 `credential_states` 只有槽名、configured 与 `bound_not_checked` / `not_configured` 等状态；系统存储是否可读只在实际读取时确认。旧数据库缺字段兼容，非法旧非空 refs 隔离为不可用，不迁入 vault。
+
+### 所有者接口与一次性操作
+
+| 操作 | 接口与请求 |
+| --- | --- |
+| 设置/轮换 | `POST /api/v1/capabilities/mcp/{serverID}/credentials/{slot}`，`{id, expected_revision, secret}` |
+| 解除并删除 | `POST .../credentials/{slot}/delete`，`{id, expected_revision}` |
+| 查询原操作 | `GET /api/v1/capability-credential-operations/{operationID}`；不存在为 404 |
+| 明确清理 | `POST .../{operationID}/cleanup`，`{id: newOperationID}` |
+
+请求体最多 8 KiB。MCP secret 为 **1–2048 UTF-8 字节、禁止 NUL，可含引号、反斜杠及换行**，不同于模型 Provider 的 ASCII Bearer header 约束。请求不存在可选 owner_kind 或任意引用；新 key 若已存在于程序/参数/目录的已知元数据（含 JSON 文本表示）则拒绝，不将明文参数转为合法存储方式。
+
+SQLite 保存独立 MCP intent/receipt，秘密不进入表、操作摘要或公开回执。相同操作 ID 仅固定元数据，重复响应 `no_secret_applied:true` 不表示新 body 已应用。后台拥有已接收 mutation，客户端断开不丢失意图。claim 只执行一次；超时/重启为 unknown、不自动重放；成功 set 以修订 CAS 换入引用，过期成功为 orphaned。delete 先解除，失败不恢复引用。显式 cleanup 保留原 status/reason，另记 cleanup_status。
+
+审计普通操作 1024、显式清理额度另 256，未清理条目最多 256；不删除历史以重用幂等 ID。注册表新增独立 MCP `credential_operations`（扁平安全操作字段与 slot），不混入 Provider scope。UI 密码不放入 React 状态/URL/本地存储；未知结果只 GET 恢复。CLI 使用 `mcp-credential set SERVER SLOT REV --stdin`，保留换行，不收秘密 argv，记录操作 ID 后只发送一次。
+
+### 实际执行与秘密边界
+
+任务在入队事务中固定各服务的修订、槽及私有 refs。所有声明槽必须已配置；运行前每槽只读一次 vault，读取前后和等待期间检查同一快照；读取失败、取消或撤权不会启动模型/服务，不回退到 Provider 或宿主 key。同一任务的多次 MCP 调用只复用该私有内存快照，不重新解析当前配置。
+
+秘密仅放入指定服务的显式环境；env_clear 规则保持，不放在 argv、模型工具定义或公开授权记录。任务级秘密集合在模型、工具、摘要与改动基线之前安装，审批只显示脱敏参数与完整操作摘要。服务变更/撤权在发现后、tools/call 前再次检查；进行中的未知外部效果仍不重放，进程清理隔离规则与 v8 相同。
+
+Native / MCP 的结构化输出、工具历史及元数据检测使用共享 JSON 文本语义处理：单段最多 **1 MiB**、最多 **4 层** JSON-in-text，键和值先处理再序列化/截断，超解析预算隐藏而非透传。常见 JSON 字符串及 ASCII Unicode 转义模式也在流式分块/展示截断前处理；匹配器每次完整处理预编译复用，扫描项目时同样复用。它不是任意编码解码器，不承诺识别 base64 等自定义编码。改动报告排除包含已知凭据的文本及标准 JSON 表示，包括晚发现的秘密。
+
+联合验证见 [MCP 环境凭据验收](acceptance-mcp-credentials-v0.8.md)。真实 OS 授权、真实 MCP 服务和 GUI 未运行；本切片不代表已完成真实平台 enrollment。

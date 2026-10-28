@@ -13,3 +13,7 @@
 .capability-selection-group { display: grid; gap: 8px; border: 0; padding: 10px 0; margin: 0; }
 .capability-selection-group legend { color: var(--secondary); font-size: 13px; }
 .capability-notice { padding: 10px; color: var(--accent); background: var(--accent-light); border-radius: 7px; }
+.mcp-credentials, .mcp-credential-server { display: grid; gap: 12px; min-width: 0; }
+.mcp-credentials { border-top: 1px solid var(--line); padding-top: 14px; }
+.mcp-credential-slot, .mcp-credential-operation { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.mcp-credentials code { overflow-wrap: anywhere; }

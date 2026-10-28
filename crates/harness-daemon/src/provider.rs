@@ -20,6 +20,9 @@ use crate::{
     Settings,
 };
 
+#[path = "provider_redaction.rs"]
+mod provider_redaction;
+pub(crate) use provider_redaction::SecretMatcher;
 #[path = "provider_stream.rs"]
 mod provider_stream;
 
@@ -816,21 +819,7 @@ async fn send_model_request(
 }
 
 fn secrets(settings: &Settings) -> Vec<String> {
-    let mut secrets = vec![settings.api_key.clone()];
-    for value in settings.provider_headers.values() {
-        if let Ok(value) = value.to_str() {
-            secrets.push(value.into());
-            if let Some(value) = value.strip_prefix("Bearer ") {
-                secrets.push(value.into());
-            }
-        }
-    }
-    for name in ["HARNESS_API_KEY", "OPENAI_API_KEY"] {
-        if let Ok(secret) = std::env::var(name) {
-            secrets.push(secret);
-        }
-    }
-    secrets
+    crate::continuation::known_secrets(settings)
 }
 
 /// Shared longest-match redaction before any presentation bound or JSON escaping.
@@ -847,22 +836,16 @@ fn redact_all(settings: &Settings, text: &str) -> String {
 }
 
 pub(crate) fn redact_value(settings: &Settings, value: &Value) -> Value {
-    match value {
-        Value::String(text) => Value::String(redact_all(settings, text)),
-        Value::Array(values) => Value::Array(
-            values
-                .iter()
-                .map(|value| redact_value(settings, value))
-                .collect(),
-        ),
-        Value::Object(values) => Value::Object(
-            values
-                .iter()
-                .map(|(key, value)| (redact_all(settings, key), redact_value(settings, value)))
-                .collect(),
-        ),
-        value => value.clone(),
-    }
+    provider_redaction::redact(value, &secrets(settings))
+}
+pub(crate) fn redact_structured(value: &Value, secrets: &[String]) -> Value {
+    provider_redaction::redact(value, secrets)
+}
+pub(crate) fn contains_known_secret(value: &Value, secrets: &[String]) -> bool {
+    provider_redaction::has_secret(value, secrets)
+}
+pub(crate) fn redact_json_text(value: &str, secrets: &[String]) -> String {
+    provider_redaction::redact_text(value, secrets)
 }
 
 /// Redact complete semantic strings before embedding JSON tool payloads into

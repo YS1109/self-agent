@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub(crate) mod capabilities;
+pub(crate) mod capability_credentials;
 mod changes;
 mod continuation;
 mod decisions;
@@ -57,6 +58,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS execution_requests_task ON execution_requests(task_id);",
         )?;
         capabilities::migrate(&db)?;
+        capability_credentials::migrate(&db)?;
         providers::migrate(&db)?;
         // One atomic migration preserves legacy UUIDs and insertion order. An
         // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
@@ -128,6 +130,7 @@ impl Store {
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
         capabilities::recover(&tx)?;
+        capability_credentials::recover(&tx)?;
         providers::recover(&tx)?;
         decisions::recover_pending(&tx)?;
         execution::recover_execution_cleanup(&tx)?;

@@ -157,3 +157,6 @@ python3 scripts/web_stream_smoke.py
 托管 MCP / Skills 的平台修复最终提交 `7cd1b16c50a75985e4e7428a956da99c33ead0c0` 已通过 push `40766271204` / PR `40766281131`，两轮各六项三平台检查成功；此结果不代替命名服务切片 CI。后续接入 MCP 环境凭据及 QQ 专用 credential scope，不能使用 Provider 密钥替代外部工具/机器人授权。真实系统凭据、GUI、真实模型均未运行。
 
 命名服务候选冻结门禁通过：core 7 / daemon 322 / CLI 27 / 前端 166，事件桥 7、Web 代理 3 组、15 个后台 smoke、fmt / Clippy / 构建；独立审查闭环。下一步先核验此切片精确提交 CI，再继续 MCP 环境凭据与 QQ 专用 scope，保留未验证实机系统存储和 GUI 边界。
+
+
+MCP 环境凭据后续切片见 protocol-v9 附节与 acceptance-mcp-credentials-v0.8：独立 slots/ref、固定 task / probe scope、一次性 vault 操作和实际进程 env；不能在设置中手填 refs，也不能复用 Provider 凭据。秘密 JSON 文本需语义处理，匹配模式每次复用而非逐字段重新编译。命名服务 `675c326d` 精确 CI 两轮各6/6已成功，MCP env 的新提交仍独立跟踪。QQ 共享接线工作树与 1.0 新 reliability 模块由各自负责人持有，不能把未验收内容混入本切片提交。

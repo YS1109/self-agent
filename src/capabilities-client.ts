@@ -1,17 +1,18 @@
 /** Public capability observations only: never credential values or imported skill bodies. */
+import { mcpSlotsError, validMcpOperation, type McpCredentialOperation } from "./mcp-credentials-client";
 export type McpProtocol = "modern2026" | "legacy2025";
 export interface McpServerView {
   id: string; revision: number; name: string; enabled: boolean; program: string; args: string[];
-  protocol: McpProtocol; credential_slots: string[]; status: string; reason: string | null;
+  protocol: McpProtocol; credential_slots: string[]; credential_states?: {slot:string;configured:boolean;status:string}[]; status: string; reason: string | null;
   catalog_digest: string | null; tool_count: number; updated_at: string;
 }
 export interface SkillView {
   id: string; revision: number; name: string; enabled: boolean; source: string;
   content_digest: string; content_bytes: number; updated_at: string;
 }
-export interface ManagedCapabilities { mcp_servers: McpServerView[]; skills: SkillView[] }
+export interface ManagedCapabilities { mcp_servers: McpServerView[]; skills: SkillView[]; credential_operations?: McpCredentialOperation[] }
 export interface CapabilitySelection { mcp_servers: string[]; skills: string[] }
-export interface McpDefinition { name: string; program: string; args: string[]; protocol: McpProtocol; enabled: boolean; credential_refs: Record<string, string> }
+export interface McpDefinition { name: string; program: string; args: string[]; protocol: McpProtocol; enabled: boolean; credential_refs: Record<string, string>; credential_slots?: string[] }
 export type CapabilityCommand =
   | { type: "save_mcp_server"; id?: string; expected_revision?: number; definition: McpDefinition }
   | { type: "set_capability_enabled"; kind: "mcp" | "skill"; id: string; expected_revision: number; enabled: boolean }
@@ -37,7 +38,8 @@ export function capabilityCommandError(command: CapabilityCommand): string | nul
     if (!absoluteCapabilityPath(value.program) || bytes(value.program) > 4096) return "程序须为有效绝对路径（最多 4096 个 UTF-8 字节）。";
     if (value.args.length > 64 || value.args.some(arg => bytes(arg) > 8192 || arg.includes("\0")) || value.args.reduce((total, arg) => total + bytes(arg), 0) > 65536) return "参数最多 64 项，每项最多 8192 个 UTF-8 字节，合计最多 65536 字节，不能包含空字符。";
     if (value.protocol !== "modern2026" && value.protocol !== "legacy2025") return "请显式选择支持的 MCP 协议版本。";
-    if (Object.keys(value.credential_refs).length) return "当前表单不支持凭据配置，请勿在参数里填写密钥。";
+    if (Object.keys(value.credential_refs).length) return "不支持凭据引用输入，请使用专用凭据槽表单，勿在参数里填写密钥。";
+    const slotsError = mcpSlotsError(value.credential_slots ?? []); if (slotsError) return slotsError;
   }
   if (command.type === "save_skill" || command.type === "import_skill") {
     if (!command.name.trim() || Array.from(command.name).length > 80 || command.name.includes("\0")) return "技能名称须为 1–80 个字符。";
@@ -70,8 +72,9 @@ export function capabilityReason(reason: string | null): string {
 function record(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 export function validCapabilityRegistry(value: unknown): value is ManagedCapabilities {
   if (!record(value) || !Array.isArray(value.mcp_servers) || !Array.isArray(value.skills) || value.mcp_servers.length > 32 || value.skills.length > 64) return false;
+  if (value.credential_operations !== undefined && (!Array.isArray(value.credential_operations) || value.credential_operations.length > 1280 || !value.credential_operations.every(validMcpOperation))) return false;
   const base = (item: unknown) => record(item) && typeof item.id === "string" && typeof item.name === "string" && Number.isSafeInteger(item.revision) && (item.revision as number) >= 0 && typeof item.enabled === "boolean" && typeof item.updated_at === "string";
-  return value.mcp_servers.every(item => base(item) && typeof item.program === "string" && Array.isArray(item.args) && item.args.every((arg: unknown) => typeof arg === "string") && ["modern2026", "legacy2025"].includes(item.protocol) && Array.isArray(item.credential_slots) && item.credential_slots.every((slot: unknown) => typeof slot === "string") && typeof item.status === "string" && (item.reason === null || typeof item.reason === "string") && (item.catalog_digest === null || typeof item.catalog_digest === "string") && Number.isSafeInteger(item.tool_count) && item.tool_count >= 0)
+  return value.mcp_servers.every(item => base(item) && typeof item.program === "string" && Array.isArray(item.args) && item.args.every((arg: unknown) => typeof arg === "string") && ["modern2026", "legacy2025"].includes(item.protocol) && Array.isArray(item.credential_slots) && item.credential_slots.every((slot: unknown) => typeof slot === "string") && (item.credential_states === undefined || (Array.isArray(item.credential_states) && item.credential_states.length <= 8 && item.credential_states.every((state: unknown) => record(state) && typeof state.slot === "string" && typeof state.configured === "boolean" && typeof state.status === "string"))) && typeof item.status === "string" && (item.reason === null || typeof item.reason === "string") && (item.catalog_digest === null || typeof item.catalog_digest === "string") && Number.isSafeInteger(item.tool_count) && item.tool_count >= 0)
     && value.skills.every(item => base(item) && typeof item.source === "string" && typeof item.content_digest === "string" && Number.isSafeInteger(item.content_bytes) && item.content_bytes >= 0);
 }
 export interface CapabilityState { registry: ManagedCapabilities; busy: boolean; loading: boolean; error: string; notice: string }

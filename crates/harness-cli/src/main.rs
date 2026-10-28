@@ -27,6 +27,9 @@ const HELP: &str = r#"Self Agent 命令行客户端
   providers save <JSON文件|->       保存服务元数据（不接受密钥）
   providers enable <ID> <修订> <true|false>  显式启停命名服务
   providers delete <ID> <修订>      删除服务，遗留凭据需显式清理
+  mcp-credential set <SERVER> <SLOT> <修订> --stdin  写入MCP专用凭据
+  mcp-credential delete <SERVER> <SLOT> <修订>  解绑并删除
+  mcp-credential operation <操作ID> | cleanup <操作ID>  查询/显式清理
   provider-credential set <ID> <修订> --stdin  仅从标准输入读取新密钥
   provider-credential delete <ID> <修订>     解绑并删除系统凭据
   provider-credential cleanup <操作ID>       清理指定遗留凭据
@@ -54,7 +57,8 @@ Codex仅支持runtime/output限制，内部请求/修复及逐工具权限不可
 批准/拒绝必须先核对requests中的任务、操作、修订与完整action_digest；回答不是授权。
 MCP 配置、启用、发现目录不等于实际调用或任务授权。probe 必须 confirm_start:true，
 它会启动可信未沙箱化本机进程，可能写文件或联网；是否可用以后台真实发现状态为准。
-能力命令仅从文件或标准输入读取，不在参数输入原始密钥；本切片拒绝凭据绑定。
+能力命令只保存元数据；MCP 环境凭据通过 mcp-credential --stdin 专用入口写入系统凭据库。
+该入口保留 UTF-8 换行，不复用 Provider header 限制。
 capability-command 不重试POST，也不支持--follow/--wait；用capabilities刷新发现状态。
 resolve-cleanup 须先在操作系统确认进程全部停止并检查改动，JSON包含快照中的
 expected_updated_at 和 confirm_processes_stopped:true；只记录所有者确认，不改写原任务/调用结果。
@@ -289,7 +293,8 @@ fn command(options: &Options) -> Result<Option<Value>> {
         | "capability-command"
         | "resolve-cleanup"
         | "providers"
-        | "provider-credential" => return Ok(None),
+        | "provider-credential"
+        | "mcp-credential" => return Ok(None),
         _ => bail!("未知命令，使用 --help 查看用法"),
     };
     if let Some(path) = &options.controls {
@@ -419,6 +424,38 @@ fn provider_stdin_secret(reader: impl Read) -> Result<String> {
         bail!("凭据必须为1至2048字节的可见ASCII字符，不能包含空格或内部换行；内容未回显");
     }
     String::from_utf8(bytes).context("凭据格式无效，内容未回显")
+}
+
+fn mcp_stdin_secret(reader: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(2049)
+        .read_to_end(&mut bytes)
+        .context("无法读取 MCP 凭据标准输入")?;
+    if bytes.is_empty() || bytes.len() > 2048 || bytes.contains(&0) {
+        bail!("MCP 凭据须为1至2048字节UTF-8，不能含空字符；内容未回显");
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("MCP 凭据须为UTF-8；内容未回显"))
+}
+fn mcp_credential_request(options: &Options) -> Result<Option<(String, String, Option<Value>)>> {
+    if options.command != "mcp-credential" {
+        return Ok(None);
+    }
+    if options.follow || options.wait.is_some() {
+        bail!("MCP 凭据只支持一次提交或只读查询，不支持follow/wait");
+    }
+    provider_uuid(&options.command_id)?;
+    let a = &options.args;
+    match a.first().map(String::as_str){
+ Some("operation") if a.len()==2=>{provider_uuid(&a[1])?;Ok(Some(("GET".into(),format!("/api/v1/capability-credential-operations/{}",a[1]),None)))},
+ Some("cleanup") if a.len()==2=>{provider_uuid(&a[1])?;Ok(Some(("POST".into(),format!("/api/v1/capability-credential-operations/{}/cleanup",a[1]),Some(json!({"id":options.command_id})))))},
+ Some(kind @ ("set"|"delete")) if (kind=="set"&&a.len()==5&&a[4]=="--stdin")||(kind=="delete"&&a.len()==4)=>{
+ provider_uuid(&a[1])?;let slot=&a[2];harness_core::validate_mcp_credential_slot(slot).map_err(anyhow::Error::msg)?;
+ let rev=a[3].parse::<u64>().ok().filter(|v|*v<=9_007_199_254_740_991).context("MCP 修订无效")?;
+ let mut body=json!({"id":options.command_id,"expected_revision":rev});if kind=="set"{body["secret"]=json!(mcp_stdin_secret(std::io::stdin())?);}
+ Ok(Some(("POST".into(),format!("/api/v1/capabilities/mcp/{}/credentials/{}{}",a[1],slot,if kind=="delete"{"/delete"}else{""}),Some(body))))},
+ _=>bail!("使用 mcp-credential set SERVER SLOT REV --stdin、delete SERVER SLOT REV、operation ID 或cleanup ID；不要在参数中填写凭据"),
+ }
 }
 
 fn provider_request(options: &Options) -> Result<Option<(String, String, Option<Value>)>> {
@@ -926,6 +963,7 @@ async fn run(options: Options) -> Result<()> {
     let capability_request = capability_body(&options)?;
     let cleanup_request = cleanup_resolution_request(&options)?;
     let provider_request = provider_request(&options)?;
+    let mcp_credential_request = mcp_credential_request(&options)?;
     validate_follow(&options, command.as_ref())?;
     if options.command == "requests" {
         arity(&options, 0, 1)?;
@@ -937,6 +975,19 @@ async fn run(options: Options) -> Result<()> {
         .then(|| changes_route(&options))
         .transpose()?;
     let client = Client::open(&options.directory)?;
+    if let Some((method, path, body)) = mcp_credential_request {
+        if method != "GET" {
+            eprintln!(
+                "MCP 凭据操作 ID：{}；结果未知时只用 operation 查询，不会重发。",
+                options.command_id
+            );
+        }
+        let response = client.request(&method, &path, body).await.map_err(|_| {
+            anyhow::anyhow!("MCP 凭据请求未确认，请只读查询原操作；未回显凭据或底层错误")
+        })?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
     if let Some((method, path, body)) = provider_request {
         let response = client.request(&method, &path, body).await?;
         println!("{}", serde_json::to_string_pretty(&response)?);
@@ -2152,5 +2203,45 @@ mod tests {
         )
         .await
         .unwrap_err();
+    }
+}
+
+#[cfg(test)]
+mod mcp_credential_cli_tests {
+    use super::*;
+    #[test]
+    fn dangerous_slots_are_rejected_before_reading_stdin_or_network() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for slot in [
+            "PATH",
+            "PSMODULEPATH",
+            "CORECLR_ENABLE_PROFILING",
+            "GLIBC_TUNABLES",
+            "LOCPATH",
+            "NLSPATH",
+            "BASH_XTRACEFD",
+            "PROMPT_COMMAND",
+            "CUSTOMPROXY",
+        ] {
+            for kind in ["set", "delete"] {
+                let mut args = vec!["mcp-credential", kind, id, slot, "1"];
+                if kind == "set" {
+                    args.push("--stdin");
+                }
+                let options = parse(args.into_iter().map(str::to_owned)).unwrap().unwrap();
+                assert!(mcp_credential_request(&options).is_err(), "{slot}");
+            }
+        }
+    }
+
+    #[test]
+    fn stdin_utf8_bounded_and_routes_are_separate() {
+        assert_eq!(
+            mcp_stdin_secret("多行\nfixture".as_bytes()).unwrap(),
+            "多行\nfixture"
+        );
+        for v in [Vec::new(), vec![b'x'; 2049], vec![0], vec![255]] {
+            assert!(mcp_stdin_secret(v.as_slice()).is_err());
+        }
     }
 }

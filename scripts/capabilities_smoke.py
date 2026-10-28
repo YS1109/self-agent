@@ -97,7 +97,7 @@ def main():
             try:
                 daemon.start()
                 daemon.request("PUT","/api/v1/settings",{"base_url":f"http://127.0.0.1:{server.server_port}/v1","model":"fixture","provider_source":"manual","main_executor":"native","execution_mode":"native"})
-                assert registry()=={"mcp_servers":[],"skills":[]}
+                assert registry()=={"mcp_servers":[],"skills":[],"credential_operations":[]}
                 creation={"type":"save_skill","name":"固定技能","content":"SKILL_FIXTURE_FIXED_V1"}
                 command_id=str(uuid.uuid4()); skill=manage(creation,command_id)
                 assert manage(creation,command_id)==skill

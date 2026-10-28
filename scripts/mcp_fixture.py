@@ -165,6 +165,9 @@ for line in sys.stdin:
         result["structuredContent"] = {"args": sys.argv[2:]}
     if mode == "env":
         result["structuredContent"] = {"explicit": os.environ.get("MCP_TOKEN"), "host": os.environ.get("MCP_HOST_CANARY"), "home": os.environ.get("HOME"), "proxy": os.environ.get("HTTPS_PROXY"), "codex": os.environ.get("CODEX_HOME")}
+    if mode == "credential-json-text":
+        result["content"][0]["text"] = json.dumps({canary: canary, "nested": json.dumps({"token": canary})})
+        result["structuredContent"] = {"host": os.environ.get("HARNESS_API_KEY"), "home": os.environ.get("HOME")}
     if mode == "secret-logs":
         sys.stderr.write(canary + "\n")
         sys.stderr.flush()

@@ -259,18 +259,53 @@ pub(super) fn validate_calls(message: &Value) -> Result<()> {
 /// Hold only a suffix which could become a credential on the next chunk.
 pub(super) struct Redactor {
     pending: String,
-    secrets: Vec<String>,
+    secrets: std::sync::Arc<Vec<String>>,
 }
 
 impl Redactor {
-    pub fn new(mut secrets: Vec<String>) -> Self {
-        secrets.retain(|secret| !secret.is_empty());
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup();
+    pub fn new(secrets: Vec<String>) -> Self {
+        Self::with_patterns(Self::compile_patterns(secrets))
+    }
+
+    pub fn with_patterns(secrets: std::sync::Arc<Vec<String>>) -> Self {
         Self {
             pending: String::new(),
             secrets,
         }
+    }
+
+    pub fn compile_patterns(mut secrets: Vec<String>) -> std::sync::Arc<Vec<String>> {
+        // Common JSON string representations must also be held across stream
+        // boundaries before any presentation truncation. Full JSON text gets
+        // additional bounded semantic parsing at the value/output boundary.
+        let original = secrets.clone();
+        for secret in original.iter().filter(|value| !value.is_empty()) {
+            let mut encoded = secret.clone();
+            for _ in 0..2 {
+                let json = serde_json::to_string(&encoded).expect("string serializes");
+                encoded = json[1..json.len() - 1].to_owned();
+                secrets.push(encoded.clone());
+            }
+            let mut ascii = String::new();
+            for ch in secret.chars() {
+                if ch.is_ascii() {
+                    let json = serde_json::to_string(&ch.to_string()).expect("string serializes");
+                    ascii.push_str(&json[1..json.len() - 1]);
+                } else {
+                    for unit in ch.encode_utf16(&mut [0; 2]) {
+                        ascii.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+            }
+            secrets.push(ascii.clone());
+            let json = serde_json::to_string(&ascii).expect("string serializes");
+            secrets.push(json[1..json.len() - 1].to_owned());
+        }
+        secrets.retain(|secret| !secret.is_empty());
+        secrets.sort();
+        secrets.dedup();
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        std::sync::Arc::new(secrets)
     }
 
     pub fn push(&mut self, text: &str) -> String {
@@ -322,6 +357,23 @@ mod tests {
     }
     fn chunk(delta: Value, finish: Value) -> String {
         frame(json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish}]}))
+    }
+
+    #[test]
+    fn json_encoded_credentials_are_held_across_every_stream_boundary() {
+        let key = "quote\"私有\\token\n😀";
+        let encoded = serde_json::to_string(key).unwrap();
+        let ascii = r#"quote\"\u79c1\u6709\\token\n\ud83d\ude00"#;
+        for value in [encoded[1..encoded.len() - 1].to_owned(), ascii.into()] {
+            let input = format!("before {value} after");
+            for split in input.char_indices().map(|(index, _)| index) {
+                let mut redactor = Redactor::new(vec![key.into()]);
+                let output = redactor.push(&input[..split])
+                    + &redactor.push(&input[split..])
+                    + &redactor.finish();
+                assert_eq!(output, "before [凭证已隐藏] after", "split {split}");
+            }
+        }
     }
 
     #[test]

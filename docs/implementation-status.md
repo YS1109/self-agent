@@ -231,3 +231,10 @@
 协议见 [v9](protocol-v9.md)，冻结门禁与精确提交 CI 见 [命名服务验收](acceptance-providers-v0.8.md)。本切片不是完整 0.8；MCP 环境凭据、真实系统存储授权、GUI 和真实模型尚未验证。QQ / H5 仍独立推进，未部署或发送真实消息。
 
 命名服务隔离冻结验证：core 7、daemon 322、CLI 27、前端 166、Rust 事件桥 7、Web 代理 3 组、15 个后台 smoke，以及格式、全目标 Clippy 和后台 / Web 构建通过；独立审查无剩余具体阻塞。Windows vault 模块交叉检查通过，完整 daemon 交叉构建缺少 MinGW；实际三平台 CI 按新提交单独记录。真实系统凭据、GUI 和真实模型未运行。
+
+
+## 0.8 MCP 环境凭据补齐切片
+
+独立 MCP 槽声明、scope-bound vault 意图与清理、任务固定私有引用、每槽一次读取及实际 stdio 环境注入已接线；没有继承 Provider 密钥或宿主环境。UI / HTTP / CLI 使用一次性提交和只读恢复，未知历史与 cleanup 状态分开。轮换/改配置使工具目录失效，须重新显式发现。已知秘密在 Native/MCP 模型上下文、工具输出、事件、报告与 JSON 文本中统一处理，解析和匹配资源有界。
+
+命名 Provider 的 `675c326d` 已通过精确 push / PR 两轮各六项 CI；本 MCP 凭据切片的冻结与平台结果单独记录于 [验收](acceptance-mcp-credentials-v0.8.md)，不沿用其 CI。真实 OS vault / MCP / 模型和 GUI 未运行。QQ / H5 与 1.0 可靠性继续独立切片，不声明完整路线图已交付。

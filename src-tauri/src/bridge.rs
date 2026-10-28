@@ -239,7 +239,48 @@ fn provider_mutation(path: &str) -> bool {
     })
 }
 
+fn scoped_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+            }
+        })
+}
+fn mcp_credential_route(method: &str, path: &str) -> bool {
+    if let Some(rest) = path.strip_prefix("/api/v1/capability-credential-operations/") {
+        return (method == "GET" && scoped_uuid(rest))
+            || (method == "POST" && rest.strip_suffix("/cleanup").is_some_and(scoped_uuid));
+    }
+    if method != "POST" {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix("/api/v1/capabilities/mcp/") else {
+        return false;
+    };
+    let Some((id, slot)) = rest.split_once("/credentials/") else {
+        return false;
+    };
+    let slot = slot.strip_suffix("/delete").unwrap_or(slot);
+    scoped_uuid(id)
+        && !slot.is_empty()
+        && slot.len() <= 64
+        && slot.as_bytes()[0].is_ascii_uppercase()
+        && slot
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
+    if mcp_credential_route(method, path) {
+        return Ok(if method == "GET" {
+            Method::GET
+        } else {
+            Method::POST
+        });
+    }
     if method == "GET"
         && path
             .strip_prefix("/api/v1/credential-operations/")
@@ -415,6 +456,37 @@ mod tests {
             ("POST", "/api/v1/codex/status"),
         ] {
             assert!(validate_route(method, path).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_credential_route_tests {
+    use super::*;
+    #[test]
+    fn scoped_mcp_credentials_routes_only() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let base = format!("/api/v1/capabilities/mcp/{id}/credentials/TOKEN");
+        for path in [
+            &base,
+            &format!("{base}/delete"),
+            &format!("/api/v1/capability-credential-operations/{id}/cleanup"),
+        ] {
+            assert!(validate_route("POST", path).is_ok());
+            assert!(validate_route("GET", path).is_err());
+        }
+        assert!(validate_route(
+            "GET",
+            &format!("/api/v1/capability-credential-operations/{id}")
+        )
+        .is_ok());
+        for path in [
+            format!("{base}?secret=x"),
+            format!("{base}/../PATH"),
+            base.replace("TOKEN", "token"),
+            base.replace(id, "../bad"),
+        ] {
+            assert!(validate_route("POST", &path).is_err());
         }
     }
 }

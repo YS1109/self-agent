@@ -1,6 +1,6 @@
 //! Durable owner-managed metadata and immutable task snapshots. No process is
 //! started here. Skill bodies/catalogs live only in private tables, never in
-//! public tasks, receipts or event payloads. This slice rejects credential refs.
+//! public tasks, receipts or event payloads. Vault bindings are privately scoped.
 use super::*;
 use harness_core::{
     CapabilityReference, ManagedCapabilities, McpServerDefinition, McpServerView,
@@ -250,8 +250,9 @@ fn validate_definition(definition: &McpServerDefinition) -> Result<()> {
     {
         bail!("MCP 参数超出数量或长度限制");
     }
+    super::capability_credentials::canonical_slots(&definition.credential_slots)?;
     if !definition.credential_refs.is_empty() {
-        bail!("当前切片尚未开放 MCP 凭据绑定，请勿改用明文参数");
+        bail!("MCP 私有凭据引用不能通过配置输入；请使用专用凭据槽接口");
     }
     Ok(())
 }
@@ -316,11 +317,18 @@ impl Store {
                     bail!("导入准备数据只能用于技能导入");
                 }
                 validate_definition(&definition)?;
+                definition.credential_slots =
+                    super::capability_credentials::canonical_slots(&definition.credential_slots)?;
                 let mut value = prepare_save(&tx, id, expected_revision, "mcp")?;
                 if definition.enabled != value["enabled"].as_bool().unwrap_or(false) {
                     bail!("启用状态只能通过独立启用指令修改，新配置默认禁用");
                 }
                 definition.enabled = value["enabled"].as_bool().unwrap_or(false);
+                super::capability_credentials::detach_mcp_credentials(
+                    &tx,
+                    &value,
+                    Some(&definition),
+                )?;
                 value["definition"] = json!(definition);
                 value["status"] = json!("configured");
                 value["reason"] = Value::Null;
@@ -438,6 +446,9 @@ impl Store {
                 kind(&cap_kind)?;
                 let mut value = active(&tx, &id, &cap_kind)?;
                 check_revision(&value, expected_revision)?;
+                if cap_kind == "mcp" {
+                    super::capability_credentials::detach_mcp_credentials(&tx, &value, None)?;
+                }
                 // Retain only a tombstone; a UUID can never acquire new authority.
                 value = json!({"id":id,"kind":cap_kind,"revision":value["revision"],"deleted":true,"enabled":false});
                 value
@@ -471,7 +482,8 @@ impl Store {
                     program: definition.program,
                     args: definition.args,
                     protocol: definition.protocol,
-                    credential_slots: definition.credential_refs.into_keys().collect(),
+                    credential_slots: definition.credential_slots,
+                    credential_states: self.mcp_credential_states(text(&value, "id")?)?,
                     status: text(&value, "status")?.into(),
                     reason: value["reason"].as_str().map(str::to_owned),
                     catalog_digest: value["catalog_digest"].as_str().map(str::to_owned),
@@ -491,6 +503,7 @@ impl Store {
                 });
             }
         }
+        result.credential_operations = self.mcp_credential_operations()?;
         Ok(result)
     }
     pub(crate) fn claim_pending_probe(
@@ -813,6 +826,12 @@ pub(super) fn snapshot_task_capabilities(db: &Connection, task: &mut Value) -> R
             name: text(&value["definition"], "name")?.into(),
             digest: text(&value, "catalog_digest")?.into(),
         };
+        super::capability_credentials::snapshot_task_mcp_credentials(
+            db,
+            text(task, "id")?,
+            &reference.id,
+            reference.revision,
+        )?;
         servers.push(json!({"reference":reference,"definition":value["definition"],"catalog":value["catalog"]}));
         refs.mcp_servers.push(reference);
     }

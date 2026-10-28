@@ -17,6 +17,8 @@ pub(crate) struct RunControl {
     pub controls: TaskControls,
     executor: String,
     started: Instant,
+    capability_credentials:
+        tokio::sync::OnceCell<crate::capabilities::credentials::ResolvedTaskCredentials>,
 }
 
 impl RunControl {
@@ -28,7 +30,37 @@ impl RunControl {
             controls,
             executor: executor.into(),
             started: Instant::now(),
+            capability_credentials: tokio::sync::OnceCell::new(),
         })
+    }
+
+    pub(crate) async fn prepare_capability_credentials(&self) -> Result<Vec<String>> {
+        self.check()?;
+        let resolved = self
+            .capability_credentials
+            .get_or_try_init(|| {
+                crate::capabilities::credentials::task(
+                    &self.state,
+                    &self.task_id,
+                    self.deadline(),
+                    || self.stopped(),
+                )
+            })
+            .await?;
+        self.check()?;
+        Ok(resolved.secrets())
+    }
+
+    pub(crate) fn capability_environment(
+        &self,
+        id: &str,
+        revision: u64,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        self.check()?;
+        self.capability_credentials
+            .get()
+            .context("MCP 私有凭据尚未解析；未启动服务")?
+            .environment(id, revision)
     }
 
     pub fn stop(&self, code: &str) {
@@ -80,6 +112,13 @@ impl RunControl {
                 .lock()
                 .unwrap()
                 .check_task_capabilities(&self.task_id)
+                .is_err()
+            || self
+                .state
+                .store
+                .lock()
+                .unwrap()
+                .check_task_mcp_credentials(&self.task_id)
                 .is_err()
         {
             self.stop("capability_revoked");

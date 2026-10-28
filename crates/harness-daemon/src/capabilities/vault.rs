@@ -91,7 +91,6 @@ impl VaultBinding {
     /// including executable, args, protocol, cwd and environment variable names
     /// (computed by caller). Exclude secret values and credential-reference IDs
     /// from that fingerprint, otherwise reference creation would be circular.
-    #[cfg(test)]
     pub(crate) fn capability(
         owner: &str,
         purpose: &str,
@@ -178,7 +177,6 @@ impl FreshCredential {
 fn canonical_uuid(value: &str) -> bool {
     value.len() == 36 && Uuid::parse_str(value).is_ok_and(|id| id.hyphenated().to_string() == value)
 }
-#[cfg(test)]
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value

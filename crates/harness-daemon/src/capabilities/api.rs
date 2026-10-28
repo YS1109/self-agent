@@ -100,7 +100,7 @@ fn read_skill(source: &str) -> Result<PreparedSkillImport> {
     })
 }
 
-async fn probe(state: Arc<AppState>, id: String, revision: u64, secrets: Vec<String>) {
+async fn probe(state: Arc<AppState>, id: String, revision: u64, mut secrets: Vec<String>) {
     let work = match state
         .store
         .lock()
@@ -131,7 +131,21 @@ async fn probe(state: Arc<AppState>, id: String, revision: u64, secrets: Vec<Str
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(25),
             cancelled: &cancelled,
         };
-        let config = runtime::config(&work.definition);
+        let private =
+            super::credentials::probe(&state, &id, revision, scope.deadline, &cancelled).await;
+        let config = match private {
+            Ok(private) => {
+                secrets.extend(private.secrets());
+                if runtime::has_secret(&serde_json::json!(work.definition), &secrets) {
+                    Err(anyhow::anyhow!("MCP 配置包含已知凭据"))
+                } else {
+                    private.check(&state).and_then(|()| {
+                        runtime::config_with_environment(&work.definition, private.environment())
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        };
         match config {
             Err(_) => Err("unavailable"),
             Ok(config) => match mcp::McpSession::open(&config, &state.capability_probe_root, scope)

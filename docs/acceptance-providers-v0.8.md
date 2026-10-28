@@ -32,3 +32,8 @@
 - Web 构建保留 Tauri 混合导入及主 JS 约 540 KiB 分块建议警告，退出成功；没有将警告隐瞒为无警告。
 
 远端 commit / tree 与该精确提交 CI 在发布后分别核验；此前提交的 CI 不挪作本切片通过证据。
+
+
+## 精确提交 CI
+
+`675c326d46c8fce6cb5f5c333d7b7cbb5a01131a`（tree `da0cd347186a8e921a679408916c3f62b45aac80`）已通过 [push](https://github.com/YS1109/self-agent/actions/runs/40771665493) 和 [PR](https://github.com/YS1109/self-agent/actions/runs/40771672539) 两轮各 **6/6** 三平台 Rust / Desktop 检查。两轮 Windows daemon **271/271**、macOS **322/322**，全部 backend smoke 通过。此处是对应提交实际平台结果；仍未调用真实 OS vault 或真实模型，不代替后续 MCP env / QQ 切片验证。

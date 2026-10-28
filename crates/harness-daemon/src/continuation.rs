@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 // Bump when effective tool/approval policy changes; cache reuse never grants authority.
-const CONTINUATION_POLICY_REVISION: &str = "v0.8-managed-capabilities-1";
+const CONTINUATION_POLICY_REVISION: &str = "v0.8-managed-capability-credentials-1";
 
 pub(crate) fn fingerprint(value: &Value) -> String {
     format!(
@@ -22,7 +22,8 @@ pub(crate) struct NativeSummary {
 }
 
 pub(crate) fn known_secrets(settings: &crate::Settings) -> Vec<String> {
-    let mut secrets = vec![settings.api_key.clone()];
+    let mut secrets = settings.redaction_secrets.clone();
+    secrets.push(settings.api_key.clone());
     for value in settings.provider_headers.values() {
         if let Ok(value) = value.to_str() {
             secrets.push(value.to_owned());

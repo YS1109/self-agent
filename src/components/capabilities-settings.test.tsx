@@ -30,12 +30,12 @@ describe("能力表单与安全边界", () => {
     expect(html).toMatch(/<button[^>]*disabled[^>]*>确认启动并发现工具<\/button>/);
     expect(html).toMatch(/<button[^>]*disabled[^>]*>删除配置<\/button>/);
   });
-  it("发现就绪也不声称真实工具使用；发现中和已绑定凭据配置不能重复启动/覆盖", () => {
+  it("发现就绪不声称真实工具使用；发现中不能重复启动，编辑警告解绑", () => {
     const onSubmit = vi.fn();
     const ready = renderToStaticMarkup(<McpServerCard server={{ ...registry.mcp_servers[0], status: "ready", tool_count: 2, catalog_digest: "b".repeat(64) }} disabled={false} onSubmit={onSubmit} />);
     expect(ready).toContain("工具目录就绪 · 未证明实际调用"); expect(ready).toContain("这不证明任一工具已被任务调用");
     const checking = renderToStaticMarkup(<McpServerCard server={{ ...registry.mcp_servers[0], status: "checking", credential_slots: ["AUTH_TOKEN"] }} disabled={false} onSubmit={onSubmit} />);
-    expect(checking).toContain("当前表单不支持编辑"); expect(checking).toContain("正在发现工具目录…"); expect(checking).not.toContain('aria-label="MCP 程序绝对路径"');
+    expect(checking).toContain("解除所有旧凭据绑定"); expect(checking).toContain("正在发现工具目录…"); expect(checking).toMatch(/aria-label="MCP 程序绝对路径"[^>]*disabled/);
   });
   it("技能展示来源与摘要，替换无正文必须由用户补齐，不自动运行脚本", () => {
     const html = renderToStaticMarkup(<SkillCard skill={registry.skills[0]} disabled={false} onSubmit={vi.fn()} />);

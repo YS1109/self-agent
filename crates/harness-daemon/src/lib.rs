@@ -79,6 +79,8 @@ pub struct Settings {
     pub api_key: String,
     #[serde(skip)]
     pub provider_headers: reqwest::header::HeaderMap,
+    #[serde(skip)]
+    pub(crate) redaction_secrets: Vec<String>,
 }
 
 impl Default for Settings {
@@ -99,6 +101,7 @@ impl Default for Settings {
             codex_binary: default_codex_binary(),
             api_key: std::env::var("HARNESS_API_KEY").unwrap_or_default(),
             provider_headers: reqwest::header::HeaderMap::new(),
+            redaction_secrets: Vec::new(),
         }
     }
 }
@@ -143,16 +146,7 @@ impl Settings {
     }
 
     fn redact(&self, text: &str) -> String {
-        let mut text = redact_secret(text, &self.api_key);
-        for value in self.provider_headers.values() {
-            if let Ok(value) = value.to_str() {
-                text = redact_secret(&text, value);
-                if let Some(secret) = value.strip_prefix("Bearer ") {
-                    text = redact_secret(&text, secret);
-                }
-            }
-        }
-        text
+        provider::redact_known(text, &continuation::known_secrets(self))
     }
 
     fn public(&self) -> Value {
@@ -258,6 +252,7 @@ impl AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     let private = Router::new()
         .route("/api/v1/snapshot", get(snapshot))
+        .merge(capabilities::credential_api::routes())
         .route(
             "/api/v1/credential-operations/{id}",
             get(capabilities::provider_api::operation),
@@ -861,7 +856,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                     return;
                 }
             };
-        let settings = match capabilities::provider_runtime::task_settings(
+        let mut settings = match capabilities::provider_runtime::task_settings(
             &state,
             &task_id,
             &settings,
@@ -876,6 +871,13 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 return;
             }
         };
+        match control.prepare_capability_credentials().await {
+            Ok(secrets) => settings.redaction_secrets.extend(secrets),
+            Err(error) => {
+                finish(&state, &task_id, Err(error));
+                return;
+            }
+        }
         let context = match task.get("context_config").filter(|value| !value.is_null()) {
             Some(value) => serde_json::from_value::<ModelContextConfig>(value.clone())
                 .map_err(anyhow::Error::from),
