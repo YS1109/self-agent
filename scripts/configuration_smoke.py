@@ -2,6 +2,7 @@
 """Verify local provider reuse, real request paths and restart without cloud access."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -118,7 +119,7 @@ x-actor = "fixture-actor-token"
                 daemon.start()
                 assert daemon.request("GET", "/api/v1/settings")["configured"]
                 assert daemon.request("POST", "/api/v1/settings/check", {})["ok"]
-                with sqlite3.connect(root / "harness.sqlite") as db:
+                with closing(sqlite3.connect(root / "harness.sqlite")) as db:
                     saved = db.execute("SELECT body FROM settings WHERE id='provider'").fetchone()[0]
                 assert json.loads(saved)["provider_source"] == "local_codex"
                 assert "fixture-provider-token" not in saved and "fixture-actor-token" not in saved
