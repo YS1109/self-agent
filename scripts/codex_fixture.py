@@ -334,6 +334,19 @@ if mode == "evidence-wrong-turn":
             },
         }
     )
+elif mode in ("evidence-orphan", "evidence-redacted-id-collision"):
+    # Evidence without a corresponding accepted tool result must never borrow
+    # another command's public-output reservation.
+    if mode == "evidence-redacted-id-collision":
+        event("item/completed", {"item": {**command,
+            "id": "private-fixture-config-value", "command": "first-fixture",
+            "aggregatedOutput": "FIRST"}})
+    event("item/completed", {"item": {**command,
+        "id": "[凭证已隐藏]" if mode == "evidence-redacted-id-collision" else "x" * 257,
+        "command": "orphan-fixture", "aggregatedOutput": "ORPHAN" * 100}})
+    event("item/completed", {"item": {**command,
+        "id": "no-exit-code", "command": "second-fixture",
+        "exitCode": None, "aggregatedOutput": "SECOND" * 100}})
 elif mode == "evidence-many":
     for number in range(70):
         event(

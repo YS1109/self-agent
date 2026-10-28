@@ -780,9 +780,12 @@ async fn protocol(
                     let item = &params["item"];
                     emit_answer_item(item, &mut assistant_items, &mut text_redactor, events)?;
                     capture_answer(item, &mut answer)?;
-                    capture_evidence(item, &mut command_ids, &credentials, evidence);
                     if let Some((id, name)) = stream_events::tool_identity(item, &credentials) {
                         if tool_finished.insert(id.clone()) {
+                            // Evidence and its accepted tool result must be adjacent.
+                            // Invalid or redaction-colliding IDs cannot leave orphan
+                            // evidence to borrow a different result's output budget.
+                            capture_evidence(item, &mut command_ids, &credentials, evidence);
                             events(stream_events::tool_result(item, id, name, &credentials))?;
                         }
                     }
