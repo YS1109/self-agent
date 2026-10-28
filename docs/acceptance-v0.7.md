@@ -28,3 +28,7 @@
 新增 smoke：`steering_smoke.py`、`changes_smoke.py`；保留原八组及 streaming/continuation/web_stream。Codex 可执行夹具只在 Unix 运行，Windows 明确跳过并继续 Native 回归。第三切片冻结本地门禁：core 5、daemon 185、CLI 19、前端 104、同文件 Rust 事件桥无头测试 7 项；格式、全目标 Clippy、daemon/CLI/Web 构建通过。十二个后台 smoke 脚本全部通过，其中 streaming 8、continuation 8、steering 10、changes 7 组；HTTP 代理另有 3 组。对应提交三平台 CI 待运行，不能用上一切片成功代替。
 
 已修复的本地门禁失败：取消夹具过早观察服务端标记，尚不能证明客户端取得 turn ID；改为同步实际客户端 ACK 进度后完整重跑通过。仍未运行/未验证：真实模型、当前版本原生 GUI、云端完整 Tauri 构建（缺 GTK/WebKit 开发库）；事件桥无头测试不是完整桌面构建。
+
+## 第三切片跨平台修复
+
+第三切片 `4d77bab2d8f000bde2b4ab8d844c09f5721f881d` 的 push 40743839739 / PR 40743844899 均在 Windows 新 changes smoke 发现夹具换行差异：Python write_text 默认生成 CRLF，而 Native 实际写入 LF，正确的区间 diff 因此包含先前行的换行变化。夹具现显式使用 LF，字节长度与预期跨平台一致；不修改生产 diff，也不隐藏真实换行变化。隔离该提交的独立工作树构建及七组 changes smoke 重跑通过。修复提交三平台 CI 另行跟踪，不能记作已通过。

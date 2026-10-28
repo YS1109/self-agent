@@ -137,22 +137,24 @@ def main():
         project = directory / "project"
         project.mkdir()
         git(project, "init", "--quiet")
-        (project / "tracked.txt").write_text("BASE\n", encoding="utf-8")
+        # Keep fixture bytes identical on Windows: Native writes UTF-8 LF without
+        # text-mode translation, so CRLF here would be a genuine interval change.
+        (project / "tracked.txt").write_text("BASE\n", encoding="utf-8", newline="\n")
         git(project, "add", "tracked.txt")
         git(project, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "--quiet", "-m", "fixture baseline")
-        (project / "tracked.txt").write_text("BASE\nUSER_STAGED\n", encoding="utf-8")
+        (project / "tracked.txt").write_text("BASE\nUSER_STAGED\n", encoding="utf-8", newline="\n")
         git(project, "add", "tracked.txt")
-        (project / "tracked.txt").write_text(USER_CONTENT, encoding="utf-8")
-        (project / "untracked-user.txt").write_text("USER_UNTRACKED_MUST_SURVIVE", encoding="utf-8")
-        (project / "ordinary.txt").write_text("initial " + SECRET, encoding="utf-8")
-        (project / ".env").write_text("HIDDEN_CONTENT_BEFORE", encoding="utf-8")
+        (project / "tracked.txt").write_text(USER_CONTENT, encoding="utf-8", newline="\n")
+        (project / "untracked-user.txt").write_text("USER_UNTRACKED_MUST_SURVIVE", encoding="utf-8", newline="\n")
+        (project / "ordinary.txt").write_text("initial " + SECRET, encoding="utf-8", newline="\n")
+        (project / ".env").write_text("HIDDEN_CONTENT_BEFORE", encoding="utf-8", newline="\n")
         # Git status/refresh could run these repository-controlled filters before
         # tool authorization. Change capture must not launch Git at all.
         filter_markers = []
         attributes = []
         for kind, filename in [("clean", "tracked.txt"), ("process", "process-filter.txt")]:
             if kind == "process":
-                (project / filename).write_text("process fixture", encoding="utf-8")
+                (project / filename).write_text("process fixture", encoding="utf-8", newline="\n")
                 git(project, "add", filename)
             marker = directory / f"{kind}-executed"
             leak = directory / f"{kind}-credential-leak"
@@ -161,8 +163,8 @@ def main():
             git(project, "config", f"filter.hostile-{kind}.required", "true")
             attributes.append(f"{filename} filter=hostile-{kind}")
             filter_markers.extend([marker, leak])
-        (project / ".gitattributes").write_text("\n".join(attributes) + "\n", encoding="utf-8")
-        (project / "process-filter.txt").write_text("changed process fixture", encoding="utf-8")
+        (project / ".gitattributes").write_text("\n".join(attributes) + "\n", encoding="utf-8", newline="\n")
+        (project / "process-filter.txt").write_text("changed process fixture", encoding="utf-8", newline="\n")
         original_index = (project / ".git" / "index").read_bytes()
         daemon = Daemon(directory, {"HARNESS_API_KEY": SECRET})
 
@@ -270,15 +272,15 @@ def main():
             assert non_git_report["files"][0]["path"] == "非仓库.txt"
             print("PASS non-Git workspace reports explicit status and real text changes")
 
-            (project / "queue.txt").write_text("queue original\n", encoding="utf-8")
+            (project / "queue.txt").write_text("queue original\n", encoding="utf-8", newline="\n")
             hold = run(create_session(project, "同项目占用锁"), "HOLD")
             assert Model.hold_started.wait(20), "First task did not acquire project lock"
             waiter = run(create_session(project, "同项目等待锁"), "QUEUED_WRITE")
             wait_for(lambda: task(waiter)["status"] in {"queued", "running"}, description="second project task queued")
             assert not Model.waiter_started.wait(0.3), "Second model ran concurrently in same project"
             assert not task(waiter).get("changes_summary"), "Baseline captured before acquiring project lock"
-            (project / "queue.txt").write_text("changed while waiting\n", encoding="utf-8")
-            (project / "outside-while-waiting.txt").write_text("external user change", encoding="utf-8")
+            (project / "queue.txt").write_text("changed while waiting\n", encoding="utf-8", newline="\n")
+            (project / "outside-while-waiting.txt").write_text("external user change", encoding="utf-8", newline="\n")
             Model.hold_release.set()
             hold_report = wait_report(hold)
             waiter_report = wait_report(waiter)
