@@ -223,7 +223,37 @@ fn task_path(path: &str, suffix: &str) -> bool {
         })
 }
 
+fn provider_mutation(path: &str) -> bool {
+    [
+        ("/api/v1/providers/", "/credential"),
+        ("/api/v1/providers/", "/credential-delete"),
+        ("/api/v1/credential-operations/", "/cleanup"),
+    ]
+    .iter()
+    .any(|(prefix, suffix)| {
+        path.strip_prefix(prefix)
+            .and_then(|part| part.strip_suffix(suffix))
+            .is_some_and(|id| {
+                id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            })
+    })
+}
+
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
+    if method == "GET"
+        && path
+            .strip_prefix("/api/v1/credential-operations/")
+            .is_some_and(|id| {
+                id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            })
+    {
+        return Ok(Method::GET);
+    }
+
+    if method == "POST" && provider_mutation(path) {
+        return Ok(Method::POST);
+    }
+
     if method == "GET" && task_path(path, "/changes") {
         return Ok(Method::GET);
     }
@@ -236,6 +266,7 @@ fn validate_route(method: &str, path: &str) -> Result<Method, String> {
             "/api/v1/snapshot"
             | "/api/v1/settings"
             | "/api/v1/capabilities"
+            | "/api/v1/providers"
             | "/api/v1/codex/status"
             | "/api/v1/provider/local-codex",
         ) => Ok(Method::GET),
@@ -243,6 +274,7 @@ fn validate_route(method: &str, path: &str) -> Result<Method, String> {
             "POST",
             "/api/v1/commands"
             | "/api/v1/capabilities/commands"
+            | "/api/v1/providers/commands"
             | "/api/v1/models"
             | "/api/v1/settings/check",
         ) => Ok(Method::POST),
@@ -336,6 +368,23 @@ mod tests {
     #[test]
     fn bridge_accepts_only_known_method_and_route_pairs() {
         assert!(validate_route("GET", "/api/v1/snapshot").is_ok());
+        let id = "94a846e4-7ac2-46d7-ac1d-fde573fd6e12";
+        assert!(validate_route("GET", "/api/v1/providers").is_ok());
+        assert!(validate_route("POST", "/api/v1/providers/commands").is_ok());
+        for suffix in ["credential", "credential-delete"] {
+            let path = format!("/api/v1/providers/{id}/{suffix}");
+            assert!(validate_route("POST", &path).is_ok());
+            assert!(validate_route("GET", &path).is_err());
+            assert!(validate_route("POST", &format!("{path}?secret=value")).is_err());
+        }
+        assert!(validate_route("GET", &format!("/api/v1/credential-operations/{id}")).is_ok());
+        assert!(validate_route(
+            "POST",
+            &format!("/api/v1/credential-operations/{id}/cleanup")
+        )
+        .is_ok());
+        assert!(validate_route("POST", "/api/v1/providers/../credential").is_err());
+
         assert!(validate_route("GET", "/api/v1/capabilities").is_ok());
         assert!(validate_route("POST", "/api/v1/capabilities/commands").is_ok());
         assert!(validate_route("POST", "/api/v1/tasks/task-123/cleanup-resolution").is_ok());

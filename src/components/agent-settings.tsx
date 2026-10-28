@@ -1,3 +1,5 @@
+import { NamedProviderSelect, RoleProviderModel } from "./providers-settings";
+import type { NamedProvider } from "../providers-client";
 import { ExecutionSettings } from "./execution-settings";
 import { defaultExecutionControls, normalizeExecutionControls, executionControlsError, intersectExecutionControls } from "../execution-controls";
 import { Bot, Plus, Trash2, Users } from "lucide-react";
@@ -32,10 +34,11 @@ export function normalizeSettings(settings: Settings): Settings {
 }
 
 export function AgentSettings({
-  settings, onChange, disabled, nativeModels, codexModels, codexPathChanged, registry,
+  settings, onChange, disabled, nativeModels, codexModels, codexPathChanged, registry, providers = [],
 }: {
   settings: Settings;
   registry?: ManagedCapabilities;
+  providers?: NamedProvider[];
   onChange: (settings: Settings) => void;
   disabled: boolean;
   nativeModels: ModelCatalog;
@@ -73,26 +76,27 @@ export function AgentSettings({
             </div>
             <div className="agent-model-summary"><Bot size={17} /><span>{agentModelLabel(agent)}</span><small>{agent.model ? "固定模型" : "使用默认模型"}</small></div>
             <label>角色名称<input required value={agent.name} placeholder="例如：编码助手、验证助手" onChange={(event) => update(agent.id, { name: event.target.value })} /></label>
-            <ModelSelect key={agent.executor} label={`角色 ${index + 1} · 预设模型`} value={agent.model} onChange={(model) => update(agent.id, { model })}
+            {agent.executor === "native" ? <RoleProviderModel agent={agent} settings={settings} providers={providers} catalog={nativeModels} disabled={disabled} onChange={patch=>update(agent.id,patch)} label={`角色 ${index+1}`} /> : <><NamedProviderSelect providers={providers} value={agent.provider_id} disabled label={`角色 ${index+1} · Native 服务（Codex 不支持）`} inheritLabel="不应用 Native 服务" onChange={()=>{}}/><ModelSelect key={agent.executor} label={`角色 ${index + 1} · 预设模型`} value={agent.model} onChange={(model) => update(agent.id, { model })}
                 catalog={agent.executor === "codex" ? codexModels : nativeModels} disabled={disabled || (agent.executor === "codex" && codexPathChanged)}
                 emptyLabel={agent.executor === "codex" ? "使用 Codex 本机默认模型" : "跟随主智能体模型（不固定）"}
-                hint={agent.executor === "codex" && codexPathChanged ? "CLI 路径已修改，请先保存设置再获取列表。" : undefined} />
-            {agent.executor === "native" && !agent.model && settings.model && <Button type="button" variant="secondary" size="small" disabled={disabled}
+                hint={agent.executor === "codex" && codexPathChanged ? "CLI 路径已修改，请先保存设置再获取列表。" : undefined} /></>}
+            {agent.executor === "native" && !agent.provider_id && settings.provider_source !== "named" && !agent.model && settings.model && <Button type="button" variant="secondary" size="small" disabled={disabled}
               onClick={() => update(agent.id, { model: settings.model })}>固定为当前主模型</Button>}
             <label>执行器
               <Select aria-label={`角色 ${index + 1} · 执行器`} value={agent.executor} disabled={disabled}
                 onValueChange={(value) => update(agent.id, { executor: value as AgentProfile["executor"], model: value === "native" ? settings.model : "" })}
                 options={[{ value: "native", label: "原生工具循环" }, { value: "codex", label: "Codex 本机 CLI" }]} />
             </label>
+            {agent.executor === "codex" && agent.provider_id && <p className="execution-warning">Codex 不支持 Native 命名服务覆盖，请显式移除后保存。<Button type="button" size="small" disabled={disabled} onClick={()=>update(agent.id,{provider_id:null})}>移除 Native 服务覆盖</Button></p>}
             <div className="context-fields">
               <label>上下文窗口覆盖（tokens）
                 <input aria-label={`角色 ${index + 1} · 上下文窗口覆盖`} type="number" min={1024} max={2_000_000} step={1}
-                  placeholder={`继承：${agentModelContext(settings, agent).context_window}`}
+                  placeholder={`继承：${agentModelContext(settings, agent, providers).context_window}`}
                   value={agent.context_window ?? ""} onChange={(event) => update(agent.id, { context_window: event.target.value === "" ? null : Number(event.target.value) })} />
               </label>
               <label>压缩阈值覆盖（%）
                 <input aria-label={`角色 ${index + 1} · 压缩阈值覆盖`} type="number" min={10} max={95} step={1}
-                  placeholder={`继承：${agentModelContext(settings, agent).compression_threshold}%`}
+                  placeholder={`继承：${agentModelContext(settings, agent, providers).compression_threshold}%`}
                   value={agent.compression_threshold ?? ""} onChange={(event) => update(agent.id, { compression_threshold: event.target.value === "" ? null : Number(event.target.value) })} />
               </label>
             </div>

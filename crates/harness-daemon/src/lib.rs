@@ -67,6 +67,8 @@ pub struct Settings {
     pub execution_mode: String,
     #[serde(default = "configuration::default_source")]
     pub provider_source: String,
+    #[serde(default)]
+    pub provider_id: Option<String>,
     #[serde(default = "profiles::default_agents")]
     pub agents: Vec<profiles::AgentProfile>,
     #[serde(default = "profiles::default_agent_id")]
@@ -91,6 +93,7 @@ impl Default for Settings {
             execution_controls: harness_core::TaskControls::default(),
             execution_mode: "native".into(),
             provider_source: configuration::default_source(),
+            provider_id: None,
             agents: profiles::default_agents(),
             default_agent_id: profiles::default_agent_id(),
             codex_binary: default_codex_binary(),
@@ -178,6 +181,7 @@ impl Settings {
             "model_contexts": self.model_contexts,
             "execution_controls": self.execution_controls,
             "provider_source": self.provider_source,
+            "provider_id": self.provider_id,
             "configuration_error": result.as_ref().err().map(ToString::to_string),
             "execution_mode": self.execution_mode, "configured": result.is_ok(),
             "api_key_configured": !effective.api_key.is_empty() || !effective.provider_headers.is_empty(),
@@ -188,6 +192,7 @@ impl Settings {
 }
 
 pub struct AppState {
+    pub(crate) vault: Arc<capabilities::vault::Vault>,
     pub store: Mutex<store::Store>,
     pub settings: RwLock<Settings>,
     pub events: broadcast::Sender<RunEvent>,
@@ -200,6 +205,18 @@ pub struct AppState {
 
 impl AppState {
     pub fn open(path: &std::path::Path, token: String) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_vault(
+            path,
+            token,
+            Arc::new(capabilities::vault::Vault::system(32)?),
+        )
+    }
+
+    pub(crate) fn open_with_vault(
+        path: &std::path::Path,
+        token: String,
+        vault: Arc<capabilities::vault::Vault>,
+    ) -> anyhow::Result<Arc<Self>> {
         let (events, _) = broadcast::channel(256);
         let store = store::Store::open(path)?;
         let settings = store.load_settings()?;
@@ -212,6 +229,7 @@ impl AppState {
         // Reject a preexisting linked probe directory instead of following it.
         project_files::ScopedProject::open(&capability_probe_root)?;
         Ok(Arc::new(Self {
+            vault,
             store: Mutex::new(store),
             settings: RwLock::new(settings),
             events,
@@ -223,6 +241,15 @@ impl AppState {
         }))
     }
 
+    /// Best-effort bounded draining; a blocked OS mutation remains uncertain
+    /// and its durable intent is recovered without replay on the next startup.
+    pub async fn shutdown_credentials(&self) -> bool {
+        self.vault
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .await
+            == capabilities::vault::ShutdownStatus::Stopped
+    }
+
     pub fn publish(&self, event: RunEvent) {
         let _ = self.events.send(event);
     }
@@ -231,6 +258,31 @@ impl AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     let private = Router::new()
         .route("/api/v1/snapshot", get(snapshot))
+        .route(
+            "/api/v1/credential-operations/{id}",
+            get(capabilities::provider_api::operation),
+        )
+        .route(
+            "/api/v1/providers",
+            get(capabilities::provider_api::registry),
+        )
+        .route(
+            "/api/v1/providers/commands",
+            post(capabilities::provider_api::command),
+        )
+        .route(
+            "/api/v1/providers/{id}/credential",
+            post(capabilities::provider_api::set_credential)
+                .layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/api/v1/providers/{id}/credential-delete",
+            post(capabilities::provider_api::delete_credential),
+        )
+        .route(
+            "/api/v1/credential-operations/{id}/cleanup",
+            post(capabilities::provider_api::cleanup),
+        )
         .route("/api/v1/capabilities", get(capabilities::api::registry))
         .route(
             "/api/v1/capabilities/commands",
@@ -322,7 +374,12 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
 }
 
 async fn settings(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(state.settings.read().unwrap().public())
+    {
+        let settings = state.settings.read().unwrap().clone();
+        Json(capabilities::provider_runtime::public_settings(
+            &state, &settings,
+        ))
+    }
 }
 
 async fn codex_status(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -396,7 +453,9 @@ async fn update_settings(
     let updated = patch_settings(&settings, &patch)?;
     state.store.lock().unwrap().save_settings(&updated)?;
     *settings = updated;
-    Ok(Json(settings.public()))
+    Ok(Json(capabilities::provider_runtime::public_settings(
+        &state, &settings,
+    )))
 }
 
 fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings> {
@@ -419,6 +478,19 @@ fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings
                 .trim()
                 .to_string();
         }
+    }
+    if let Some(id) = patch.get("provider_id") {
+        updated.provider_id = if id.is_null() {
+            None
+        } else {
+            let id = id
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("模型服务标识必须是 UUID 或 null"))?;
+            if uuid::Uuid::parse_str(id).is_err() {
+                anyhow::bail!("模型服务标识无效");
+            }
+            Some(id.into())
+        };
     }
     if let Some(agents) = patch.get("agents") {
         let mut agents = agents.clone();
@@ -472,6 +544,21 @@ fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings
                 updated.api_key.clear();
             }
         }
+        "named" => {
+            if updated.provider_id.is_none() {
+                anyhow::bail!("请选择命名模型服务");
+            }
+            if patch.get("api_key").is_some() {
+                anyhow::bail!("命名服务凭据只能通过专用系统凭据接口设置");
+            }
+            updated.api_key.clear();
+            updated.provider_headers.clear();
+            updated.base_url.clear();
+            updated.models_endpoint.clear();
+            if updated.main_executor == "native" {
+                updated.model.clear();
+            }
+        }
         "local_codex" => {
             configuration::resolve(&updated)?;
             updated.api_key.clear();
@@ -516,6 +603,25 @@ async fn check_settings(
 ) -> ApiResult<Json<Value>> {
     let settings = state.settings.read().unwrap().clone();
     let draft = patch_settings(&settings, &patch)?;
+    if draft.provider_source == "named" {
+        let id = draft
+            .provider_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("请选择命名模型服务"))?;
+        let selected = capabilities::provider_runtime::discovery(&state, id, &draft).await?;
+        selected.check(&state)?;
+        let check = configuration::check(&selected.settings);
+        tokio::pin!(check);
+        let result = loop {
+            selected.check(&state)?;
+            tokio::select! {
+                value = &mut check => break value?,
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+            }
+        };
+        selected.check(&state)?;
+        return Ok(Json(result));
+    }
     Ok(Json(configuration::check(&draft).await?))
 }
 
@@ -747,9 +853,24 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         if !agent.model.trim().is_empty() {
             settings.model = agent.model.clone();
         }
-        let settings = match configuration::resolve(&settings) {
+        let control =
+            match execution_control::RunControl::start(state.clone(), &task_id, &agent.executor) {
+                Ok(control) => Arc::new(control),
+                Err(error) => {
+                    finish(&state, &task_id, Err(error));
+                    return;
+                }
+            };
+        let settings = match capabilities::provider_runtime::task_settings(
+            &state,
+            &task_id,
+            &settings,
+            &agent.executor,
+            &control,
+        )
+        .await
+        {
             Ok(settings) => settings,
-            Err(_) if agent.executor == "codex" => settings,
             Err(error) => {
                 finish(&state, &task_id, Err(error));
                 return;
@@ -798,14 +919,6 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 agent.instructions
             )
         };
-        let control =
-            match execution_control::RunControl::start(state.clone(), &task_id, &agent.executor) {
-                Ok(control) => Arc::new(control),
-                Err(error) => {
-                    finish(&state, &task_id, Err(error));
-                    return;
-                }
-            };
         let capability_state = match control.capability_state() {
             Ok(value) => value,
             Err(error) => {
@@ -967,6 +1080,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                             "identity":continuation::native_identity(&settings, &root, &agent, &context)?,
                             "execution_controls":control.controls,
                             "managed_capabilities":task["managed_capabilities"],
+                            "managed_provider":task["managed_provider"],
                         }));
                         let memory = if task["task_kind"] == "main" {
                             state
@@ -1441,6 +1555,24 @@ mod tests {
         };
         assert_eq!(settings.public()["model"], "");
         assert_eq!(settings.public()["main_executor"], "codex");
+    }
+
+    #[test]
+    fn named_native_service_does_not_replace_codex_model_selection() {
+        let state = AppState::open(std::path::Path::new(":memory:"), "test".into()).unwrap();
+        let receipt=state.store.lock().unwrap().provider_command(&json!({"id":new_id(),"command":{"type":"save_provider","definition":{"name":"fixture","base_url":"https://example.invalid/v1","model":"native-default"}}}),&[]).unwrap();
+        let settings=patch_settings(&Settings::default(),&json!({"provider_source":"named","provider_id":receipt["provider_id"],"main_executor":"codex","model":"codex-explicit"})).unwrap();
+        assert_eq!(settings.model, "codex-explicit");
+        assert_eq!(
+            capabilities::provider_runtime::public_settings(&state, &settings)["model"],
+            "codex-explicit"
+        );
+        let native = patch_settings(&settings, &json!({"main_executor":"native"})).unwrap();
+        assert!(native.model.is_empty());
+        assert_eq!(
+            capabilities::provider_runtime::public_settings(&state, &native)["model"],
+            "native-default"
+        );
     }
 
     #[tokio::test]

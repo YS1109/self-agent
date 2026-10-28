@@ -42,3 +42,10 @@
 `c8780b9137aa5f95119fa48e15c2c984d0befd3c` 的 push/PR 两轮 Windows Rust 均观察到 **220 通过、1 失败**：固定根路径仍可被 rename。其余 Windows Job、取消/背压、双协议、环境、junction 拒绝等实际夹具通过，不能因此忽略失败项。根因是仅请求 `FILE_READ_ATTRIBUTES` 的句柄不建立预期的读访问共享约束。
 
 修复将路径锁句柄访问改为 `GENERIC_READ`，仍不允许 share-delete/share-write，保留原失败断言和 nofollow/句柄生命周期；权限不足会安全拒绝，而不是放松检查。该两处源码 hunk 经独立静态复审，隔离 Linux MCP 10 项、Windows target 全目标 Clippy、格式检查通过。修复提交的实际 Windows CI 在发布后单独跟踪，不能把交叉编译当成已修复的运行证据。
+
+
+## 精确提交平台收敛
+
+最终修复提交 `7cd1b16c50a75985e4e7428a956da99c33ead0c0`（tree `ccfebdaae4fb58269ad3b5774b5b0ad323ca2221`）已通过 [push CI](https://github.com/YS1109/self-agent/actions/runs/40766271204) 与 [PR CI](https://github.com/YS1109/self-agent/actions/runs/40766281131)，两轮各 **6/6** 三平台 Rust / Desktop 检查成功。Windows daemon **221/221**、macOS **272/272**，全部 15 个后台 smoke 通过；目录锁的原始 rename 断言未弱化。
+
+中间提交 `a9a64075607bab751a388d892291d63d03714594` 的目录锁测试已通过，但 Windows smoke 的 SQLite 句柄关闭与 macOS Python 启动夹具仍失败。最终仅修复测试路径解析、启动等待和数据库 context manager 显式关闭；实际工具调用超时/取消断言及生产语义未更改，父级独立复审通过。首次失败与中间失败不记作成功；最终 CI 也不替代后续命名服务切片验证。

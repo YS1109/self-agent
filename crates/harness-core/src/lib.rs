@@ -1,5 +1,7 @@
 //! Shared records exchanged by the daemon, desktop bridge, and channel adapters.
 
+mod providers;
+pub use providers::*;
 mod capabilities;
 pub use capabilities::*;
 mod execution;
@@ -85,6 +87,8 @@ pub struct AgentProfile {
     pub executor: String,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_threshold: Option<u8>,
@@ -100,6 +104,7 @@ impl Default for AgentProfile {
             instructions: "根据任务目标检查项目、实施修改并验证结果；如实说明证据和限制。".into(),
             executor: "native".into(),
             model: String::new(),
+            provider_id: None,
             context_window: None,
             compression_threshold: None,
             controls: None,
@@ -185,6 +190,8 @@ pub struct TaskRun {
     pub question_answers: Vec<serde_json::Value>,
     #[serde(default)]
     pub managed_capabilities: TaskCapabilities,
+    #[serde(default)]
+    pub managed_provider: Option<ProviderReference>,
     #[serde(default)]
     pub capability_calls: Vec<CapabilityCallRecord>,
 }

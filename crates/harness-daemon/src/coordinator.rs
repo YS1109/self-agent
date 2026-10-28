@@ -50,14 +50,27 @@ pub fn spawn(state: Arc<AppState>) {
                     let settings = state.settings.read().unwrap().clone();
                     let result = match context {
                         Ok(context) => {
-                            let request = execute(&settings, &job, &context);
+                            let request = async {
+                                let effective = if job["execution_mode"] == "demo" {
+                                    settings.clone()
+                                } else {
+                                    crate::capabilities::provider_runtime::coordinator_settings(
+                                        &state, &job_id, &settings,
+                                    )
+                                    .await?
+                                };
+                                execute(&effective, &job, &context).await
+                            };
                             tokio::pin!(request);
                             loop {
                                 tokio::select! {
                                     result = &mut request => break result,
                                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                                        let active = state.store.lock().unwrap()
-                                            .coordinator_job_active(&job_id).unwrap_or(false);
+                                        let active = {
+                                            let store=state.store.lock().unwrap();
+                                            store.coordinator_job_active(&job_id).unwrap_or(false)
+                                                && store.check_coordinator_provider(&job_id).is_ok()
+                                        };
                                         if !active {
                                             break Err(anyhow::anyhow!("主 Agent 作业已取消或过期"));
                                         }
@@ -110,8 +123,11 @@ async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Va
         return Ok(demo(kind, context));
     }
     let settings = crate::configuration::resolve(settings)?;
-    let context_text = serde_json::to_string(&json!({"job":job,"context":context}))
-        .context("无法编码主 Agent 会话上下文")?;
+    let context_text = serde_json::to_string(&crate::provider::redact_value(
+        &settings,
+        &json!({"job":job,"context":context}),
+    ))
+    .context("无法编码主 Agent 会话上下文")?;
     if context_text.len() > MAX_CONTEXT_BYTES {
         bail!("会话上下文超过主 Agent 的 512 KiB 预算，请缩小目标或新建会话");
     }
@@ -157,17 +173,8 @@ async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Va
         }
         let body: Value = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("主 Agent 模型服务返回了无效 JSON"))?;
-        let mut parsed = parse_response(kind, &body)?;
-        redact(&mut parsed, &settings.api_key);
-        for value in settings.provider_headers.values() {
-            if let Ok(value) = value.to_str() {
-                redact(&mut parsed, value);
-                if let Some(secret) = value.strip_prefix("Bearer ") {
-                    redact(&mut parsed, secret);
-                }
-            }
-        }
-        Ok(parsed)
+        let parsed = parse_response(kind, &body)?;
+        Ok(crate::provider::redact_value(&settings, &parsed))
     })
     .await
     .map_err(|_| anyhow::anyhow!("主 Agent 模型请求超过 120 秒，请重试或调整模型服务"))?
@@ -293,6 +300,7 @@ fn required_text(value: &Value, field: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn redact(value: &mut Value, secret: &str) {
     if secret.is_empty() {
         return;
@@ -497,5 +505,41 @@ mod tests {
         .to_string();
         assert!(error.contains("512 KiB"));
         assert!(!error.contains("secret-credential"));
+    }
+    #[tokio::test]
+    async fn coordinator_redacts_semantic_context_before_json_escaping() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        let secret = "coordinator\"\\private-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app=Router::new().route("/chat/completions",post(move |headers:HeaderMap,Json(body):Json<Value>| async move {
+            assert_eq!(headers["authorization"],format!("Bearer {secret}"));
+            let context=body["messages"][1]["content"].as_str().unwrap();
+            let value:Value=serde_json::from_str(context).unwrap();
+            assert_eq!(value["job"]["content"],"[凭证已隐藏]");
+            assert_eq!(value["context"]["messages"][0]["content"],"[凭证已隐藏]");
+            assert!(!value["context"].as_object().unwrap().contains_key(secret));
+            Json(json!({"choices":[{"message":{"content":json!({"action":"reply","message":secret}).to_string()}}]}))
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let settings = Settings {
+            base_url: base,
+            model: "fixture".into(),
+            api_key: secret.into(),
+            provider_source: "manual".into(),
+            ..Settings::default()
+        };
+        let reply = execute(
+            &settings,
+            &json!({"kind":"message","content":secret}),
+            &json!({secret:"hidden key","messages":[{"role":"user","content":secret}]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["message"], "[凭证已隐藏]");
+        server.abort();
+        let _ = server.await;
     }
 }

@@ -115,4 +115,24 @@ describe("development proxy boundary", () => {
       expect(allowDevelopmentProxy("POST",path,undefined,"same-origin","application/json")).toBe(false);
   });
 
+  it("命名凭据只接受准确UUID和同源JSON POST，拒绝查询参数与路径绕过",()=>{
+    const id="00000000-0000-0000-0000-000000000001";
+    expect(allowDevelopmentProxy("GET","/api/v1/providers",undefined,"same-origin",undefined)).toBe(true);
+    for(const path of ["/api/v1/providers/commands",`/api/v1/providers/${id}/credential`,`/api/v1/providers/${id}/credential-delete`,`/api/v1/credential-operations/${id}/cleanup`]){
+      expect(allowDevelopmentProxy("POST",path,undefined,"same-origin","application/json")).toBe(true);
+      expect(allowDevelopmentProxy("GET",path,undefined,"same-origin",undefined)).toBe(false);
+      expect(allowDevelopmentProxy("POST",path,"https://outside.invalid","cross-site","application/json")).toBe(false);
+      expect(allowDevelopmentProxy("POST",path+"?secret=x",undefined,"same-origin","application/json")).toBe(false);
+    }
+    expect(allowDevelopmentProxy("POST","/api/v1/providers/../credential",undefined,"same-origin","application/json")).toBe(false);
+  });
+
+});
+
+// Single-operation recovery is read-only and cannot include secret/query data.
+it("allows only exact read-only credential operation recovery",()=> {
+ const path="/api/v1/credential-operations/94a846e4-7ac2-46d7-ac1d-fde573fd6e12";
+ expect(allowDevelopmentProxy("GET",path,undefined,undefined,undefined)).toBe(true);
+ expect(allowDevelopmentProxy("POST",path,undefined,undefined,"application/json")).toBe(false);
+ expect(allowDevelopmentProxy("GET",path+"?secret=x",undefined,undefined,undefined)).toBe(false);
 });

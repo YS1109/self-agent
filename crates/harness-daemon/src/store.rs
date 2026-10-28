@@ -16,6 +16,7 @@ mod changes;
 mod continuation;
 mod decisions;
 pub(crate) mod execution;
+pub(crate) mod providers;
 mod steering;
 
 const MAX_NODES: usize = 12;
@@ -56,6 +57,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS execution_requests_task ON execution_requests(task_id);",
         )?;
         capabilities::migrate(&db)?;
+        providers::migrate(&db)?;
         // One atomic migration preserves legacy UUIDs and insertion order. An
         // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
         let has_sequence = db
@@ -126,6 +128,7 @@ impl Store {
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
         capabilities::recover(&tx)?;
+        providers::recover(&tx)?;
         decisions::recover_pending(&tx)?;
         execution::recover_execution_cleanup(&tx)?;
         changes::recover_changes(&tx)?;
@@ -229,6 +232,7 @@ impl Store {
             "event_cursor":event_cursor,
             "context_states":self.public_context_states()?,
             "managed_capabilities":self.capabilities_registry()?,
+            "named_providers":self.named_providers()?,
             "execution_requests":rows(&self.db,"execution_requests")?,
             "plan_changes":rows(&self.db,"plan_changes")?,
             "deliveries":rows(&self.db,"deliveries")?, "selections":rows(&self.db,"selections")?,
@@ -431,13 +435,16 @@ impl Store {
                 let mut session = record(&tx, "sessions", &id)?;
                 append_message(&mut session, "user", content, None)?;
                 let job_id = new_id();
-                let needs_configuration =
-                    settings.execution_mode == "native" && !settings.configured();
-                let agents = snapshot_agents(settings)?;
-                let job = json!({"id":job_id,"kind":"message","session_id":id,"source":source,"content":content,
+                let needs_configuration = settings.execution_mode == "native"
+                    && !providers::metadata_configured(&tx, settings);
+                let agents = snapshot_agents(&tx, settings)?;
+                let mut job = json!({"id":job_id,"kind":"message","session_id":id,"source":source,"content":content,
                     "agents":agents,"default_agent_id":settings.default_agent_id,
                     "execution_mode":settings.execution_mode,"status":if needs_configuration {"failed"} else {"pending"},
                     "created_at":now(),"updated_at":now(),"error":if needs_configuration {Some(CONFIGURATION_HINT)} else {None}});
+                if !needs_configuration {
+                    providers::snapshot_coordinator_provider(&tx, &mut job, settings)?;
+                }
                 put(&tx, "coordinator_jobs", &job)?;
                 if needs_configuration {
                     append_message(&mut session, "assistant", CONFIGURATION_HINT, None)?;
@@ -531,7 +538,7 @@ impl Store {
                 }
                 if settings.execution_mode == "native"
                     && settings.main_executor == "native"
-                    && !settings.configured()
+                    && !providers::metadata_configured(&tx, settings)
                 {
                     bail!(CONFIGURATION_HINT);
                 }
@@ -546,7 +553,7 @@ impl Store {
                     model: String::new(),
                     ..AgentProfile::default()
                 };
-                let (agent, context) = snapshot_agent(settings, main)?;
+                let (agent, context) = snapshot_agent(&tx, settings, main)?;
                 let sequence = rows(&tx, "tasks")?
                     .iter()
                     .filter(|task| task["session_id"] == session_id && task["task_kind"] == "main")
@@ -594,6 +601,7 @@ impl Store {
                 task["context_config"] = json!(context);
                 let task_id = text(&task, "id")?.to_owned();
                 capabilities::snapshot_task_capabilities(&tx, &mut task)?;
+                providers::snapshot_task_provider(&tx, &mut task)?;
                 put(&tx, "tasks", &task)?;
                 let mut session = record(&tx, "sessions", &session_id)?;
                 append_message(&mut session, "user", &content, Some(&task_id))?;
@@ -622,18 +630,11 @@ impl Store {
                 validate_agents(&settings.agents, &settings.default_agent_id)?;
                 let requested = requested_agent(command)?;
                 let agent = resolve_agent(&settings.agents, &settings.default_agent_id, requested)?;
-                let (agent, context) = snapshot_agent(settings, agent)?;
+                let (agent, context) = snapshot_agent(&tx, settings, agent)?;
                 if settings.execution_mode == "native"
                     && agent.executor == "native"
-                    && !(Settings {
-                        model: if agent.model.trim().is_empty() {
-                            settings.model.clone()
-                        } else {
-                            agent.model.clone()
-                        },
-                        ..settings.clone()
-                    })
-                    .configured()
+                    && !providers::effective_settings(&tx, settings, &mut agent.clone())?
+                        .configured()
                 {
                     bail!(CONFIGURATION_HINT);
                 }
@@ -659,6 +660,7 @@ impl Store {
                 task["context_config"] = json!(context);
                 let id = text(&task, "id")?.to_string();
                 capabilities::snapshot_task_capabilities(&tx, &mut task)?;
+                providers::snapshot_task_provider(&tx, &mut task)?;
                 put(&tx, "tasks", &task)?;
                 let mut session = record(&tx, "sessions", &session_id)?;
                 append_message(&mut session, "user", title, Some(&id))?;
@@ -694,7 +696,9 @@ impl Store {
                 {
                     bail!("待生成的计划调整已达到 32 个，请等待或放弃部分建议");
                 }
-                if plan["execution_mode"] == "native" && !settings.configured() {
+                if plan["execution_mode"] == "native"
+                    && !providers::metadata_configured(&tx, settings)
+                {
                     bail!(CONFIGURATION_HINT);
                 }
                 let change_id = new_id();
@@ -709,17 +713,15 @@ impl Store {
                         "status":"queued","nodes":[],"created_at":now(),"updated_at":now()
                     }),
                 )?;
-                put(
-                    &tx,
-                    "coordinator_jobs",
-                    &json!({
-                        "id":job_id,"kind":"change","change_id":change_id,"plan_id":id,
-                        "plan_snapshot":plan,"session_id":plan["session_id"],"source":source,
-                        "content":content,"execution_mode":plan["execution_mode"],
-                        "agents":agents,"default_agent_id":default_id,"status":"pending",
-                        "created_at":now(),"updated_at":now()
-                    }),
-                )?;
+                let mut job = json!({
+                    "id":job_id,"kind":"change","change_id":change_id,"plan_id":id,
+                    "plan_snapshot":plan,"session_id":plan["session_id"],"source":source,
+                    "content":content,"execution_mode":plan["execution_mode"],
+                    "agents":agents,"default_agent_id":default_id,"status":"pending",
+                    "created_at":now(),"updated_at":now()
+                });
+                providers::inherit_coordinator_provider(&tx, &plan, &mut job)?;
+                put(&tx, "coordinator_jobs", &job)?;
                 let mut session = record(&tx, "sessions", text(&plan, "session_id")?)?;
                 append_message(&mut session, "user", content, plan["task_id"].as_str())?;
                 put(&tx, "sessions", &session)?;
@@ -906,7 +908,9 @@ impl Store {
                 let id = text(command, "plan_id")?;
                 let mut plan = record(&tx, "plans", id)?;
                 check_revision(&plan, command)?;
-                if plan["execution_mode"] == "native" && !settings.configured() {
+                if plan["execution_mode"] == "native"
+                    && !providers::metadata_configured(&tx, settings)
+                {
                     bail!(CONFIGURATION_HINT);
                 }
                 match plan["status"].as_str() {
@@ -1301,6 +1305,17 @@ impl Store {
         if job["status"] != "running" {
             return Ok(Vec::new());
         }
+        // Response readiness and a revocation may race on different workers.
+        // Fence the result inside its commit transaction, not just the wait loop.
+        let result = result.and_then(|value| {
+            providers::check_coordinator_provider(&tx, job_id)
+                .map_err(|_| anyhow!("作业固定的模型服务已改变，未应用旧服务返回的结果"))?;
+            if value["action"] == "plan" {
+                providers::validate_plan_role_providers(&tx, &job["agents"])
+                    .map_err(|_| anyhow!("计划角色的模型服务已撤销或不可用，未生成新计划"))?;
+            }
+            Ok(value)
+        });
         if job["kind"] == "change" {
             if !change_target_active(&tx, &job)? {
                 discard_change_job(&tx, &mut job)?;
@@ -1591,9 +1606,12 @@ fn task_plan_dispatchable(db: &Connection, task: &Value) -> Result<bool> {
 }
 
 fn snapshot_agent(
+    db: &Connection,
     settings: &Settings,
     mut agent: AgentProfile,
 ) -> Result<(AgentProfile, ModelContextConfig)> {
+    let effective = providers::effective_settings(db, settings, &mut agent)?;
+    let settings = &effective;
     if agent.model.trim().is_empty() && agent.executor == "native" {
         agent.model = crate::configuration::resolve(settings)
             .map(|resolved| resolved.model)
@@ -1614,12 +1632,12 @@ fn snapshot_agent(
     Ok((agent, context))
 }
 
-fn snapshot_agents(settings: &Settings) -> Result<Vec<AgentProfile>> {
+fn snapshot_agents(db: &Connection, settings: &Settings) -> Result<Vec<AgentProfile>> {
     settings
         .agents
         .iter()
         .cloned()
-        .map(|agent| snapshot_agent(settings, agent).map(|(agent, _)| agent))
+        .map(|agent| snapshot_agent(db, settings, agent).map(|(agent, _)| agent))
         .collect()
 }
 
@@ -2314,7 +2332,22 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                     )?);
                     task["title"] = nodes[index]["title"].clone();
                     task["acceptance_command"] = nodes[index]["acceptance_command"].clone();
-                    capabilities::snapshot_task_capabilities(tx, &mut task)?;
+                    // A revoked downstream selection blocks only that node.
+                    // Do not roll back the preceding task's completed result.
+                    // The savepoint also prevents half-created private snapshots
+                    // when the second authority check fails.
+                    tx.execute_batch("SAVEPOINT plan_task_authority")?;
+                    let authority = providers::inherit_task_provider(tx, &plan, &mut task)
+                        .and_then(|_| capabilities::snapshot_task_capabilities(tx, &mut task));
+                    if authority.is_err() {
+                        tx.execute_batch(
+                            "ROLLBACK TO plan_task_authority; RELEASE plan_task_authority",
+                        )?;
+                        nodes[index]["status"] = json!("blocked");
+                        nodes[index]["error"] = json!("后续任务的模型服务或托管能力已撤销或不可用，未创建执行任务；前置结果已保留。");
+                        continue;
+                    }
+                    tx.execute_batch("RELEASE plan_task_authority")?;
                     put(tx, "tasks", &task)?;
                     nodes[index]["status"] = json!("queued");
                     nodes[index]["task_id"] = task["id"].clone();
@@ -2376,11 +2409,9 @@ fn enqueue_review(tx: &Transaction<'_>, plan: &Value) -> Result<()> {
     }) {
         return Ok(());
     }
-    put(
-        tx,
-        "coordinator_jobs",
-        &json!({"id":new_id(),"kind":"review","session_id":plan["session_id"],"plan_id":plan["id"],"plan_revision":plan["revision"],"source":plan["source"],"execution_mode":plan["execution_mode"],"agents":plan["agents"],"default_agent_id":plan["default_agent_id"],"status":"pending","created_at":now(),"updated_at":now()}),
-    )
+    let mut job = json!({"id":new_id(),"kind":"review","session_id":plan["session_id"],"plan_id":plan["id"],"plan_revision":plan["revision"],"source":plan["source"],"execution_mode":plan["execution_mode"],"agents":plan["agents"],"default_agent_id":plan["default_agent_id"],"status":"pending","created_at":now(),"updated_at":now()});
+    providers::inherit_coordinator_provider(tx, plan, &mut job)?;
+    put(tx, "coordinator_jobs", &job)
 }
 fn review_target_current(db: &Connection, job: &Value) -> Result<bool> {
     let plan = record(db, "plans", text(job, "plan_id")?)?;
@@ -2592,10 +2623,11 @@ fn apply_outcome(
             nodes,
         } => {
             let (agents, default_id) = role_snapshot(job)?;
-            let plan = json!({"id":new_id(),"session_id":job["session_id"],"task_id":null,"title":title,"source":job["source"],
+            let mut plan = json!({"id":new_id(),"session_id":job["session_id"],"task_id":null,"title":title,"source":job["source"],
                 "agents":agents,"default_agent_id":default_id,
                 "execution_mode":job["execution_mode"],"status":"draft","revision":1,"round":0,"max_rounds":MAX_ROUNDS,
                 "created_at":now(),"updated_at":now(),"nodes":nodes,"layout":{},"layout_revision":0});
+            providers::inherit_plan_provider(tx, job, &mut plan)?;
             put(tx, "plans", &plan)?;
             append_plan_message(tx, &plan, &message)?;
             produced.push(plan_event(

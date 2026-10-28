@@ -337,6 +337,10 @@ async fn execute_inner(
         matches!(role, "user" | "assistant").then(|| json!({"role":role,"content":content}))
     }));
     messages.push(json!({"role":"user", "content":objective}));
+    messages = messages
+        .iter()
+        .map(|message| model_message(settings, message))
+        .collect();
     let mut current_goal = messages.len() - 1;
     let mut tools = tools(shell_enabled);
     let managed = runtime.map(RunControl::capability_state).transpose()?;
@@ -401,7 +405,7 @@ async fn execute_inner(
             }
         };
         for input in supplements {
-            messages.push(json!({"role":"user", "content":input.content}));
+            messages.push(json!({"role":"user", "content":redact_all(settings, &input.content)}));
         }
         if turn > 0 || !input_ids.is_empty() {
             if let Err(error) = compact_context(
@@ -475,7 +479,9 @@ async fn execute_inner(
                     .await?;
                     if !verified {
                         control.charge(Charge::RepairAttempt)?;
-                        messages.push(json!({"role":"assistant","content":content}));
+                        messages.push(
+                            json!({"role":"assistant","content":redact_all(settings, content)}),
+                        );
                         messages.push(json!({"role":"user","content":"后台实际运行了固化的验收命令，至少一项失败。请依据以下真实失败证据修复实现，不得修改或跳过验收要求；完成修改后后台会重新运行同一组验收命令。"}));
                         messages.push(
                             json!({"role":"user","content":control.verification_feedback()?}),
@@ -489,7 +495,7 @@ async fn execute_inner(
         if calls.len() > 16 {
             bail!("模型服务超过了每轮 16 次工具调用限制");
         }
-        messages.push(message);
+        messages.push(model_message(settings, &message));
         for call in calls {
             let call_id = call
                 .get("id")
@@ -648,7 +654,7 @@ async fn execute_inner(
                 success,
                 output: visible_output,
             })?;
-            messages.push(json!({"role":"tool","tool_call_id":call_id,"content":serde_json::to_string(&output)?}));
+            messages.push(json!({"role":"tool","tool_call_id":redact_all(settings, call_id),"content":serde_json::to_string(&redact_value(settings, &output))?}));
         }
     }
     if let Some(control) = runtime {
@@ -840,7 +846,7 @@ fn redact_all(settings: &Settings, text: &str) -> String {
     redactor.push(text) + &redactor.finish()
 }
 
-fn redact_value(settings: &Settings, value: &Value) -> Value {
+pub(crate) fn redact_value(settings: &Settings, value: &Value) -> Value {
     match value {
         Value::String(text) => Value::String(redact_all(settings, text)),
         Value::Array(values) => Value::Array(
@@ -857,6 +863,36 @@ fn redact_value(settings: &Settings, value: &Value) -> Value {
         ),
         value => value.clone(),
     }
+}
+
+/// Redact complete semantic strings before embedding JSON tool payloads into
+/// model history. Redacting already-escaped arguments would miss quoted keys.
+fn model_message(settings: &Settings, message: &Value) -> Value {
+    let mut safe = redact_value(settings, message);
+    if let (Some(original), Some(calls)) = (
+        message["tool_calls"].as_array(),
+        safe["tool_calls"].as_array_mut(),
+    ) {
+        for (original, call) in original.iter().zip(calls) {
+            if let Some(arguments) = original
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+            {
+                if let Ok(value) = serde_json::from_str::<Value>(arguments) {
+                    call["function"]["arguments"] =
+                        json!(redact_value(settings, &value).to_string());
+                }
+            }
+        }
+    }
+    if message["role"] == "tool" {
+        if let Some(content) = message["content"].as_str() {
+            if let Ok(value) = serde_json::from_str::<Value>(content) {
+                safe["content"] = json!(redact_value(settings, &value).to_string());
+            }
+        }
+    }
+    safe
 }
 
 struct TextEvents<'a, F> {
@@ -2086,6 +2122,30 @@ mod tests {
         .to_string()
         .contains("请求失败"));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn model_history_redacts_embedded_json_before_escaping() {
+        let secret = "fixture\"\\private-key";
+        let settings = Settings {
+            api_key: secret.into(),
+            ..Settings::default()
+        };
+        let arguments = json!({secret:secret,"nested":[secret]}).to_string();
+        let message = json!({"role":"assistant","content":secret,"tool_calls":[{"id":"one","type":"function","function":{"name":"write_file","arguments":arguments}}]});
+        let safe = model_message(&settings, &message);
+        let parsed: Value = serde_json::from_str(
+            safe["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!parsed.as_object().unwrap().contains_key(secret));
+        assert_eq!(parsed["nested"][0], "[凭证已隐藏]");
+        assert_eq!(safe["content"], "[凭证已隐藏]");
+        let result = model_message(&settings, &json!({"role":"tool","content":arguments}));
+        let parsed: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["nested"][0], "[凭证已隐藏]");
     }
 
     #[test]

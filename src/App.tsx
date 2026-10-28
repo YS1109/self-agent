@@ -1,3 +1,5 @@
+import { EMPTY_PROVIDERS, namedModelRequest } from "./providers-client";
+import { ProvidersSettings } from "./components/providers-settings";
 import {
   useEffect,
   useRef,
@@ -45,7 +47,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, dispatch, capabilityClient } from "./api";
+import { api, dispatch, capabilityClient, providersClient } from "./api";
 import { useDaemonSnapshot } from "./use-daemon-snapshot";
 import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
 import { TaskSupplements, ContinueTask } from "./components/task-controls";
@@ -84,7 +86,7 @@ import {
 } from "./types";
 
 type Panel = "plan" | "changes" | "artifacts" | "task";
-type Modal = "new" | "settings" | "remote" | "capabilities" | null;
+type Modal = "new" | "settings" | "remote" | "capabilities" | "providers" | null;
 const time = (value: string) =>
   new Date(value).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -206,6 +208,7 @@ function EmptyPanel({
 export default function App() {
   const { snapshot, connected, checked, connectionError, eventStatus, refresh } = useDaemonSnapshot();
   const registry = snapshot.managed_capabilities ?? EMPTY_CAPABILITIES;
+  const providers = snapshot.named_providers ?? EMPTY_PROVIDERS;
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState<Modal>(null);
@@ -242,10 +245,8 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [codexStatus, setCodexStatus] = useState("");
   const [checkingCodex, setCheckingCodex] = useState(false);
-  const quickModels = useModelCatalog(settings.main_executor === "codex" ? { executor: "codex" } : {
-    provider_source: settings.provider_source ?? "manual", base_url: settings.base_url, models_endpoint: settings.models_endpoint ?? "",
-  }, connected && (settings.main_executor === "codex" || !!settings.base_url || settings.provider_source === "local_codex"));
-  const nativeModels = useModelCatalog({ provider_source: settingsForm.provider_source ?? "manual", base_url: settingsForm.base_url, models_endpoint: settingsForm.models_endpoint ?? "", ...(apiKey ? { api_key: apiKey } : {}) }, connected && modal === "settings" && (!!settingsForm.base_url || settingsForm.provider_source === "local_codex"));
+  const quickModels = useModelCatalog(settings.main_executor === "codex" ? {executor:"codex"} : namedModelRequest(settings),connected && (settings.main_executor === "codex" || !!settings.base_url || settings.provider_source === "local_codex" || (settings.provider_source === "named" && !!settings.provider_id)));
+  const nativeModels = useModelCatalog(namedModelRequest(settingsForm,apiKey),connected && modal === "settings" && (!!settingsForm.base_url || settingsForm.provider_source === "local_codex" || (settingsForm.provider_source === "named" && !!settingsForm.provider_id)));
   const codexModels = useModelCatalog({ executor: "codex" }, connected && modal === "settings"
     && settingsForm.codex_binary === settings.codex_binary && (settingsForm.main_executor === "codex" || settingsForm.agents.some((agent) => agent.executor === "codex")));
   const [inputModes, setInputModes] = useState<Record<string, "goal" | "change">>({});
@@ -302,12 +303,14 @@ export default function App() {
         .then((value) => setSettings(normalizeSettings(value)))
         .catch(() => {});
   }, [connected]);
+  const previousModal = useRef<Modal>(null);
   useEffect(() => {
-    if (modal === "settings") {
+    if (modal === "settings" && previousModal.current !== "providers") {
       setSettingsForm(settings);
       setApiKey("");
       setCodexStatus("");
     }
+    previousModal.current = modal;
   }, [modal]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -424,6 +427,7 @@ export default function App() {
       const value = await api<Settings>("PUT", "/settings", {
         base_url: settingsForm.base_url,
         provider_source: settingsForm.provider_source ?? "manual",
+        provider_id: settingsForm.provider_id ?? null,
         model: settingsForm.model,
         execution_mode: settingsForm.execution_mode,
         agents: settingsForm.agents,
@@ -433,7 +437,7 @@ export default function App() {
         models_endpoint: settingsForm.models_endpoint ?? "",
         model_contexts: settingsForm.model_contexts ?? {},
         execution_controls: settingsForm.execution_controls ?? defaultExecutionControls(),
-        ...(apiKey ? { api_key: apiKey } : {}),
+        ...(apiKey && settingsForm.provider_source !== "named" ? { api_key: apiKey } : {}),
       });
       setSettings(normalizeSettings(value));
       setApiKey("");
@@ -892,8 +896,8 @@ export default function App() {
                 />
                 <div className="composer-toolbar">
                   <div className="composer-options">
-                    <QuickModelSelect value={settings.model} catalog={quickModels} disabled={busy || !connected}
-                      emptyLabel={settings.main_executor === "codex" ? "Codex 本机默认模型" : "请选择模型"}
+                    <QuickModelSelect value={settings.main_executor !== "codex" && settings.provider_source === "named" ? providers.providers.find(provider=>provider.id===settings.provider_id)?.definition.model ?? "" : settings.model} catalog={quickModels} disabled={busy || !connected || (settings.main_executor !== "codex" && settings.provider_source === "named")}
+                      emptyLabel={settings.main_executor === "codex" ? "Codex 本机默认模型" : settings.provider_source === "named" ? "在命名服务中设置默认模型" : "请选择模型"}
                       onChange={(model) => void selectModel(model)} onSettings={() => setModal("settings")} />
                     <span
                       className={`mode-pill ${settings.execution_mode === "demo" ? "mode-demo" : ""}`}
@@ -1061,6 +1065,7 @@ export default function App() {
                   <TaskUsage taskId={selectedTask.id} events={snapshot.events} />
                   <TaskContext task={selectedTask} events={snapshot.events} />
                   <TaskSupplements task={selectedTask} />
+                  {selectedTask.managed_provider && <section className="task-execution-details"><h4>任务固定模型服务</h4><p>{selectedTask.managed_provider.name} · 修订 {selectedTask.managed_provider.revision}</p><p>模型 {selectedTask.managed_provider.model}</p><p className="help-text">服务选择不证明请求成功；不会因修改配置静默转投其他服务。</p></section>}
                   <TaskExecutionDetails task={selectedTask} onCleanupResolved={() => void refresh()} disabled={busy || !connected} />
                   <ExecutionRequests requests={sessionRequests.filter(request => request.task_id === selectedTask.id)} tasks={[selectedTask]} disabled={busy || !connected} onCommand={command} />
                   {selectedTask.continued_from && <p className="help-text">继续自任务 {selectedTask.continued_from}；这是新的执行，不是原任务重放。</p>}
@@ -1283,12 +1288,12 @@ export default function App() {
               )}
             </button>
           </div>
-          <ProviderSettings settings={settingsForm} saved={settings} onChange={setSettingsForm} apiKey={apiKey}
+          <ProviderSettings providers={providers.providers} onManageProviders={()=>{setApiKey("");setModal("providers");}} settings={settingsForm} saved={settings} onChange={setSettingsForm} apiKey={apiKey}
             onKeyChange={setApiKey} catalog={settingsForm.main_executor === "codex" ? codexModels : nativeModels} disabled={busy || !connected} />
           <ExecutionSettings registry={registry} value={settingsForm.execution_controls ?? defaultExecutionControls()} executor={settingsForm.main_executor ?? "native"} disabled={busy}
             onChange={execution_controls => setSettingsForm(current => ({ ...current, execution_controls }))} />
-          <ModelContextSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy} catalogs={[nativeModels, codexModels]} />
-          <AgentSettings registry={registry} settings={settingsForm} onChange={setSettingsForm} disabled={busy}
+          <ModelContextSettings providers={providers.providers} settings={settingsForm} onChange={setSettingsForm} disabled={busy} catalogs={[nativeModels, codexModels]} />
+          <AgentSettings providers={providers.providers} registry={registry} settings={settingsForm} onChange={setSettingsForm} disabled={busy}
             nativeModels={nativeModels} codexModels={codexModels} codexPathChanged={settingsForm.codex_binary !== settings.codex_binary} />
           <div className="codex-check">
             <Button type="button" size="small" variant="secondary" disabled={busy || checkingCodex || !connected || settingsForm.codex_binary !== settings.codex_binary} onClick={() => void checkCodex()}>
@@ -1315,6 +1320,11 @@ export default function App() {
             </Button>
           </div>
         </form>
+      </ModalFrame>
+
+      <ModalFrame error="" open={modal === "providers"} onClose={()=>setModal("settings")} title="命名服务与系统凭据" description="仅本机所有者管理；关闭页面不撤回已经接受的系统操作。" wide>
+        {modal === "providers" && <ProvidersSettings registry={providers} client={providersClient} disabled={!connected} onRegistryChange={()=>void refresh()}/>}
+        <div className="modal-actions"><Button type="button" variant="secondary" onClick={()=>setModal("settings")}>返回设置（保留元数据草稿）</Button></div>
       </ModalFrame>
 
       <ModalFrame

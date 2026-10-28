@@ -1,3 +1,4 @@
+import { providerUuid, type ProvidersClient } from "./providers-client";
 import type { Command, Receipt, SourceContext } from "./types";
 import type { CapabilityClient } from "./capabilities-client";
 
@@ -43,4 +44,13 @@ export function dispatch(source: SourceContext, command: Command) {
 export const capabilityClient: CapabilityClient = {
   getRegistry: signal => api("GET", "/capabilities", undefined, signal),
   command: (envelope, signal) => api("POST", "/capabilities/commands", envelope, signal),
+};
+
+function providerPath(id:string,suffix:string){if(!providerUuid(id))throw new Error("服务或操作标识无效");return `${suffix.startsWith("operation:")?"/credential-operations":"/providers"}/${id}/${suffix.replace("operation:","")}`;}
+export const providersClient:ProvidersClient={
+ registry:signal=>api("GET","/providers",undefined,signal),
+ command:(envelope,signal)=>api("POST","/providers/commands",envelope,signal),
+ setCredential:(id,body,signal)=>api("POST",providerPath(id,"credential"),body,signal),
+ deleteCredential:(id,body,signal)=>api("POST",providerPath(id,"credential-delete"),body,signal),
+ cleanupCredential:(id,body,signal)=>api("POST",providerPath(id,"operation:cleanup"),body,signal),
 };

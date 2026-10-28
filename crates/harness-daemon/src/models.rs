@@ -14,6 +14,7 @@ pub(crate) struct ModelRequest {
     api_key: Option<String>,
     executor: Option<String>,
     provider_source: Option<String>,
+    provider_id: Option<String>,
 }
 
 pub(crate) fn service_url(value: &str) -> Result<Url> {
@@ -95,6 +96,45 @@ pub(crate) async fn discover(
                 .provider_source
                 .as_deref()
                 .unwrap_or(&settings.provider_source);
+            if source == "named" {
+                if request.api_key.is_some()
+                    || request.base_url.is_some()
+                    || request.models_endpoint.is_some()
+                {
+                    return Err(anyhow::anyhow!("命名服务模型发现不接受地址或凭据覆盖").into());
+                }
+                let id = request
+                    .provider_id
+                    .as_deref()
+                    .or(settings.provider_id.as_deref())
+                    .ok_or_else(|| anyhow::anyhow!("请选择命名模型服务"))?;
+                let selected =
+                    crate::capabilities::provider_runtime::discovery(&state, id, &settings).await?;
+                selected.check(&state)?;
+                let request = fetch_models_with_provider(&selected.settings);
+                tokio::pin!(request);
+                let models = loop {
+                    selected.check(&state)?;
+                    tokio::select! {
+                        result = &mut request => break result?,
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+                    }
+                };
+                selected.check(&state)?;
+                let models: Vec<Value> = models
+                    .into_iter()
+                    .filter(|row| {
+                        row.as_object().is_some_and(|fields| {
+                            fields.values().all(|value| {
+                                value
+                                    .as_str()
+                                    .is_none_or(|text| selected.settings.redact(text) == text)
+                            })
+                        })
+                    })
+                    .collect();
+                return Ok(Json(json!({"models":models})));
+            }
             let provider = match source {
                 "local_codex" => {
                     let models_endpoint = request.models_endpoint.unwrap_or_else(|| {

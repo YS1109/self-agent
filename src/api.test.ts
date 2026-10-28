@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, dispatch, capabilityClient } from "./api";
+import { api, dispatch, capabilityClient, providersClient } from "./api";
 import { cleanupResolutionBody, resolveTaskCleanup } from "./cleanup-resolution";
 import { DESKTOP_SOURCE, REMOTE_SOURCE, sameSource } from "./types";
 
@@ -154,6 +154,16 @@ describe("private daemon transport", () => {
     await expect(resolveTaskCleanup(task,true)).resolves.toEqual({task_id:"t",resolved:true});
     expect(fetcher.mock.calls[0][0]).toBe("/api/v1/tasks/t/cleanup-resolution");expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({expected_updated_at:"stamp",confirm_processes_stopped:true});
     fetcher.mockRejectedValue(new Error("lost"));await expect(resolveTaskCleanup(task,true)).rejects.toThrow("lost");expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("命名凭据只放专用POST body，经Rust桥不回填前端，未知结果不重发",async()=>{
+    vi.stubGlobal("window",{__TAURI_INTERNALS__:{}});const id="00000000-0000-0000-0000-000000000001",operation="00000000-0000-0000-0000-000000000002";
+    invoke.mockResolvedValue({operation:{id:operation,status:"pending"},replayed:false,no_secret_applied:false});
+    await providersClient.setCredential(id,{id:operation,expected_revision:2,secret:"fixture-secret"},new AbortController().signal);
+    expect(invoke).toHaveBeenCalledWith("api_request",{method:"POST",path:`/api/v1/providers/${id}/credential`,body:{id:operation,expected_revision:2,secret:"fixture-secret"}});
+    expect(invoke.mock.calls[0][1].path).not.toContain("secret");invoke.mockRejectedValue(new Error("lost"));
+    await expect(providersClient.deleteCredential(id,{id:operation,expected_revision:2},new AbortController().signal)).rejects.toThrow("lost");expect(invoke).toHaveBeenCalledTimes(2);
+    expect(()=>providersClient.setCredential("../x",{id:operation,expected_revision:2,secret:"fixture-secret"},new AbortController().signal)).toThrow();expect(invoke).toHaveBeenCalledTimes(2);
   });
 
 });

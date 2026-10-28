@@ -1,3 +1,4 @@
+import type { NamedProviders } from "./providers-client";
 import type { CapabilitySelection, ManagedCapabilities } from "./capabilities-client";
 export type { CapabilitySelection, ManagedCapabilities, McpServerView, SkillView } from "./capabilities-client";
 
@@ -146,6 +147,7 @@ export interface CapabilityCallRecord {
   status: string; reason: string | null; created_at: string; updated_at: string;
 }
 export interface TaskRun {
+  managed_provider?: {id:string;revision:number;name:string;model:string} | null;
   managed_capabilities?: TaskCapabilities;
   capability_calls?: CapabilityCallRecord[];
   execution_cleanup_owner_ack?: {expected_updated_at:string;confirmed_at:string;source:"local_owner"} | null;
@@ -183,6 +185,7 @@ export interface TaskRun {
   waiting_request_id?: string | null;
 }
 export interface AgentProfile {
+  provider_id?: string | null;
   id: string;
   name: string;
   instructions: string;
@@ -293,6 +296,7 @@ export interface ContextState {
   updated_at: string;
 }
 export interface Snapshot {
+  named_providers?: NamedProviders;
   managed_capabilities?: ManagedCapabilities;
   execution_requests?: ExecutionRequest[];
   context_states?: ContextState[];
@@ -313,7 +317,8 @@ export interface ModelContextConfig {
 export interface Settings {
   execution_controls?: TaskControls;
   api_key_configured?: boolean;
-  provider_source?: "manual" | "local_codex";
+  provider_source?: "manual" | "local_codex" | "named";
+  provider_id?: string | null;
   configuration_error?: string | null;
   base_url: string;
   model: string;

@@ -85,6 +85,17 @@ impl RunControl {
             self.stop("capability_revoked");
             return true;
         }
+        if self
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .check_task_provider(&self.task_id)
+            .is_err()
+        {
+            self.stop("provider_revoked");
+            return true;
+        }
         if self.started.elapsed()
             >= Duration::from_secs(self.controls.budget.max_runtime_seconds.into())
         {

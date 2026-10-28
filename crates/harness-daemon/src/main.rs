@@ -80,7 +80,10 @@ async fn main() -> Result<()> {
     std::fs::rename(&temporary, &metadata)?;
     spawn_workers(state.clone());
     tracing::info!(base_url=%info.base_url, "本机后台服务已就绪");
-    let result = axum::serve(listener, router(state)).await;
+    let result = axum::serve(listener, router(state.clone())).await;
+    if !state.shutdown_credentials().await {
+        tracing::warn!("凭据工作线程未确认停止；未完成操作将在下次启动保守恢复，不能自动重放");
+    }
     // Do not remove metadata after an abrupt exit; clients verify health and PID.
     result?;
     Ok(())

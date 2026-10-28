@@ -1,3 +1,5 @@
+import { NamedProviderSelect } from "./providers-settings";
+import { namedModelRequest, type NamedProvider } from "../providers-client";
 import { useEffect, useRef, useState } from "react";
 import { Loader2, ShieldCheck } from "lucide-react";
 import { api } from "../api";
@@ -6,24 +8,21 @@ import { ModelSelect, type ModelCatalog } from "./model-select";
 import { Button } from "./ui/button";
 import { Select } from "./ui/select";
 
-export function ProviderSettings({ settings, saved, onChange, apiKey, onKeyChange, catalog, disabled }: {
+export function ProviderSettings({ settings, saved, onChange, apiKey, onKeyChange, catalog, disabled, providers = [], onManageProviders }: {
   settings: Settings; saved: Settings; onChange: (settings: Settings) => void;
+  providers?:NamedProvider[]; onManageProviders?:()=>void;
   apiKey: string; onKeyChange: (key: string) => void; catalog: ModelCatalog; disabled: boolean;
 }) {
+  const named = settings.provider_source === "named";
+  const selectedProvider = providers.find(provider=>provider.id===settings.provider_id);
   const local = settings.provider_source === "local_codex";
   const codex = settings.main_executor === "codex";
   const [sourceError, setSourceError] = useState("");
   const [reading, setReading] = useState(false);
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState<{ key: string; message: string }>();
-  const draft = {
-    provider_source: settings.provider_source ?? "manual",
-    base_url: settings.base_url,
-    models_endpoint: settings.models_endpoint ?? "",
-    model: settings.model,
-    ...(apiKey ? { api_key: apiKey } : {}),
-  };
-  const key = JSON.stringify(draft);
+  const draft = {...namedModelRequest(settings,apiKey),...(named?{}:{model:settings.model})};
+  const key = JSON.stringify({draft,provider_revision:selectedProvider?.revision});
   const currentKey = useRef(key);
   currentKey.current = key;
   const onChangeRef = useRef(onChange);
@@ -75,30 +74,35 @@ export function ProviderSettings({ settings, saved, onChange, apiKey, onKeyChang
       ]} />
     </label>
     <p className="help-text">{codex ? "主智能体通过本机 Codex CLI 直接工作，使用其登录与服务配置。下面的模型服务配置仍供原生子智能体与远程编排使用。" : "主智能体直接调用模型与项目工具，多轮处理会话目标。远程入口可额外派发子智能体。"}</p>
-    <ModelSelect key={settings.main_executor ?? "native"} label="主智能体 · 模型" value={settings.model} catalog={catalog}
+    {named && !codex ? <div className="form-info"><strong>主智能体 · 模型：{selectedProvider?.definition.model||"命名服务尚未设置默认模型"}</strong><p>默认模型来自命名服务修订；请在管理页编辑，不使用旧的全局模型字段覆盖。</p></div> : <ModelSelect key={settings.main_executor ?? "native"} label="主智能体 · 模型" value={settings.model} catalog={catalog}
       disabled={disabled || (!codex && reading) || (codex && settings.codex_binary !== saved.codex_binary)}
       hint={codex && settings.codex_binary !== saved.codex_binary ? "CLI 路径已修改，请先保存设置再获取列表。" : undefined}
-      emptyLabel={codex ? "使用 Codex 本机默认模型" : "请选择模型"}
-      onChange={(model) => onChange({ ...settings, model })} />
+      emptyLabel={codex ? "使用 Codex 本机默认模型" : named ? `使用服务默认模型${selectedProvider?.definition.model?` · ${selectedProvider.definition.model}`:""}` : "请选择模型"}
+      onChange={(model) => onChange({ ...settings, model })} />}
     {codex && !settings.model && <p className="help-text">未指定模型时由 Codex 选择本机默认模型，应用使用 128,000 tokens / 80% 的默认上下文策略。需要按模型设置策略时，请先选择具体模型。</p>}
     <div className="settings-section-heading"><h3>模型服务</h3></div>
     <label>服务配置来源
-      <Select aria-label="服务配置来源" value={settings.provider_source ?? "manual"} disabled={disabled} onValueChange={(value) => {
+      <Select aria-label="服务配置来源" value={settings.provider_source ?? "manual"} disabled={disabled || codex} onValueChange={(value) => {
         onKeyChange("");
         setSourceError("");
-        onChange({ ...settings, provider_source: value as "manual" | "local_codex", base_url: "", models_endpoint: "" });
+        onChange({ ...settings, provider_source: value as Settings["provider_source"], provider_id:null, base_url: "", models_endpoint: "", model:"" });
       }} options={[
-        { value: "manual", label: "手动配置模型服务" },
+        { value: "named", label: "应用管理的命名服务 · 系统凭据存储" },
+        { value: "manual", label: "手动配置模型服务（旧版内存凭据）" },
         { value: "local_codex", label: "复用本机 Codex 服务配置" },
       ]} />
     </label>
+    {named && <><NamedProviderSelect providers={providers} value={settings.provider_id} disabled={disabled||codex} onChange={provider_id=>{onKeyChange("");onChange({...settings,provider_id,model:""});}} label="Native 全局命名服务"/>
+      {selectedProvider && !selectedProvider.enabled && <p className="execution-warning">服务当前停用，不能启动新的 Native 任务；请在管理页显式启用。停用状态不阻止显式模型列表发现。</p>}
+      <p className="help-text">新任务固定所选服务与修订。凭据只在专用管理页设置；绑定存在不代表系统存储可读。Codex 不使用这里的命名服务。</p></>}
+    {onManageProviders&&<Button type="button" size="small" variant="secondary" disabled={disabled} onClick={onManageProviders}>管理命名服务与系统凭据</Button>}
     {local && <div className="form-info"><ShieldCheck size={16} /><p>
       从本机 Codex 的顶层自定义服务配置读取地址、凭据和请求头；重启后自动重新读取，不复制凭据到本应用。
       当前仍使用 Chat Completions，连接检测会验证 JSON 回复。专属登录与配置档案暂不支持。
     </p></div>}
     {reading && <p role="status">正在读取本机服务配置…</p>}
     {sourceError && <p className="codex-check-result" role="alert">{sourceError}</p>}
-    <label>自定义 Endpoint
+    {!named && <><label>自定义 Endpoint
       <input type="url" placeholder="https://api.example.com/v1" value={settings.base_url} readOnly={local}
         onChange={(event) => onChange({ ...settings, base_url: event.target.value })} />
       <small>{local ? "地址由本机 Codex 配置提供，切换为手动配置后可以修改。" : "填写模型服务的 API 基础地址；模型请求使用此地址下的 /chat/completions。"}</small>
@@ -118,9 +122,10 @@ export function ProviderSettings({ settings, saved, onChange, apiKey, onKeyChang
         模型协议为 Chat Completions。
       </p></div>
     </>}
+    </>}
     {saved.configuration_error && <p className="codex-check-result">{codex ? "原生执行与远程编排的模型服务配置不可用" : "当前保存的配置不可用"}：{saved.configuration_error}</p>}
     <div className="codex-check">
-      <Button type="button" size="small" variant="secondary" disabled={disabled || codex || checking || reading || !!sourceError || !settings.model}
+      <Button type="button" size="small" variant="secondary" disabled={disabled || codex || checking || reading || !!sourceError || (!settings.model && !selectedProvider?.definition.model)}
         onClick={() => void check()}>
         {checking ? <Loader2 size={13} className="spin" /> : <ShieldCheck size={13} />}检测模型连接
       </Button>

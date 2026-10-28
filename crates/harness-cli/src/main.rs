@@ -23,6 +23,13 @@ const HELP: &str = r#"Self Agent 命令行客户端
   continue <任务ID> [内容|-]        从终态主任务创建新的继续任务
   changes <任务ID>                  查看只读执行区间改动报告
   requests [任务ID]                 列出持久化问题与逐次授权请求
+  providers [list]                 查看命名服务与系统凭据操作
+  providers save <JSON文件|->       保存服务元数据（不接受密钥）
+  providers enable <ID> <修订> <true|false>  显式启停命名服务
+  providers delete <ID> <修订>      删除服务，遗留凭据需显式清理
+  provider-credential set <ID> <修订> --stdin  仅从标准输入读取新密钥
+  provider-credential delete <ID> <修订>     解绑并删除系统凭据
+  provider-credential cleanup <操作ID>       清理指定遗留凭据
   capabilities                     查看托管 MCP / Skills 配置与发现状态
   resolve-cleanup <任务ID> <JSON文件|-> 本机所有者确认解除未知清理隔离
   capability-command <JSON文件|->   管理能力，幂等ID用--command-id指定
@@ -51,7 +58,10 @@ MCP 配置、启用、发现目录不等于实际调用或任务授权。probe �
 capability-command 不重试POST，也不支持--follow/--wait；用capabilities刷新发现状态。
 resolve-cleanup 须先在操作系统确认进程全部停止并检查改动，JSON包含快照中的
 expected_updated_at 和 confirm_processes_stopped:true；只记录所有者确认，不改写原任务/调用结果。
-输入模型密钥时请使用受保护的JSON文件或标准输入，避免写入命令参数。
+命名服务凭据只接受--stdin，不接受密钥参数或文件；移除单个末尾换行，禁止内部换行。
+凭据POST绝不自动重试；结果未知请用providers只读刷新，新尝试使用新的--command-id。
+no_secret_applied:true表示新输入没有写入，不能当作凭据保存成功。
+旧版临时模型密钥可使用受保护的JSON文件或标准输入，避免写入命令参数。
 "#;
 
 #[derive(Debug)]
@@ -268,8 +278,18 @@ fn command(options: &Options) -> Result<Option<Value>> {
             }
             value
         }
-        "sessions" | "status" | "settings" | "models" | "follow" | "changes" | "requests"
-        | "capabilities" | "capability-command" | "resolve-cleanup" => return Ok(None),
+        "sessions"
+        | "status"
+        | "settings"
+        | "models"
+        | "follow"
+        | "changes"
+        | "requests"
+        | "capabilities"
+        | "capability-command"
+        | "resolve-cleanup"
+        | "providers"
+        | "provider-credential" => return Ok(None),
         _ => bail!("未知命令，使用 --help 查看用法"),
     };
     if let Some(path) = &options.controls {
@@ -366,6 +386,154 @@ fn cleanup_resolution_request(options: &Options) -> Result<Option<(String, Value
         format!("/api/v1/tasks/{id}/cleanup-resolution"),
         body,
     )))
+}
+
+fn provider_uuid(value: &str) -> Result<()> {
+    if value.len() != 36
+        || !value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+    {
+        bail!("服务或操作标识必须为规范UUID");
+    }
+    Ok(())
+}
+
+fn provider_stdin_secret(reader: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(2051)
+        .read_to_end(&mut bytes)
+        .context("无法读取凭据标准输入")?;
+    if bytes.ends_with(b"\n") {
+        bytes.pop();
+        if bytes.ends_with(b"\r") {
+            bytes.pop();
+        }
+    }
+    if bytes.is_empty() || bytes.len() > 2048 || !bytes.iter().all(u8::is_ascii_graphic) {
+        bail!("凭据必须为1至2048字节的可见ASCII字符，不能包含空格或内部换行；内容未回显");
+    }
+    String::from_utf8(bytes).context("凭据格式无效，内容未回显")
+}
+
+fn provider_request(options: &Options) -> Result<Option<(String, String, Option<Value>)>> {
+    if !matches!(
+        options.command.as_str(),
+        "providers" | "provider-credential"
+    ) {
+        return Ok(None);
+    }
+    if options.follow || options.wait.is_some() {
+        bail!("服务管理不支持--follow/--wait；请用providers刷新持久记录");
+    }
+    let args = &options.args;
+    if options.command == "providers" && (args.is_empty() || args.as_slice() == ["list"]) {
+        return Ok(Some(("GET".into(), "/api/v1/providers".into(), None)));
+    }
+    provider_uuid(&options.command_id)?;
+    if options.command == "providers" {
+        let command = match args.first().map(String::as_str) {
+            Some("save") => {
+                arity(options, 2, 2)?;
+                let value: Value = serde_json::from_str(&input(&args[1], true)?)
+                    .context("服务元数据JSON格式无效")?;
+                if value["type"] != "save_provider"
+                    || value.get("secret").is_some()
+                    || value.get("api_key").is_some()
+                    || !value["definition"].as_object().is_some_and(|map| {
+                        map.keys().all(|key| {
+                            matches!(
+                                key.as_str(),
+                                "name"
+                                    | "base_url"
+                                    | "models_endpoint"
+                                    | "model"
+                                    | "allow_insecure_http"
+                            )
+                        })
+                    })
+                {
+                    bail!("仅接受save_provider元数据对象；凭据必须通过provider-credential set --stdin提交");
+                }
+                value
+            }
+            Some("enable" | "delete") => {
+                let enable = args[0] == "enable";
+                arity(
+                    options,
+                    if enable { 4 } else { 3 },
+                    if enable { 4 } else { 3 },
+                )?;
+                provider_uuid(&args[1])?;
+                let revision: u64 = args[2].parse().context("修订必须是正整数")?;
+                if revision == 0 || revision > 9_007_199_254_740_991 {
+                    bail!("服务修订无效");
+                }
+                if enable {
+                    let enabled = args[3].parse::<bool>().context("启用值只能为true或false")?;
+                    json!({"type":"set_provider_enabled","id":args[1],"expected_revision":revision,"enabled":enabled})
+                } else {
+                    json!({"type":"delete_provider","id":args[1],"expected_revision":revision})
+                }
+            }
+            _ => bail!("使用providers list/save/enable/delete；不要在命令参数中填写密钥"),
+        };
+        let envelope = json!({"id":options.command_id,"command":command});
+        if serde_json::to_vec(&envelope)?.len() > 256 * 1024 {
+            bail!("服务元数据请求超过256 KiB");
+        }
+        return Ok(Some((
+            "POST".into(),
+            "/api/v1/providers/commands".into(),
+            Some(envelope),
+        )));
+    }
+    match args.first().map(String::as_str) {
+        Some("set" | "delete") => {
+            let set = args[0] == "set";
+            arity(options, if set { 4 } else { 3 }, if set { 4 } else { 3 })?;
+            if set && args[3] != "--stdin" {
+                bail!("凭据只接受--stdin；不接受密钥参数或文件，未回显输入");
+            }
+            provider_uuid(&args[1])?;
+            let revision: u64 = args[2].parse().context("修订必须是正整数")?;
+            if revision == 0 || revision > 9_007_199_254_740_991 {
+                bail!("服务修订无效");
+            }
+            let mut body = json!({"id":options.command_id,"expected_revision":revision});
+            if set {
+                body["secret"] = json!(provider_stdin_secret(std::io::stdin())?);
+            }
+            Ok(Some((
+                "POST".into(),
+                format!(
+                    "/api/v1/providers/{}/{}",
+                    args[1],
+                    if set {
+                        "credential"
+                    } else {
+                        "credential-delete"
+                    }
+                ),
+                Some(body),
+            )))
+        }
+        Some("cleanup") => {
+            arity(options, 2, 2)?;
+            provider_uuid(&args[1])?;
+            Ok(Some((
+                "POST".into(),
+                format!("/api/v1/credential-operations/{}/cleanup", args[1]),
+                Some(json!({"id":options.command_id})),
+            )))
+        }
+        _ => bail!("使用provider-credential set/delete/cleanup；凭据只能从标准输入读取"),
+    }
 }
 
 fn task<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value> {
@@ -757,6 +925,7 @@ async fn run(options: Options) -> Result<()> {
     let command = command(&options)?;
     let capability_request = capability_body(&options)?;
     let cleanup_request = cleanup_resolution_request(&options)?;
+    let provider_request = provider_request(&options)?;
     validate_follow(&options, command.as_ref())?;
     if options.command == "requests" {
         arity(&options, 0, 1)?;
@@ -768,6 +937,11 @@ async fn run(options: Options) -> Result<()> {
         .then(|| changes_route(&options))
         .transpose()?;
     let client = Client::open(&options.directory)?;
+    if let Some((method, path, body)) = provider_request {
+        let response = client.request(&method, &path, body).await?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
     if let Some((path, body)) = cleanup_request {
         let response = client.request("POST", &path, Some(body)).await?;
         println!("{}", serde_json::to_string_pretty(&response)?);
@@ -1326,11 +1500,17 @@ mod tests {
                 socket.read_exact(&mut bytes).await.unwrap();
                 if let Some(command) = command {
                     let envelope: Value = serde_json::from_slice(&bytes).unwrap();
-                    if path.ends_with("/cleanup-resolution") {
+                    if path.ends_with("/cleanup-resolution")
+                        || path.ends_with("/credential")
+                        || path.ends_with("/credential-delete")
+                        || path.starts_with("/api/v1/credential-operations/")
+                    {
                         assert_eq!(envelope, command);
                     } else {
                         assert_eq!(envelope["command"], command);
-                        assert!(envelope[if path == "/api/v1/capabilities/commands" {
+                        assert!(envelope[if path == "/api/v1/capabilities/commands"
+                            || path == "/api/v1/providers/commands"
+                        {
                             "id"
                         } else {
                             "command_id"
@@ -1883,5 +2063,94 @@ mod tests {
         .await
         .is_err());
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn named_provider_inputs_reject_secret_arguments_and_bind_revisions() {
+        let parsed = |args: &[&str]| {
+            parse(args.iter().map(|arg| (*arg).to_owned()))
+                .unwrap()
+                .unwrap()
+        };
+        let id = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(
+            provider_stdin_secret(&b"fixture-secret\r\n"[..]).unwrap(),
+            "fixture-secret"
+        );
+        assert_eq!(
+            provider_stdin_secret("x".repeat(2048).as_bytes())
+                .unwrap()
+                .len(),
+            2048
+        );
+        for value in [
+            "".to_owned(),
+            "a\nb".to_owned(),
+            "x".repeat(2049),
+            "秘密".to_owned(),
+        ] {
+            assert!(provider_stdin_secret(value.as_bytes()).is_err());
+        }
+        let error = provider_request(&parsed(&[
+            "provider-credential",
+            "set",
+            id,
+            "1",
+            "secret-on-argv",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("secret-on-argv"));
+        assert!(error.contains("--stdin"));
+        for value in [
+            "../provider",
+            "not-an-id",
+            "00000000-0000-0000-0000-00000000000X",
+        ] {
+            assert!(
+                provider_request(&parsed(&["providers", "enable", value, "1", "true"])).is_err()
+            );
+        }
+        assert!(provider_request(&parsed(&["--follow", "providers", "list"])).is_err());
+        let (_, path, body) = provider_request(&parsed(&["providers", "enable", id, "2", "false"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/api/v1/providers/commands");
+        assert_eq!(
+            body.unwrap()["command"],
+            json!({"type":"set_provider_enabled","id":id,"expected_revision":2,"enabled":false})
+        );
+        let (_, path, body) =
+            provider_request(&parsed(&["provider-credential", "delete", id, "2"]))
+                .unwrap()
+                .unwrap();
+        assert_eq!(path, format!("/api/v1/providers/{id}/credential-delete"));
+        assert_eq!(body.unwrap()["expected_revision"], 2);
+    }
+
+    #[tokio::test]
+    async fn named_provider_routes_are_owner_only_and_uncertain_mutations_do_not_retry() {
+        let id = "00000000-0000-0000-0000-000000000001";
+        let op = "00000000-0000-0000-0000-000000000002";
+        cli_fixture(
+            &["providers", "list"],
+            vec![(
+                "GET",
+                "/api/v1/providers",
+                None,
+                Some(json!({"providers":[],"credential_operations":[]}).to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        cli_fixture(&["providers","enable",id,"1","true"],vec![("POST","/api/v1/providers/commands",Some(json!({"type":"set_provider_enabled","id":id,"expected_revision":1,"enabled":true})),None)]).await.unwrap_err();
+        let path = format!("/api/v1/providers/{id}/credential-delete");
+        cli_fixture(&["--command-id",op,"provider-credential","delete",id,"1"],vec![("POST",&path,Some(json!({"id":op,"expected_revision":1})),Some(json!({"operation":{"id":op,"status":"unknown"},"replayed":false,"no_secret_applied":false}).to_string()))]).await.unwrap();
+        let cleanup = format!("/api/v1/credential-operations/{id}/cleanup");
+        cli_fixture(
+            &["--command-id", op, "provider-credential", "cleanup", id],
+            vec![("POST", &cleanup, Some(json!({"id":op})), None)],
+        )
+        .await
+        .unwrap_err();
     }
 }
