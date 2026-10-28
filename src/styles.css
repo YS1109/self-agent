@@ -3044,3 +3044,29 @@ textarea {
 .changes-git li, .changes-skipped li { overflow-wrap: anywhere; margin: 6px 0; }
 .changes-git li span { display: block; color: var(--muted); }
 .changes-diff { overflow: auto; max-height: 420px; padding: 10px; background: var(--surface); white-space: pre; font-size: 11px; border-radius: 4px; }
+
+.execution-settings, .task-execution-details { margin: 16px 0; border: 1px solid var(--line); border-radius: 9px; padding: 13px; }
+.execution-settings h3, .task-execution-details h3, .execution-request h3 { font-size: 14px; margin: 0 0 10px; }
+.execution-budget-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }
+.execution-settings label { display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
+.execution-settings input[type="number"], .execution-settings textarea, .execution-request textarea { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); }
+.execution-settings textarea, .execution-request textarea { resize: vertical; }
+.execution-settings small { color: var(--muted); }
+.execution-permissions { display: grid; gap: 10px; margin: 14px 0; }
+.execution-settings label.execution-checkbox, label.execution-checkbox { display: flex; flex-direction: row; align-items: center; gap: 8px; margin: 10px 0; font-size: 12px; }
+.execution-checkbox input { width: 15px; height: 15px; accent-color: var(--accent); }
+.execution-warning { font-size: 12px; line-height: 1.7; padding: 8px 10px; background: var(--accent-light); border-left: 2px solid var(--accent); }
+.next-execution-controls { margin: 8px 0; font-size: 12px; max-height: 45vh; overflow-y: auto; }
+.next-execution-controls summary, .execution-requests summary { cursor: pointer; padding: 5px 0; }
+.execution-request { margin: 14px 0; padding: 14px; border: 1px solid var(--accent); border-radius: 9px; background: var(--surface); font-size: 13px; }
+.execution-request-prompt, .execution-answer { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.execution-request .help-text, .execution-digest { overflow-wrap: anywhere; font-size: 11px; }
+.execution-action, .verification-attempt pre { overflow: auto; max-height: 260px; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; background: var(--surface-2); font-size: 11px; border-radius: 5px; }
+.execution-request-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.task-budget-list { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px; }
+.task-budget-list dt { color: var(--muted); }.task-budget-list dd { margin: 0; }
+.verification-attempt { border-top: 1px solid var(--line); padding: 9px 0; font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 760px) { .execution-budget-fields { grid-template-columns: 1fr; } }
+
+.execution-cleanup { margin: 10px 0; padding: 9px 11px; border-left: 2px solid var(--accent); background: var(--accent-light); font-size: 12px; line-height: 1.6; text-align: left; }
+.execution-cleanup p { margin: 5px 0; }.execution-cleanup small { color: var(--muted); }

@@ -13,7 +13,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::{
     context::ExecutionInput,
     continuation::{fingerprint, NativeSummary},
+    execution_control::RunControl,
+    project_files::ScopedProject,
     steering::InputAcknowledgement,
+    store::execution::Charge,
     Settings,
 };
 
@@ -21,7 +24,6 @@ use crate::{
 mod provider_stream;
 
 const MAX_TURNS: usize = 10;
-const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Native v0 deliberately uses Chat Completions-compatible models only.
@@ -133,6 +135,7 @@ pub(crate) async fn execute_with_memory(
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_with_control(
     settings: &Settings,
@@ -146,6 +149,40 @@ pub(crate) async fn execute_with_control(
     save_summary: impl Fn(NativeSummary) -> Result<()>,
     claim_inputs: impl Fn() -> Result<Vec<TaskSupplement>>,
     ack_inputs: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
+) -> Result<String> {
+    execute_with_runtime(
+        settings,
+        root,
+        input,
+        progress,
+        cancelled,
+        evidence,
+        events,
+        memory,
+        save_summary,
+        claim_inputs,
+        ack_inputs,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_with_runtime(
+    settings: &Settings,
+    root: &Path,
+    input: ExecutionInput<'_>,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+    evidence: impl Fn(CommandEvidence),
+    events: impl Fn(ExecutionEvent) -> Result<()>,
+    memory: Option<&NativeSummary>,
+    save_summary: impl Fn(NativeSummary) -> Result<()>,
+    claim_inputs: impl Fn() -> Result<Vec<TaskSupplement>>,
+    ack_inputs: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
+    runtime: Option<&RunControl>,
+    project: Option<&ScopedProject>,
 ) -> Result<String> {
     let settings = crate::configuration::resolve(settings)?;
     let emitted_text = std::sync::atomic::AtomicUsize::new(0);
@@ -206,6 +243,8 @@ pub(crate) async fn execute_with_control(
             save_summary,
             claim_inputs,
             ack_inputs,
+            runtime,
+            project,
         )
         .await?;
         // Never flush a possible credential suffix on cancellation or failure.
@@ -243,6 +282,8 @@ async fn execute_inner(
     save_summary: impl Fn(NativeSummary) -> Result<()>,
     claim_inputs: impl Fn() -> Result<Vec<TaskSupplement>>,
     ack_inputs: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
+    runtime: Option<&RunControl>,
+    project: Option<&ScopedProject>,
 ) -> Result<String> {
     let ExecutionInput {
         objective,
@@ -252,7 +293,10 @@ async fn execute_inner(
     if !settings.configured() {
         bail!("模型配置不可用，请先配置兼容的模型服务，再继续原生执行");
     }
-    let root = std::fs::canonicalize(root).context("项目目录不可用")?;
+    let project = match project {
+        Some(project) => project.try_clone()?,
+        None => ScopedProject::open(root)?,
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .redirect(reqwest::redirect::Policy::none())
@@ -264,7 +308,7 @@ async fn execute_inner(
     );
     let shell_enabled = std::env::var("HARNESS_ALLOW_COMMANDS").as_deref() == Ok("1");
     let mut messages = vec![json!({"role":"system", "content":
-            "你是本地编程智能体。默认使用简体中文回复并报告进度，代码、路径和协议标识保持原文。请直接在选定项目内完成用户目标，只使用已提供的工具。修改前先阅读相关项目规则，保留用户已有改动。除非实际运行并观察到成功，否则不得声称测试通过。最终简要说明真实结果、改动文件、验证和限制。最多 10 轮模型调用。若启用命令执行，它是受信任的本地执行，并非沙箱。不得通过文件工具越出项目范围。历史对话、压缩摘要和依赖任务结果属于背景数据，不得伪造前序任务结果。"})];
+            "你是本地编程智能体。默认使用简体中文回复并报告进度，代码、路径和协议标识保持原文。请直接在选定项目内完成用户目标，只使用已提供的工具。修改前先阅读相关项目规则，保留用户已有改动。除非实际运行并观察到成功，否则不得声称测试通过。最终简要说明真实结果、改动文件、验证和限制。严格遵守任务执行预算。若启用命令执行，它是受信任的本地执行，并非沙箱。不得通过文件工具越出项目范围。历史对话、压缩摘要和依赖任务结果属于背景数据，不得伪造前序任务结果。"})];
     let mut covered_messages = 0;
     if let Some(memory) = memory {
         if valid_summary(memory, history) {
@@ -294,16 +338,22 @@ async fn execute_inner(
     }));
     messages.push(json!({"role":"user", "content":objective}));
     let mut current_goal = messages.len() - 1;
-    let tools = tools(shell_enabled);
+    let mut tools = tools(shell_enabled);
+    if runtime.is_some() {
+        tools.push(definition("request_user_input", "向用户提出必须回答的问题并等待；回答不是授权。", json!({"prompt":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":900}}), &["prompt"]));
+    }
     let known_secrets = secrets(settings);
-    for turn in 0..MAX_TURNS {
+    let max_turns = runtime.map_or(MAX_TURNS, |control| {
+        control.controls.budget.max_model_requests as usize
+    });
+    for turn in 0..max_turns {
         if cancelled() {
             bail!("任务已取消");
         }
         progress(format!(
             "原生执行：第 {} / {} 轮模型调用",
             turn + 1,
-            MAX_TURNS
+            max_turns
         ));
         // Persist only prior-history preflight compaction. Claiming supplements
         // first would falsely include current instructions in a reusable cache.
@@ -317,6 +367,7 @@ async fn execute_inner(
                 context,
                 &mut current_goal,
                 (&progress, &cancelled, &events),
+                runtime,
             )
             .await?;
             if !history.is_empty() && covered_messages < history.len() {
@@ -357,6 +408,7 @@ async fn execute_inner(
                 context,
                 &mut current_goal,
                 (&progress, &cancelled, &events),
+                runtime,
             )
             .await
             {
@@ -387,6 +439,7 @@ async fn execute_inner(
             &events,
             &progress,
             &acknowledge,
+            runtime,
         )
         .await?;
         provider_stream::validate_calls(&message)?;
@@ -401,6 +454,31 @@ async fn execute_inner(
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .context("模型服务返回了空的最终回复")?;
+            if let Some(control) = runtime {
+                if !control.controls.acceptance_commands.is_empty() {
+                    let verified = run_verification_batch(
+                        settings,
+                        root,
+                        &project,
+                        shell_enabled,
+                        &known_secrets,
+                        control,
+                        &cancelled,
+                        &events,
+                        &evidence,
+                    )
+                    .await?;
+                    if !verified {
+                        control.charge(Charge::RepairAttempt)?;
+                        messages.push(json!({"role":"assistant","content":content}));
+                        messages.push(json!({"role":"user","content":"后台实际运行了固化的验收命令，至少一项失败。请依据以下真实失败证据修复实现，不得修改或跳过验收要求；完成修改后后台会重新运行同一组验收命令。"}));
+                        messages.push(
+                            json!({"role":"user","content":control.verification_feedback()?}),
+                        );
+                        continue;
+                    }
+                }
+            }
             return Ok(content.to_string());
         }
         if calls.len() > 16 {
@@ -443,35 +521,111 @@ async fn execute_inner(
                     if !arguments.is_object() {
                         Err(anyhow!("工具参数必须为对象"))
                     } else {
-                        interruptible(
-                            tool(&root, name, arguments, shell_enabled, &known_secrets),
-                            &cancelled,
-                        )
-                        .await
+                        if name == "request_user_input" {
+                            let control = runtime.context("此执行方式不支持待回答问题")?;
+                            let prompt = redact_all(settings, argument(&arguments, "prompt")?);
+                            let seconds = arguments
+                                .get("timeout_seconds")
+                                .map(|value| value.as_u64().context("等待秒数必须为整数"))
+                                .transpose()?
+                                .unwrap_or(300);
+                            let seconds = u32::try_from(seconds).context("等待秒数超出范围")?;
+                            Ok(json!({"answer":control.ask_question(&prompt, seconds).await?}))
+                        } else {
+                            if let Some(control) = runtime {
+                                control
+                                    .authorize_tool(
+                                        name,
+                                        &arguments,
+                                        safe_action(settings, name, &arguments),
+                                    )
+                                    .await?;
+                                if matches!(name, "write_file" | "run_command") {
+                                    control.charge(Charge::Mutation)?;
+                                }
+                            }
+                            if matches!(name, "run_command" | "write_file") {
+                                if name == "write_file" {
+                                    if let Some(control) = runtime {
+                                        control.set_cleanup(true)?;
+                                    }
+                                }
+                                // Blocking writes cannot be aborted. Await completion while
+                                // the caller retains the project lease, even after cancellation.
+                                let result = tool(
+                                    root,
+                                    &project,
+                                    name,
+                                    arguments,
+                                    shell_enabled,
+                                    &known_secrets,
+                                    &cancelled,
+                                )
+                                .await;
+                                if name == "write_file" {
+                                    if let Some(control) = runtime {
+                                        control.set_cleanup(false)?;
+                                    }
+                                }
+                                result
+                            } else {
+                                interruptible(
+                                    tool(
+                                        root,
+                                        &project,
+                                        name,
+                                        arguments,
+                                        shell_enabled,
+                                        &known_secrets,
+                                        &cancelled,
+                                    ),
+                                    &cancelled,
+                                )
+                                .await
+                            }
+                        }
                     }
                 }
                 Err(_) => Err(anyhow!("工具调用参数不是有效 JSON")),
             };
-            if name == "run_command" {
-                if let (Ok(value), Ok(arguments)) =
-                    (&result, serde_json::from_str::<Value>(arguments))
-                {
-                    if let Some(record) = command_evidence(settings, value, &arguments) {
-                        evidence(record);
-                    }
+            let mut command_record = if name == "run_command" {
+                match (&result, serde_json::from_str::<Value>(arguments)) {
+                    (Ok(value), Ok(arguments)) => command_evidence(settings, value, &arguments),
+                    _ => None,
                 }
-            }
-            if cancelled() {
-                bail!("任务已取消");
-            }
+            } else {
+                None
+            };
             let success = result.as_ref().is_ok_and(|value| value["success"] != false);
             let output = match result {
                 Ok(value) => value,
                 Err(error) => json!({"error":settings.redact(&error.to_string())}),
             };
-            // JSON text has at most twofold escaping when embedded in an event.
             let mut visible_output = serde_json::to_string(&redact_value(settings, &output))?;
             truncate_utf8(&mut visible_output, 12 * 1024);
+            // One logical result may appear in both evidence and the event.
+            // Reserve its longest public representation BEFORE either is saved.
+            let bytes = visible_output.len().max(
+                command_record
+                    .as_ref()
+                    .map_or(0, |record| record.output.len()),
+            );
+            let reserved = runtime.map_or(Ok(()), |control| {
+                control.charge(Charge::OutputBytes(bytes as u64))
+            });
+            if reserved.is_err() {
+                visible_output.clear();
+                if let Some(record) = &mut command_record {
+                    record.output.clear();
+                }
+            }
+            if let Some(record) = command_record {
+                evidence(record);
+            }
+            reserved?;
+            if cancelled() {
+                bail!("任务已取消");
+            }
             events(ExecutionEvent::ToolFinished {
                 call_id: redact_all(settings, call_id),
                 name: redact_all(settings, name),
@@ -481,7 +635,10 @@ async fn execute_inner(
             messages.push(json!({"role":"tool","tool_call_id":call_id,"content":serde_json::to_string(&output)?}));
         }
     }
-    bail!("原生执行已达到 10 轮预算，请检查已有改动后创建后续任务继续。")
+    if let Some(control) = runtime {
+        control.stop("model_budget_exhausted");
+    }
+    bail!("原生执行已达到模型请求预算；已有结果和改动已保留。")
 }
 
 fn truncate_utf8(text: &mut String, max: usize) {
@@ -495,6 +652,145 @@ fn truncate_utf8(text: &mut String, max: usize) {
     }
     text.truncate(end);
     text.push_str(marker);
+}
+
+fn safe_action(settings: &Settings, name: &str, arguments: &Value) -> Value {
+    match name {
+        "write_file" => json!({
+            "path":redact_all(settings, arguments["path"].as_str().unwrap_or_default()),
+            "content_bytes":arguments["content"].as_str().map(str::len),
+            "content_preview":({ let mut text = redact_all(settings, arguments["content"].as_str().unwrap_or_default()); truncate_utf8(&mut text, 8192); text }),
+            "content_preview_truncated":arguments["content"].as_str().is_some_and(|text| text.len() > 8192),
+            "content_digest":fingerprint(&arguments["content"]),
+        }),
+        "run_command" => {
+            json!({"command":redact_all(settings, arguments["command"].as_str().unwrap_or_default()),
+            "warning":"可信本机 shell，不是项目文件系统或网络沙箱"})
+        }
+        _ => json!({}),
+    }
+}
+
+/// Verification is a declared command batch after the model's mutations. Its
+/// generation does not assert scripts are read-only or detect external editors.
+#[allow(clippy::too_many_arguments)]
+async fn run_verification_batch(
+    settings: &Settings,
+    root: &Path,
+    project: &ScopedProject,
+    shell_enabled: bool,
+    known_secrets: &[String],
+    control: &RunControl,
+    cancelled: &impl Fn() -> bool,
+    events: &impl Fn(ExecutionEvent) -> Result<()>,
+    evidence: &impl Fn(CommandEvidence),
+) -> Result<bool> {
+    control.charge(Charge::Mutation)?;
+    for command in &control.controls.acceptance_commands {
+        let arguments = json!({"command":command});
+        control
+            .authorize_tool(
+                "run_command",
+                &arguments,
+                safe_action(settings, "run_command", &arguments),
+            )
+            .await?;
+        let call_id = format!("verify-{}", harness_core::new_id());
+        events(ExecutionEvent::ToolStarted {
+            call_id: call_id.clone(),
+            name: "run_command".into(),
+        })?;
+        let result = tool(
+            root,
+            project,
+            "run_command",
+            arguments.clone(),
+            shell_enabled,
+            known_secrets,
+            cancelled,
+        )
+        .await;
+        let mut command_record = result
+            .as_ref()
+            .ok()
+            .and_then(|value| command_evidence(settings, value, &arguments));
+        let (exit_code, mut output) = match &result {
+            Ok(value) => (
+                value["exit_code"]
+                    .as_i64()
+                    .and_then(|code| i32::try_from(code).ok()),
+                bounded_redacted(
+                    settings,
+                    &format!(
+                        "{}{}",
+                        value["stdout"].as_str().unwrap_or_default(),
+                        value["stderr"].as_str().unwrap_or_default()
+                    ),
+                ),
+            ),
+            Err(error) => (None, redact_all(settings, &error.to_string())),
+        };
+        let bytes = output.len().max(
+            command_record
+                .as_ref()
+                .map_or(0, |record| record.output.len()),
+        );
+        let reserved = control.charge(Charge::OutputBytes(bytes as u64));
+        if reserved.is_err() {
+            output.clear();
+            if let Some(record) = &mut command_record {
+                record.output.clear();
+            }
+        }
+        if let Some(record) = command_record {
+            evidence(record);
+        }
+        control.record_verification(command, exit_code, &output)?;
+        reserved?;
+        let mut visible = output;
+        truncate_utf8(&mut visible, 12 * 1024);
+        events(ExecutionEvent::ToolFinished {
+            call_id,
+            name: "run_command".into(),
+            success: exit_code == Some(0),
+            output: visible,
+        })?;
+    }
+    control.verification_complete()
+}
+
+/// Retry only explicit pre-body transient rejection. Stream errors, parse
+/// errors and unknown send outcomes are never replayed. Every attempt consumes
+/// the same durable model-request budget, including summary requests.
+async fn send_model_request(
+    settings: &Settings,
+    client: &reqwest::Client,
+    endpoint: &str,
+    body: &Value,
+    runtime: Option<&RunControl>,
+) -> Result<reqwest::Response> {
+    let mut retries = 0;
+    loop {
+        if let Some(control) = runtime {
+            control.charge(Charge::ModelRequest)?;
+        }
+        let response = settings
+            .authorize(client.post(endpoint).json(body))
+            .send()
+            .await
+            .context("模型服务请求失败；结果未知，未自动重试")?;
+        let retryable = matches!(response.status().as_u16(), 429 | 503);
+        let Some(control) = runtime else {
+            return Ok(response);
+        };
+        if !retryable || retries >= control.controls.budget.max_retries {
+            return Ok(response);
+        }
+        control.charge(Charge::Retry)?;
+        retries += 1;
+        drop(response);
+        tokio::time::sleep(Duration::from_millis(100 * u64::from(retries))).await;
+    }
 }
 
 fn secrets(settings: &Settings) -> Vec<String> {
@@ -587,6 +883,7 @@ async fn request_completion(
     events: &impl Fn(ExecutionEvent) -> Result<()>,
     progress: &impl Fn(String),
     acknowledge: &impl Fn(InputAcknowledgement) -> Result<()>,
+    runtime: Option<&RunControl>,
 ) -> Result<Value> {
     if serde_json::to_vec(body)?.len() > 2 * 1024 * 1024 {
         acknowledge(InputAcknowledgement::NotApplied {
@@ -596,11 +893,7 @@ async fn request_completion(
     }
     interruptible(
         async {
-            let response = settings
-                .authorize(client.post(endpoint).json(body))
-                .send()
-                .await
-                .context("模型服务请求失败，请检查连接与配置")?;
+            let response = send_model_request(settings, client, endpoint, body, runtime).await?;
             if !response.status().is_success() {
                 acknowledge(InputAcknowledgement::NotApplied {
                     reason: format!("模型服务返回 HTTP {}，补充未应用", response.status()),
@@ -707,17 +1000,14 @@ async fn request_json(
     endpoint: &str,
     body: &Value,
     cancelled: &impl Fn() -> bool,
+    runtime: Option<&RunControl>,
 ) -> Result<Value> {
     if serde_json::to_vec(body)?.len() > 2 * 1024 * 1024 {
         bail!("原生执行已达到 2 MiB 请求预算，请增大压缩力度或创建后续会话");
     }
-    let request = settings.authorize(client.post(endpoint).json(body));
     interruptible(
         async {
-            let response = request
-                .send()
-                .await
-                .context("模型服务请求失败，请检查连接与配置")?;
+            let response = send_model_request(settings, client, endpoint, body, runtime).await?;
             if !response.status().is_success() {
                 bail!(
                     "模型服务返回 HTTP {}，请检查模型、凭证和 Chat Completions 兼容性",
@@ -754,6 +1044,7 @@ async fn compact_context(
         &impl Fn() -> bool,
         &impl Fn(ExecutionEvent) -> Result<()>,
     ),
+    runtime: Option<&RunControl>,
 ) -> Result<Option<String>> {
     let (progress, cancelled, events) = callbacks;
     if !(1024..=2_000_000).contains(&config.context_window)
@@ -821,7 +1112,7 @@ async fn compact_context(
             "model":settings.model, "messages":summary_messages,
             "stream":false, "max_tokens":summary_budget,
         });
-        let response = request_json(settings, client, endpoint, &body, cancelled).await?;
+        let response = request_json(settings, client, endpoint, &body, cancelled, runtime).await?;
         if let Some(usage) = response.get("usage").filter(|value| value.is_object()) {
             events(ExecutionEvent::Usage {
                         scope: "request".into(),
@@ -1000,56 +1291,45 @@ pub fn scoped_path(root: &Path, requested: &str, writing: bool) -> Result<PathBu
 
 async fn tool(
     root: &Path,
+    project: &ScopedProject,
     name: &str,
     arguments: Value,
     shell: bool,
     known_secrets: &[String],
+    cancelled: &impl Fn() -> bool,
 ) -> Result<Value> {
     match name {
         "read_file" => {
-            let path = scoped_path(root, argument(&arguments, "path")?, false)?;
-            let metadata = tokio::fs::metadata(&path)
+            let path = argument(&arguments, "path")?.to_owned();
+            let project = project.try_clone()?;
+            let content = tokio::task::spawn_blocking(move || project.read(&path))
                 .await
-                .context("无法读取文件信息")?;
-            if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-                bail!("只能读取不超过 256 KiB 的普通文件");
-            }
-            let bytes = tokio::fs::read(path).await.context("无法读取文件")?;
-            if bytes.len() as u64 > MAX_FILE_BYTES {
-                bail!("文件大小已超过 256 KiB");
-            }
-            Ok(json!({"content":String::from_utf8(bytes).context("文件不是 UTF-8 文本")?}))
+                .context("项目文件读取任务未完成")??;
+            Ok(json!({"content":content}))
         }
         "write_file" => {
-            let path = scoped_path(root, argument(&arguments, "path")?, true)?;
-            let content = argument(&arguments, "content")?;
-            if content.len() as u64 > MAX_FILE_BYTES {
-                bail!("写入内容超过 256 KiB 限制");
-            }
-            if let Ok(metadata) = tokio::fs::metadata(&path).await {
-                if !metadata.is_file() {
-                    bail!("只能写入普通文件");
-                }
-            }
-            tokio::fs::write(path, content)
+            let path = argument(&arguments, "path")?.to_owned();
+            let content = argument(&arguments, "content")?.to_owned();
+            let project = project.try_clone()?;
+            let bytes = tokio::task::spawn_blocking(move || project.write(&path, &content))
                 .await
-                .context("无法写入文件")?;
-            Ok(json!({"written":true, "bytes":content.len()}))
+                .context("项目文件写入任务未完成")??;
+            Ok(json!({"written":true,"bytes":bytes}))
         }
         "list_files" | "search_files" => {
-            let path = scoped_path(root, argument(&arguments, "path")?, false)?;
-            let root = root.to_path_buf();
+            let path = argument(&arguments, "path")?.to_owned();
             let query = if name == "search_files" {
-                Some(argument(&arguments, "query")?.to_string())
+                Some(argument(&arguments, "query")?.to_owned())
             } else {
                 None
             };
+            let project = project.try_clone()?;
             let known_secrets = known_secrets.to_vec();
             tokio::task::spawn_blocking(move || {
-                walk(&root, &path, query.as_deref(), &known_secrets)
+                project.scan(&path, query.as_deref(), &known_secrets)
             })
             .await
-            .context("文件搜索任务未能完成")?
+            .context("项目文件搜索任务未完成")?
         }
         "run_command" if shell => {
             let command = argument(&arguments, "command")?;
@@ -1066,6 +1346,8 @@ async fn tool(
             let mut process = {
                 let mut process = tokio::process::Command::new("/bin/sh");
                 process.args(["-c", command]);
+                use std::os::unix::process::CommandExt;
+                process.as_std_mut().process_group(0);
                 process
             };
             let mut child = process
@@ -1078,25 +1360,100 @@ async fn tool(
                 .kill_on_drop(true)
                 .spawn()
                 .context("无法启动命令")?;
+            let mut tree = CommandTree(child.id());
             let stdout = child.stdout.take().unwrap();
             let stderr = child.stderr.take().unwrap();
-            let run = async {
-                let (status, stdout, stderr) = tokio::try_join!(
-                    child.wait(),
-                    capture(stdout, known_secrets),
-                    capture(stderr, known_secrets),
-                )?;
-                Ok::<_, std::io::Error>(json!({
-                    "exit_code":status.code(),"success":status.success(),
-                    "stdout":stdout,"stderr":stderr
-                }))
+            let outcome = {
+                let run = async {
+                    let (status, stdout, stderr) = tokio::try_join!(
+                        child.wait(),
+                        capture(stdout, known_secrets),
+                        capture(stderr, known_secrets),
+                    )?;
+                    Ok::<_, std::io::Error>(
+                        json!({"exit_code":status.code(),"success":status.success(),"stdout":stdout,"stderr":stderr}),
+                    )
+                };
+                tokio::pin!(run);
+                let deadline = tokio::time::sleep(Duration::from_secs(60));
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        result = &mut run => break result.context("无法读取命令执行结果"),
+                        _ = &mut deadline => break Err(anyhow!("命令执行超过 60 秒限制")),
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            if cancelled() { break Err(anyhow!("任务已停止，正在回收命令进程树")); }
+                        }
+                    }
+                }
             };
-            tokio::time::timeout(Duration::from_secs(60), run)
-                .await
-                .context("命令执行超过 60 秒限制")?
-                .context("无法读取命令执行结果")
+            stop_command_tree(&mut child, &mut tree).await;
+            outcome
         }
         _ => bail!("工具不存在或未启用"),
+    }
+}
+
+/// Dropping an interrupted tool must not leave a child writing after the task
+/// has stopped. This also reaps detached descendants after a successful shell.
+struct CommandTree(Option<u32>);
+async fn stop_command_tree(child: &mut tokio::process::Child, tree: &mut CommandTree) {
+    if let Some(pid) = tree.0 {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("/bin/kill");
+            command.args(["-KILL", "--", &format!("-{pid}")]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("taskkill");
+            command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+            command
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    tree.0 = None;
+}
+
+impl Drop for CommandTree {
+    fn drop(&mut self) {
+        let Some(pid) = self.0 else {
+            return;
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("/bin/kill");
+            command.args(["-KILL", "--", &format!("-{pid}")]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("taskkill");
+            command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+            command
+        };
+        let _ = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|mut child| {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                })
+            });
     }
 }
 
@@ -1173,68 +1530,6 @@ fn append_capture(result: &mut String, safe: &str) -> bool {
     }
     result.push_str(&safe[..end]);
     end < safe.len() || result.len() == MAX_OUTPUT_BYTES
-}
-
-fn walk(root: &Path, start: &Path, query: Option<&str>, known_secrets: &[String]) -> Result<Value> {
-    let mut stack = vec![start.to_path_buf()];
-    let mut files = Vec::new();
-    let mut matches = Vec::new();
-    let mut visited = 0;
-    while let Some(path) = stack.pop() {
-        if visited >= 2000 || matches.len() >= 100 {
-            break;
-        }
-        visited += 1;
-        let metadata = std::fs::symlink_metadata(&path).context("无法读取文件信息")?;
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-        let canonical = std::fs::canonicalize(&path).context("无法解析项目内路径")?;
-        if !canonical.starts_with(root) {
-            bail!("路径超出了项目根目录");
-        }
-        if metadata.is_dir() {
-            let mut entries: Vec<_> = std::fs::read_dir(&path)
-                .context("无法读取项目目录")?
-                .filter_map(Result::ok)
-                .collect();
-            entries.sort_by_key(|entry| entry.file_name());
-            for entry in entries.into_iter().rev().take(2000) {
-                if !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | "node_modules" | "target" | ".venv")
-                ) {
-                    stack.push(entry.path());
-                }
-            }
-        } else if metadata.is_file() {
-            let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
-            if let Some(query) = query {
-                if metadata.len() <= MAX_FILE_BYTES {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        for (line, text) in content.lines().enumerate() {
-                            if text.contains(query) {
-                                let mut redactor =
-                                    provider_stream::Redactor::new(known_secrets.to_vec());
-                                let safe = redactor.push(text) + &redactor.finish();
-                                matches.push(json!({"path":relative,"line":line+1,"text":safe.chars().take(500).collect::<String>()}));
-                                if matches.len() >= 100 {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                files.push(relative);
-            }
-        }
-    }
-    Ok(if query.is_some() {
-        json!({"matches":matches,"truncated":visited>=2000 || matches.len()>=100})
-    } else {
-        json!({"files":files,"truncated":visited>=2000})
-    })
 }
 
 #[cfg(test)]
@@ -2576,10 +2871,12 @@ mod tests {
         let arguments = json!({"command":"printf 'private-test-key'; printf '失败' >&2; exit 7"});
         let value = tool(
             &std::env::temp_dir(),
+            &ScopedProject::open(&std::env::temp_dir().canonicalize().unwrap()).unwrap(),
             "run_command",
             arguments.clone(),
             true,
             &["private-test-key".into()],
+            &|| false,
         )
         .await
         .unwrap();
@@ -2683,10 +2980,12 @@ mod tests {
         .unwrap();
         let output = tool(
             &root,
+            &ScopedProject::open(&root).unwrap(),
             "search_files",
             json!({"path":".","query":secret}),
             false,
             &[secret.into()],
+            &|| false,
         )
         .await
         .unwrap();
@@ -2719,3 +3018,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod execution_tests;

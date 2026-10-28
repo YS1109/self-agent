@@ -115,4 +115,16 @@ describe("private daemon transport", () => {
     expect(invoke).toHaveBeenCalledWith("api_request",{method:"GET",path:"/api/v1/tasks/task-1/changes",body:null});
   });
 
+  it("执行控制和逐次授权信封保留完整绑定，传输失败不重试决定", async () => {
+    vi.stubGlobal("window",{});
+    const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>({status:"accepted",task_id:"t"})});
+    vi.stubGlobal("fetch",fetcher);
+    await dispatch(DESKTOP_SOURCE,{type:"run_agent",session_id:"s",content:"目标",controls:{budget:{max_runtime_seconds:30},permissions:{run_commands:"ask"}}});
+    expect(JSON.parse(fetcher.mock.calls[0][1].body).command.controls).toEqual({budget:{max_runtime_seconds:30},permissions:{run_commands:"ask"}});
+    fetcher.mockRejectedValue(new Error("connection lost"));
+    await expect(dispatch(DESKTOP_SOURCE,{type:"decide_request",request_id:"r",expected_revision:2,approve:true,action_digest:"a".repeat(64)})).rejects.toThrow("connection lost");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetcher.mock.calls[1][1].body).command).toEqual({type:"decide_request",request_id:"r",expected_revision:2,approve:true,action_digest:"a".repeat(64)});
+  });
+
 });

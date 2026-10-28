@@ -1,5 +1,8 @@
 //! Shared records exchanged by the daemon, desktop bridge, and channel adapters.
 
+mod execution;
+pub use execution::*;
+
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -83,6 +86,8 @@ pub struct AgentProfile {
     pub context_window: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_threshold: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controls: Option<TaskControls>,
 }
 
 impl Default for AgentProfile {
@@ -95,6 +100,7 @@ impl Default for AgentProfile {
             model: String::new(),
             context_window: None,
             compression_threshold: None,
+            controls: None,
         }
     }
 }
@@ -157,6 +163,22 @@ pub struct TaskRun {
     pub context_estimate: Option<TaskContextEstimate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_compaction: Option<TaskContextCompaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<TaskControls>,
+    #[serde(default)]
+    pub budget_usage: BudgetUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_cleanup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_cleanup_updated_at: Option<String>,
+    #[serde(default)]
+    pub verification_attempts: Vec<VerificationAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_request_id: Option<String>,
+    #[serde(default)]
+    pub question_answers: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -417,6 +439,8 @@ pub struct Snapshot {
     pub events: Vec<RunEvent>,
     pub capabilities: Vec<Capability>,
     pub selections: Vec<SessionSelection>,
+    #[serde(default)]
+    pub execution_requests: Vec<ExecutionRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -459,6 +483,8 @@ pub enum Command {
         #[serde(default)]
         session_id: Option<String>,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controls: Option<serde_json::Value>,
     },
     SteerTask {
         task_id: String,
@@ -468,6 +494,8 @@ pub enum Command {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controls: Option<serde_json::Value>,
     },
     StartTask {
         #[serde(default)]
@@ -475,6 +503,19 @@ pub enum Command {
         title: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controls: Option<serde_json::Value>,
+    },
+    AnswerRequest {
+        request_id: String,
+        expected_revision: u32,
+        answer: String,
+    },
+    DecideRequest {
+        request_id: String,
+        expected_revision: u32,
+        approve: bool,
+        action_digest: String,
     },
     CancelTask {
         task_id: String,

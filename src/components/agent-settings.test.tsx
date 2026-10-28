@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
+import { defaultExecutionControls } from "../execution-controls";
 import { agentModelLabel } from "../agent-model";
 import type { Settings } from "../types";
 import { AgentSettings, normalizeSettings } from "./agent-settings";
@@ -40,4 +41,15 @@ describe("子智能体模型预设", () => {
     expect(html).toContain("已有计划保留原配置");
     expect(html).toContain("添加子智能体预设");
   });
+  it("角色控制可继承或收紧，切换主模型不丢失权限，Codex继承冲突明确提示",()=>{
+    const global=defaultExecutionControls();global.permissions.write_files="ask";global.permissions.run_commands="ask";
+    const role=defaultExecutionControls();role.permissions.write_files="deny";role.permissions.run_commands="deny";
+    const configured={...settings,execution_controls:global,agents:[{...settings.agents[0],controls:role},settings.agents[1]]};
+    const normalized=normalizeSettings({...configured,model:"changed"});
+    expect(normalized.agents[0].controls).toEqual(role);
+    const html=renderToStaticMarkup(<AgentSettings settings={configured} onChange={vi.fn()} disabled={false} nativeModels={catalog} codexModels={catalog} codexPathChanged={false}/>);
+    expect(html).toContain("角色额外执行限制");expect(html).toContain("自定义执行限制");expect(html).toContain("切换模型或执行器不会清除");
+    expect(html).toContain("此角色继承全局限制后当前无法执行");expect(html).toContain("不会自动放宽");
+  });
+
 });

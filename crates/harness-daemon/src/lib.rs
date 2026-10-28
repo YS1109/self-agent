@@ -4,9 +4,11 @@ mod configuration;
 mod context;
 mod continuation;
 mod coordinator;
+mod execution_control;
 mod model_config;
 mod models;
 pub mod profiles;
+mod project_files;
 pub mod provider;
 mod steering;
 pub mod store;
@@ -59,6 +61,8 @@ pub struct Settings {
     pub models_endpoint: String,
     #[serde(default)]
     pub model_contexts: BTreeMap<String, ModelContextConfig>,
+    #[serde(default)]
+    pub execution_controls: harness_core::TaskControls,
     pub execution_mode: String,
     #[serde(default = "configuration::default_source")]
     pub provider_source: String,
@@ -83,6 +87,7 @@ impl Default for Settings {
             main_executor: default_main_executor(),
             models_endpoint: String::new(),
             model_contexts: BTreeMap::new(),
+            execution_controls: harness_core::TaskControls::default(),
             execution_mode: "native".into(),
             provider_source: configuration::default_source(),
             agents: profiles::default_agents(),
@@ -170,6 +175,7 @@ impl Settings {
             "main_executor": self.main_executor,
             "models_endpoint": self.models_endpoint,
             "model_contexts": self.model_contexts,
+            "execution_controls": self.execution_controls,
             "provider_source": self.provider_source,
             "configuration_error": result.as_ref().err().map(ToString::to_string),
             "execution_mode": self.execution_mode, "configured": result.is_ok(),
@@ -363,13 +369,31 @@ fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings
         }
     }
     if let Some(agents) = patch.get("agents") {
-        updated.agents = serde_json::from_value(agents.clone())
+        let mut agents = agents.clone();
+        if let Some(items) = agents.as_array_mut() {
+            for item in items {
+                if item.get("controls").is_none() {
+                    if let Some(prior) = settings.agents.iter().find(|prior| item["id"] == prior.id)
+                    {
+                        item["controls"] = serde_json::to_value(&prior.controls)?;
+                    }
+                }
+            }
+        }
+        updated.agents = serde_json::from_value(agents)
             .map_err(|_| anyhow::anyhow!("子智能体角色配置格式无效"))?;
     }
     if let Some(configs) = patch.get("model_contexts") {
         updated.model_contexts = serde_json::from_value(configs.clone())
             .map_err(|_| anyhow::anyhow!("模型上下文配置格式无效"))?;
     }
+    if let Some(controls) = patch.get("execution_controls") {
+        let mut merged = serde_json::to_value(&settings.execution_controls)?;
+        merge_control_patch(&mut merged, controls)?;
+        updated.execution_controls = serde_json::from_value(merged)
+            .map_err(|_| anyhow::anyhow!("执行预算或权限配置格式无效"))?;
+    }
+    store::execution::resolve_controls(&updated.execution_controls, None, None, "native")?;
     model_config::validate_registry(&updated.model_contexts)?;
     profiles::validate_agents(&updated.agents, &updated.default_agent_id)?;
     if !matches!(updated.main_executor.as_str(), "native" | "codex") {
@@ -406,6 +430,22 @@ fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings
         _ => anyhow::bail!("模型配置来源无效"),
     }
     Ok(updated)
+}
+
+// Partial settings updates preserve every omitted limit. Unknown keys still
+// fail typed deserialization; null never silently restores permissive defaults.
+fn merge_control_patch(target: &mut Value, patch: &Value) -> anyhow::Result<()> {
+    let values = patch
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("执行配置补丁必须为对象"))?;
+    for (key, value) in values {
+        if target.get(key).is_some_and(Value::is_object) {
+            merge_control_patch(&mut target[key], value)?;
+        } else {
+            target[key] = value.clone();
+        }
+    }
+    Ok(())
 }
 
 async fn local_codex_provider() -> ApiResult<Json<Value>> {
@@ -614,6 +654,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         return;
     }
     let mut change_baseline = None;
+    let mut report_control = None;
     let report_secrets = Arc::new(Mutex::new(Vec::<String>::new()));
     let result = if task["execution_mode"] == "demo" {
         demo(&state, &task_id).await
@@ -695,6 +736,37 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             history: &history,
             config: &context,
         };
+        let control =
+            match execution_control::RunControl::start(state.clone(), &task_id, &agent.executor) {
+                Ok(control) => Arc::new(control),
+                Err(error) => {
+                    finish(&state, &task_id, Err(error));
+                    return;
+                }
+            };
+        report_control = Some(control.clone());
+        // Open the saved root without resolving a replacement symlink. Keep
+        // this capability through Native execution; never reopen checked paths.
+        let project = match project_files::ScopedProject::open(&root) {
+            Ok(project) => project,
+            Err(error) => {
+                finish(&state, &task_id, Err(error));
+                return;
+            }
+        };
+        if !control.controls.acceptance_commands.is_empty()
+            && std::env::var("HARNESS_ALLOW_COMMANDS").as_deref() != Ok("1")
+        {
+            control.stop("permission_denied");
+            finish(
+                &state,
+                &task_id,
+                Err(anyhow::anyhow!(
+                    "任务要求实际运行验收命令，但可信本机命令尚未启用；未开始修改"
+                )),
+            );
+            return;
+        }
         let state_for_log = state.clone();
         let task_for_log = task_id.clone();
         let task_for_cancel = task_id.clone();
@@ -709,33 +781,20 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 state_for_log.publish(event);
             }
         };
-        let is_cancelled = move || cancelled(&state_for_cancel, &task_for_cancel);
-        let state_for_evidence = state.clone();
-        let task_for_evidence = task_id.clone();
-        let evidence_secret = settings.api_key.clone();
-        let evidence = move |mut item: harness_core::CommandEvidence| {
-            item.command = redact_secret(&item.command, &evidence_secret);
-            item.output = redact_secret(&item.output, &evidence_secret);
-            if let Err(error) = state_for_evidence
-                .store
-                .lock()
-                .unwrap()
-                .record_evidence(&task_for_evidence, item)
-            {
-                tracing::error!(%error, "无法保存命令执行证据");
-            }
-        };
-        let state_for_events = state.clone();
-        let task_for_events = task_id.clone();
-        let execution_event = move |data| -> anyhow::Result<()> {
-            let event = state_for_events
-                .store
-                .lock()
-                .unwrap()
-                .execution_event(&task_for_events, data)?;
-            state_for_events.publish(event);
-            Ok(())
-        };
+        let cancel_control = control.clone();
+        let is_cancelled =
+            move || cancel_control.stopped() || cancelled(&state_for_cancel, &task_for_cancel);
+        let output = Arc::new(execution_control::ExecutionOutput::new(
+            state.clone(),
+            &task_id,
+            control.clone(),
+            agent.executor == "codex",
+            settings.api_key.clone(),
+        ));
+        let evidence_output = output.clone();
+        let evidence = move |item| evidence_output.evidence(item);
+        let event_output = output.clone();
+        let execution_event = move |data| event_output.emit(data);
         let state_for_inputs = state.clone();
         let task_for_inputs = task_id.clone();
         let claim_inputs = move || {
@@ -760,31 +819,43 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 }
                 Ok(())
             };
+        // This marker is metadata only; denying reads still needs a durable
+        // unavailable report, not a missing report that looks unfinished.
         let began_changes = state.store.lock().unwrap().begin_changes(&task_id);
         if let Err(error) = began_changes {
             finish(&state, &task_id, Err(error));
             return;
         }
-        let initial_secrets = continuation::known_secrets(&settings);
-        *report_secrets.lock().unwrap() = initial_secrets.clone();
-        let capture_root = root.clone();
-        match tokio::task::spawn_blocking(move || changes::capture(&capture_root, &initial_secrets))
+        if control.read_files_allowed() {
+            let initial_secrets = continuation::known_secrets(&settings);
+            *report_secrets.lock().unwrap() = initial_secrets.clone();
+            let capture_root = root.clone();
+            match tokio::task::spawn_blocking(move || {
+                changes::capture(&capture_root, &initial_secrets)
+            })
             .await
-        {
-            Ok(Ok(baseline)) => change_baseline = Some(baseline),
-            _ => {
-                publish_changes(
-                    &state,
-                    &task_id,
-                    json!({"state":"unavailable","reason":"无法安全采集项目基线；未启动执行器写入。"}),
-                );
-                finish(
-                    &state,
-                    &task_id,
-                    Err(anyhow::anyhow!("无法安全采集项目基线，任务未开始写入")),
-                );
-                return;
+            {
+                Ok(Ok(baseline)) => change_baseline = Some(baseline),
+                _ => {
+                    publish_changes(
+                        &state,
+                        &task_id,
+                        json!({"state":"unavailable","reason":"无法安全采集项目基线；未启动执行器写入。"}),
+                    );
+                    finish(
+                        &state,
+                        &task_id,
+                        Err(anyhow::anyhow!("无法安全采集项目基线，任务未开始写入")),
+                    );
+                    return;
+                }
             }
+        } else {
+            publish_changes(
+                &state,
+                &task_id,
+                json!({"state":"unavailable","reason":"任务禁止读取项目文件；未采集改动基线或文件报告。"}),
+            );
         }
         if is_cancelled() {
             Err(anyhow::anyhow!("任务已取消"))
@@ -796,8 +867,10 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                         // Codex config edit cannot change the summary identity between
                         // cache validation and the actual provider call.
                         let settings = configuration::resolve(&settings)?;
-                        let config =
-                            continuation::native_identity(&settings, &root, &agent, &context)?;
+                        let config = continuation::fingerprint(&json!({
+                            "identity":continuation::native_identity(&settings, &root, &agent, &context)?,
+                            "execution_controls":control.controls,
+                        }));
                         let memory = if task["task_kind"] == "main" {
                             state
                                 .store
@@ -810,7 +883,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                         let state_for_summary = state.clone();
                         let task_for_summary = task_id.clone();
                         let main = task["task_kind"] == "main";
-                        provider::execute_with_control(
+                        provider::execute_with_runtime(
                             &settings,
                             &root,
                             input,
@@ -831,6 +904,8 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                             },
                             claim_inputs,
                             ack_inputs,
+                            Some(&control),
+                            Some(&project),
                         )
                         .await
                     }
@@ -845,6 +920,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                                 &root,
                                 &agent,
                                 &context,
+                                &is_cancelled,
                             )
                             .await?;
                             let prior = state
@@ -866,7 +942,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                         let state_for_lifecycle = state.clone();
                         let task_for_lifecycle = task_id.clone();
                         let known_secrets = continuation::known_secrets(&settings);
-                        codex::execute_with_control(
+                        let result = codex::execute_with_control(
                             &settings.codex_binary,
                             &agent.model,
                             &root,
@@ -891,11 +967,17 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                             ack_inputs,
                             |secrets| report_secrets.lock().unwrap().extend_from_slice(secrets),
                         )
-                        .await
-                        .map(|text| redact_secret(&text, &settings.api_key))
-                        .map_err(|error| {
-                            anyhow::anyhow!(redact_secret(&error.to_string(), &settings.api_key))
-                        })
+                        .await;
+                        let flushed = output.flush();
+                        result
+                            .and_then(|text| flushed.map(|()| text))
+                            .map(|text| redact_secret(&text, &settings.api_key))
+                            .map_err(|error| {
+                                anyhow::anyhow!(redact_secret(
+                                    &error.to_string(),
+                                    &settings.api_key
+                                ))
+                            })
                     }
                     .await
                 }
@@ -904,11 +986,46 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         }
     };
     if let Some(baseline) = change_baseline {
-        let report_root = root.clone();
-        let secrets = report_secrets.lock().unwrap().clone();
-        let report = tokio::task::spawn_blocking(move || changes::finish(&report_root, baseline, &secrets))
+        if !state
+            .store
+            .lock()
+            .unwrap()
+            .execution_cleanup_settled(&task_id)
+            .unwrap_or(false)
+        {
+            publish_changes(
+                &state,
+                &task_id,
+                json!({"state":"unavailable","reason":"在途文件操作的清理尚未确认；不生成稳定结束报告。"}),
+            );
+        } else if report_control
+            .as_ref()
+            .is_some_and(|control| !control.read_files_allowed())
+        {
+            publish_changes(
+                &state,
+                &task_id,
+                json!({"state":"unavailable","reason":"文件读取权限已撤销；不再采集或公开项目改动报告。"}),
+            );
+        } else {
+            let report_root = root.clone();
+            let secrets = report_secrets.lock().unwrap().clone();
+            let report = tokio::task::spawn_blocking(move || changes::finish(&report_root, baseline, &secrets))
             .await.ok().and_then(Result::ok).unwrap_or_else(|| json!({"state":"unavailable","reason":"改动报告采集未完成；任务实际结果与文件仍保留。"}));
-        publish_changes(&state, &task_id, report);
+            // A policy update during the bounded scan also prevents publication.
+            if report_control
+                .as_ref()
+                .is_some_and(|control| !control.read_files_allowed())
+            {
+                publish_changes(
+                    &state,
+                    &task_id,
+                    json!({"state":"unavailable","reason":"文件读取权限已撤销；本次改动报告不公开。"}),
+                );
+            } else {
+                publish_changes(&state, &task_id, report);
+            }
+        }
     }
     drop(permit);
     finish(&state, &task_id, result);
@@ -995,6 +1112,41 @@ pub fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_settings_never_reset_omitted_permissions_or_role_controls() {
+        let mut settings = Settings::default();
+        settings.execution_controls.permissions.write_files = harness_core::PermissionMode::Deny;
+        settings.execution_controls.permissions.run_commands = harness_core::PermissionMode::Deny;
+        settings.agents[0].controls = Some(settings.execution_controls.clone());
+        let updated = patch_settings(
+            &settings,
+            &json!({"execution_controls":{"budget":{"max_runtime_seconds":5}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            updated.execution_controls.permissions,
+            settings.execution_controls.permissions
+        );
+        assert_eq!(updated.execution_controls.budget.max_runtime_seconds, 5);
+        let mut agents = serde_json::to_value(&settings.agents).unwrap();
+        agents[0].as_object_mut().unwrap().remove("controls");
+        let updated = patch_settings(&settings, &json!({"agents":agents})).unwrap();
+        assert_eq!(updated.agents[0].controls, settings.agents[0].controls);
+        agents[0]["controls"] = Value::Null;
+        assert!(patch_settings(&settings, &json!({"agents":agents}))
+            .unwrap()
+            .agents[0]
+            .controls
+            .is_none());
+        for patch in [
+            json!({"execution_controls":null}),
+            json!({"execution_controls":{"permissions":null}}),
+            json!({"execution_controls":{"budget":{"unknown":1}}}),
+        ] {
+            assert!(patch_settings(&settings, &patch).is_err());
+        }
+    }
 
     #[test]
     fn validates_numeric_event_cursors_and_header_agreement() {

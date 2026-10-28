@@ -1,4 +1,5 @@
 import { Loader2, Terminal, Waypoints } from "lucide-react";
+import { ExecutionCleanupNotice } from "./execution-settings";
 import { TaskSupplements } from "./task-controls";
 import { taskTools } from "../event-state";
 import { activeTask, type RunEvent, type TaskRun } from "../types";
@@ -55,6 +56,7 @@ export function LiveTaskMessage({ task, events }: { task: TaskRun; events: RunEv
       <div className="message-text">{!running && task.result ? task.result : task.stream_output || "任务正在执行，等待回复或工具结果…"}</div>
       {task.stream_output_truncated && <p className="help-text">过程回复已达到保留上限；任务终态与最终结果仍会更新。</p>}
       {!running && task.error && <p className="task-error">{task.error}</p>}
+      <ExecutionCleanupNotice task={task} />
       <ToolActivity task={task} events={events} />
       <TaskUsage taskId={task.id} events={events} />
       <TaskContext task={task} events={events} />

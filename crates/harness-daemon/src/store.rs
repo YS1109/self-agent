@@ -13,6 +13,8 @@ use crate::{
 
 mod changes;
 mod continuation;
+mod decisions;
+pub(crate) mod execution;
 mod steering;
 
 const MAX_NODES: usize = 12;
@@ -48,7 +50,9 @@ impl Store {
         )?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_contexts(id TEXT PRIMARY KEY, body TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS task_changes(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS task_changes(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS execution_requests(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, body TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS execution_requests_task ON execution_requests(task_id);",
         )?;
         // One atomic migration preserves legacy UUIDs and insertion order. An
         // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
@@ -119,6 +123,8 @@ impl Store {
 
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
+        decisions::recover_pending(&tx)?;
+        execution::recover_execution_cleanup(&tx)?;
         changes::recover_changes(&tx)?;
         for mut state in rows(&tx, "session_contexts")? {
             if state["executor"] == "codex"
@@ -176,6 +182,9 @@ impl Store {
             }
             if task["status"] == "running" && task["task_kind"] != "plan" {
                 task["status"] = json!("failed");
+                if task["stop_reason"].is_null() {
+                    task["stop_reason"] = json!("daemon_interrupted");
+                }
                 task["error"] = json!("后台在执行过程中重启。请检查已有项目修改后再安排后续工作；此任务没有自动重放。");
                 terminal_steps(&mut task, false);
                 complete_transaction(&tx, &mut task)?;
@@ -216,6 +225,7 @@ impl Store {
             "sessions":sessions, "tasks":tasks, "plans":plans, "events":events,
             "event_cursor":event_cursor,
             "context_states":self.public_context_states()?,
+            "execution_requests":rows(&self.db,"execution_requests")?,
             "plan_changes":rows(&self.db,"plan_changes")?,
             "deliveries":rows(&self.db,"deliveries")?, "selections":rows(&self.db,"selections")?,
             "capabilities":[
@@ -374,6 +384,14 @@ impl Store {
         let mut receipt = json!({"command_id":command_id,"status":"accepted"});
         let produced;
         match kind {
+            "answer_request" | "decide_request" => {
+                // All current authenticated endpoints are local-owner only. Source
+                // routing strings are not used as authority for decisions.
+                let item = decisions::decide(&tx, command, "local_owner")?;
+                receipt["task_id"] = json!(item.task_id);
+                receipt["session_id"] = json!(item.session_id);
+                produced = Some(item);
+            }
             "create_session" => {
                 let title = bounded_text(command, "title", 200)?;
                 let project_path = std::fs::canonicalize(text(command, "project_path")?)
@@ -548,6 +566,26 @@ impl Store {
                     task["continuation_request"] = json!(continuation_request);
                 }
                 task["main_sequence"] = json!(sequence);
+                let controls = execution::resolve_controls(
+                    &settings.execution_controls,
+                    agent.controls.as_ref(),
+                    None,
+                    &agent.executor,
+                )?;
+                let prior_controls = previous
+                    .as_ref()
+                    .and_then(|task| task.get("controls"))
+                    .filter(|value| !value.is_null())
+                    .map(|value| {
+                        serde_json::from_value::<harness_core::TaskControls>(value.clone())
+                    })
+                    .transpose()?;
+                task["controls"] = json!(execution::resolve_controls(
+                    &controls,
+                    prior_controls.as_ref(),
+                    command.get("controls"),
+                    &agent.executor
+                )?);
                 task["agent"] = json!(agent);
                 task["context_config"] = json!(context);
                 let task_id = text(&task, "id")?.to_owned();
@@ -606,6 +644,12 @@ impl Store {
                     None,
                     None,
                 );
+                task["controls"] = json!(execution::resolve_controls(
+                    &settings.execution_controls,
+                    agent.controls.as_ref(),
+                    command.get("controls"),
+                    &agent.executor
+                )?);
                 task["agent"] = json!(agent);
                 task["context_config"] = json!(context);
                 let id = text(&task, "id")?.to_string();
@@ -1035,6 +1079,19 @@ impl Store {
         Ok(record(&self.db, "tasks", task_id)?["status"] == "cancelled")
     }
 
+    pub(crate) fn execution_stopped(&self, task_id: &str) -> Result<bool> {
+        let task = record(&self.db, "tasks", task_id)?;
+        Ok(
+            !matches!(task["status"].as_str(), Some("running" | "waiting_input"))
+                || !task["stop_reason"].is_null(),
+        )
+    }
+
+    pub(crate) fn execution_cleanup_settled(&self, task_id: &str) -> Result<bool> {
+        let task = record(&self.db, "tasks", task_id)?;
+        Ok(task["execution_cleanup"].is_null() || task["execution_cleanup"] == "settled")
+    }
+
     pub fn task_may_start(&self, task_id: &str) -> Result<bool> {
         let task = record(&self.db, "tasks", task_id)?;
         Ok(task["status"] == "running" && task_plan_dispatchable(&self.db, &task)?)
@@ -1120,6 +1177,9 @@ impl Store {
             bail!("计划父任务只能由主智能体回顾或用户取消来结束");
         }
         let result = result.and_then(|result| {
+            if !execution::verification_complete(&task)? {
+                bail!("任务固化的验收命令尚无最终修改后的成功证据");
+            }
             if let Some(command) = task["acceptance_command"].as_str() {
                 if !has_passing_evidence(&task, command) {
                     bail!("验收命令未取得真实的成功退出证据：{command}");
@@ -1537,6 +1597,12 @@ fn snapshot_agent(
     }
     let context =
         crate::model_config::resolve(&settings.model_contexts, &agent.model, Some(&agent))?;
+    agent.controls = Some(execution::resolve_controls(
+        &settings.execution_controls,
+        agent.controls.as_ref(),
+        None,
+        &agent.executor,
+    )?);
     agent.context_window = Some(context.context_window);
     agent.compression_threshold = Some(context.compression_threshold);
     Ok((agent, context))
@@ -1604,7 +1670,10 @@ fn active_task_count(db: &Connection) -> Result<usize> {
         .iter()
         .filter(|task| {
             task["task_kind"] != "plan"
-                && matches!(task["status"].as_str(), Some("running" | "queued"))
+                && matches!(
+                    task["status"].as_str(),
+                    Some("running" | "queued" | "waiting_input")
+                )
         })
         .count())
 }
@@ -1616,6 +1685,14 @@ fn main_history_messages(task: &Value) -> Vec<Value> {
     for input in &inputs {
         if input["status"] == "applied" {
             messages.push(json!({"role":"user","content":input["content"]}));
+        }
+    }
+    for answered in task["question_answers"].as_array().into_iter().flatten() {
+        if let (Some(prompt), Some(answer)) =
+            (answered["prompt"].as_str(), answered["answer"].as_str())
+        {
+            messages.push(json!({"role":"assistant","content":format!("此前任务提出的问题（不是授权请求）：{prompt}")}));
+            messages.push(json!({"role":"user","content":answer}));
         }
     }
     let unapplied: Vec<_> = inputs
@@ -1665,6 +1742,10 @@ fn terminal_steps(task: &mut Value, success: bool) {
     }
 }
 fn complete_transaction(tx: &Transaction<'_>, task: &mut Value) -> Result<RunEvent> {
+    if task["status"] == "cancelled" && task["stop_reason"].is_null() {
+        task["stop_reason"] = json!("user_cancelled");
+    }
+    decisions::cancel_for_task(tx, text(task, "id")?, "任务已结束，未执行待授权操作")?;
     steering::finalize(task);
     task["updated_at"] = json!(now());
     put(tx, "tasks", task)?;
@@ -2219,6 +2300,7 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                         requested_agent(&nodes[index])?,
                     )?);
                     let agent: AgentProfile = serde_json::from_value(task["agent"].clone())?;
+                    task["controls"] = json!(agent.controls.clone().unwrap_or_default());
                     task["context_config"] = json!(crate::model_config::resolve(
                         &std::collections::BTreeMap::new(),
                         &agent.model,
@@ -3519,6 +3601,7 @@ mod tests {
         let first = store.claim_task().unwrap().unwrap();
         let mut expected_agent = original.agents[0].clone();
         expected_agent.context_window = Some(64_000);
+        expected_agent.controls = Some(original.execution_controls.clone());
         assert_eq!(first["agent"], json!(expected_agent));
         assert_eq!(first["context_config"]["context_window"], 64_000);
         assert_eq!(first["context_config"]["compression_threshold"], 55);

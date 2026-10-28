@@ -58,6 +58,9 @@ import { Status } from "./components/status";
 import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/agent-settings";
 import { QuickModelSelect, useModelCatalog } from "./components/model-select";
 import { ProviderSettings } from "./components/provider-settings";
+import { ExecutionCleanupNotice, ExecutionSettings, TaskExecutionDetails } from "./components/execution-settings";
+import { ExecutionRequests } from "./components/execution-requests";
+import { defaultExecutionControls, controlsForTask, executionControlsError, settingsExecutionError } from "./execution-controls";
 import { ModelContextSettings } from "./components/model-context-settings";
 import { applyUiScale, DEFAULT_UI_SCALE, readUiScale, saveUiScale, UI_SCALE_OPTIONS } from "./ui-preferences";
 import { syncNativeTheme, type AppTheme } from "./theme";
@@ -75,6 +78,7 @@ import {
   type Settings,
   type SourceContext,
   type TaskRun,
+  type TaskControls,
 } from "./types";
 
 type Panel = "plan" | "changes" | "artifacts" | "task";
@@ -168,6 +172,7 @@ function TaskCard({
           </span>
         </div>
         {task.agent && <div className="task-model-preset" title={`模型预设：${agentModelLabel(task.agent)}`}>模型预设：{agentModelLabel(task.agent)}</div>}
+        <ExecutionCleanupNotice task={task} />
         {task.steps.length > 0 && (
           <div className="task-progress">
             <span style={{ width: `${(done / task.steps.length) * 100}%` }} />
@@ -210,6 +215,7 @@ export default function App() {
   const [planLayouts, setPlanLayouts] = useState<Record<string, PlanLayoutDraft>>({});
   const commandGate = useRef(createCommandGate());
   const [inputTargets, setInputTargets] = useState<Record<string, InputTarget>>({});
+  const [executionDrafts, setExecutionDrafts] = useState<Record<string, TaskControls | undefined>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [settings, setSettings] = useState<Settings>({
     base_url: "",
@@ -266,6 +272,9 @@ export default function App() {
   );
   const draftKey = sessionId ?? "new";
   const draft = drafts[draftKey] ?? "";
+  const executionDraft = executionDrafts[draftKey];
+  const sessionRequests = (snapshot.execution_requests ?? []).filter(request => request.session_id === sessionId);
+  const pendingRequestCount = sessionRequests.filter(request => request.status === "pending").length;
   const inputTarget = inputTargets[draftKey] ?? { mode: "queue" as const };
   const steerableTasks = tasks.filter(canSteer);
   const currentRunningTask = tasks.find(task => task.task_kind === "main" && task.status === "running");
@@ -330,7 +339,7 @@ export default function App() {
   const liveTextLength = tasks.filter(task => activeTask(task.status)).reduce((length, task) => length + (task.stream_output?.length ?? 0), 0);
   useEffect(() => {
     if (followScroll.current && scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [liveTextLength]);
+  }, [liveTextLength, pendingRequestCount]);
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key === "n") {
@@ -389,17 +398,23 @@ export default function App() {
     if (!session || !draft.trim() || busy || !connected) return;
     const key = draftKey;
     let value: Command;
-    try { value = inputCommand(session.id, inputTarget, draft, tasks); }
+    try {
+      value = inputCommand(session.id, inputTarget, draft, tasks);
+      if (value.type === "run_agent" && executionDraft) value = { ...value, controls: controlsForTask(executionDraft, settings.main_executor ?? "native") };
+    }
     catch (error) { setNotice(errorMessage(error)); return; }
     const receipt = await command(value);
     if (receipt) {
       setDrafts((old) => old[key] === draft ? { ...old, [key]: "" } : old);
+      if (value.type === "run_agent" && executionDraft) setExecutionDrafts(current => current[key] === executionDraft ? { ...current, [key]: undefined } : current);
       if (receipt.task_id && currentSessionId.current === session.id) setTaskId(receipt.task_id);
       if (receipt.supplement_id) setNotice(`补充已接收 · ${receipt.supplement_id.slice(0, 8)}，等待执行器应用；接收不代表已生效。`);
     }
   }
   async function saveSettings(event: FormEvent) {
     event.preventDefault();
+    const controlsError = settingsExecutionError(settingsForm);
+    if (controlsError) { setNotice(controlsError); return; }
     setBusy(true);
     setNotice("");
     try {
@@ -414,6 +429,7 @@ export default function App() {
         main_executor: settingsForm.main_executor ?? "native",
         models_endpoint: settingsForm.models_endpoint ?? "",
         model_contexts: settingsForm.model_contexts ?? {},
+        execution_controls: settingsForm.execution_controls ?? defaultExecutionControls(),
         ...(apiKey ? { api_key: apiKey } : {}),
       });
       setSettings(normalizeSettings(value));
@@ -774,6 +790,7 @@ export default function App() {
                   {tasks.filter(task => task.task_kind === "main" && (task.stream_output || task.status === "running")
                     && !session.messages.some(message => message.role === "assistant" && message.task_id === task.id))
                     .slice().reverse().map(task => <LiveTaskMessage key={`stream-${task.id}`} task={task} events={snapshot.events} />)}
+                  <ExecutionRequests requests={sessionRequests} tasks={tasks} disabled={busy || !connected} onCommand={command} />
                   {plans.length > 0 && (
                     <section className="tasks-section">
                       <div className="section-label"><Network size={13} />编排计划<span>{plans.length}</span></div>
@@ -839,6 +856,13 @@ export default function App() {
                   <p className="help-text">目标会话：{session.title} · 任务：{inputTarget.taskId}。{steeringUnavailable ? "请重新选择目标，或改为排队下一条；不会自动转投新任务。" : "接收后在执行器支持的安全边界应用，不保证立即生效。"}</p>
                 </> : <p className="help-text">目标会话：{session.title} · {session.id.slice(0, 8)}。创建独立主任务，已有任务运行时顺序排队；不会补充当前执行。</p>}
               </div>}
+              {session && inputTarget.mode === "queue" && <details className="next-execution-controls">
+                <summary>下一条执行预算与权限{executionDraft ? " · 已设置额外限制" : " · 使用后台默认值"}</summary>
+                <label className="execution-checkbox"><input type="checkbox" disabled={busy} checked={!!executionDraft}
+                  onChange={event => setExecutionDrafts(current => ({ ...current, [draftKey]: event.target.checked ? structuredClone(settings.execution_controls ?? defaultExecutionControls()) : undefined }))} />为下一条任务指定更严格限制</label>
+                {executionDraft && <ExecutionSettings value={executionDraft} executor={settings.main_executor ?? "native"} scope="task" disabled={busy}
+                  onChange={value => setExecutionDrafts(current => ({ ...current, [draftKey]: value }))} />}
+              </details>}
               <div
                 className={`composer ${!session ? "composer-inactive" : ""}`}
               >
@@ -876,7 +900,7 @@ export default function App() {
                   <div className="composer-submit">
                     <Button
                       size="small"
-                      disabled={!connected || !session || !draft.trim() || busy || steeringUnavailable}
+                      disabled={!connected || !session || !draft.trim() || busy || steeringUnavailable || (inputTarget.mode === "queue" && !!executionDraft && !!executionControlsError(executionDraft, settings.main_executor ?? "native"))}
                       onClick={() => void send()}
                       title="主智能体直接处理（⌘/Ctrl + Enter）"
                     >
@@ -1033,6 +1057,8 @@ export default function App() {
                   <TaskUsage taskId={selectedTask.id} events={snapshot.events} />
                   <TaskContext task={selectedTask} events={snapshot.events} />
                   <TaskSupplements task={selectedTask} />
+                  <TaskExecutionDetails task={selectedTask} />
+                  <ExecutionRequests requests={sessionRequests.filter(request => request.task_id === selectedTask.id)} tasks={[selectedTask]} disabled={busy || !connected} onCommand={command} />
                   {selectedTask.continued_from && <p className="help-text">继续自任务 {selectedTask.continued_from}；这是新的执行，不是原任务重放。</p>}
                   {canContinue(selectedTask) && <ContinueTask key={selectedTask.id} task={selectedTask} disabled={busy || !connected} onCommand={command} onCreated={id => { if (currentSessionId.current === selectedTask.session_id) setTaskId(id); }} />}
                   <ExecutionEvidence evidence={selectedTask.evidence} />
@@ -1255,6 +1281,8 @@ export default function App() {
           </div>
           <ProviderSettings settings={settingsForm} saved={settings} onChange={setSettingsForm} apiKey={apiKey}
             onKeyChange={setApiKey} catalog={settingsForm.main_executor === "codex" ? codexModels : nativeModels} disabled={busy || !connected} />
+          <ExecutionSettings value={settingsForm.execution_controls ?? defaultExecutionControls()} executor={settingsForm.main_executor ?? "native"} disabled={busy}
+            onChange={execution_controls => setSettingsForm(current => ({ ...current, execution_controls }))} />
           <ModelContextSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy} catalogs={[nativeModels, codexModels]} />
           <AgentSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy}
             nativeModels={nativeModels} codexModels={codexModels} codexPathChanged={settingsForm.codex_binary !== settings.codex_binary} />
@@ -1278,7 +1306,7 @@ export default function App() {
             >
               取消
             </Button>
-            <Button disabled={busy || !connected} type="submit">
+            <Button disabled={busy || !connected || !!settingsExecutionError(settingsForm)} type="submit">
               保存设置
             </Button>
           </div>

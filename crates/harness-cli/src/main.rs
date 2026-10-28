@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 const HELP: &str = r#"Self Agent 命令行客户端
 
-用法：self-agent-cli [--data-dir 目录] [--conversation 来源会话] [--command-id 幂等ID] [--wait 秒] [--follow] 命令 [参数]
+用法：self-agent-cli [--data-dir 目录] [--conversation 来源会话] [--command-id 幂等ID] [--wait 秒] [--follow] [--controls JSON文件|-] 命令 [参数]
 
   sessions                         列出会话
   create <标题> <项目绝对路径>       创建并选择会话
@@ -22,6 +22,10 @@ const HELP: &str = r#"Self Agent 命令行客户端
   steer <任务ID> <内容|->           补充指定任务（接收不代表已应用）
   continue <任务ID> [内容|-]        从终态主任务创建新的继续任务
   changes <任务ID>                  查看只读执行区间改动报告
+  requests [任务ID]                 列出持久化问题与逐次授权请求
+  answer <请求ID> <修订> <回答|->   回答问题（不授予执行权限）
+  approve <请求ID> <修订> <摘要>    仅批准此请求绑定的具体操作
+  deny <请求ID> <修订> <摘要>       拒绝此操作
   follow <任务ID>                   跟随已有任务的持久化事件与终态
   settings [JSON文件|-]             查看公开设置或提交设置补丁
   models [JSON文件|-]               从当前或草稿Endpoint获取模型
@@ -30,9 +34,14 @@ const HELP: &str = r#"Self Agent 命令行客户端
 先独立启动 harness-daemon。客户端读取同一数据目录的私有 daemon.json，
 自动进行本机认证；不需要桌面窗口。所有成功输出为JSON，错误写入标准错误。
 --wait 适用于返回任务ID的命令及follow；终态失败或超时会返回非零退出码。
---follow 用于run、steer、continue或返回任务ID的command，逐行输出JSON收据、事件和任务快照。
+--follow 用于run、steer、continue、answer、approve、deny或返回任务ID的command，逐行输出JSON收据、事件和任务快照。
 follow先输出当前快照再跟随新事件；自动重连，恢复快照带reset:true。
 跟随默认等待3600秒，可用--wait覆盖；超时不会取消后台任务。
+跟随按任务终态退出；execution_cleanup为pending/unknown时仍需检查在途文件操作，
+不能把终态当作副作用已停止。task_snapshot会附带cleanup_notice，之后可用status查询。
+--controls 仅用于run，读取任务预算/权限JSON；只能收紧全局与角色限制。
+Codex仅支持runtime/output限制，内部请求/修复及逐工具权限不可伪装成受控。
+批准/拒绝必须先核对requests中的任务、操作、修订与完整action_digest；回答不是授权。
 输入密钥时请使用受保护的JSON文件或标准输入，避免写入命令参数。
 "#;
 
@@ -43,6 +52,7 @@ struct Options {
     command_id: String,
     wait: Option<u64>,
     follow: bool,
+    controls: Option<String>,
     command: String,
     args: Vec<String>,
 }
@@ -54,6 +64,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
         command_id: new_id(),
         wait: None,
         follow: false,
+        controls: None,
         command: String::new(),
         args: Vec::new(),
     };
@@ -61,12 +72,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--follow" => options.follow = true,
-            "--data-dir" | "--conversation" | "--command-id" | "--wait" => {
+            "--data-dir" | "--conversation" | "--command-id" | "--wait" | "--controls" => {
                 let value = args.next().context("选项缺少参数")?;
                 match arg.as_str() {
                     "--data-dir" => options.directory = PathBuf::from(value),
                     "--conversation" => options.conversation = value,
                     "--command-id" => options.command_id = value,
+                    "--controls" => {
+                        if options.controls.replace(value).is_some() {
+                            bail!("--controls 不能重复指定");
+                        }
+                    }
                     "--wait" => {
                         let seconds: u64 = value.parse().context("等待秒数必须是正整数")?;
                         if !(1..=86_400).contains(&seconds) {
@@ -180,7 +196,13 @@ impl Client {
 
 fn command(options: &Options) -> Result<Option<Value>> {
     let args = &options.args;
-    let value = match options.command.as_str() {
+    if options.controls.is_some() && options.command != "run" {
+        bail!("--controls 仅用于run；完整命令请在command JSON内指定controls");
+    }
+    if options.controls.as_deref() == Some("-") && args.get(1).map(String::as_str) == Some("-") {
+        bail!("任务内容与controls不能同时读取标准输入");
+    }
+    let mut value = match options.command.as_str() {
         "create" => {
             arity(options, 2, 2)?;
             json!({"type":"create_session","title":args[0],"project_path":args[1]})
@@ -206,6 +228,24 @@ fn command(options: &Options) -> Result<Option<Value>> {
             }
             value
         }
+        "answer" => {
+            arity(options, 3, 3)?;
+            let revision: u64 = args[1].parse().context("修订必须是非负整数")?;
+            json!({"type":"answer_request","request_id":args[0],"expected_revision":revision,"answer":input(&args[2],false)?})
+        }
+        "approve" | "deny" => {
+            arity(options, 3, 3)?;
+            let revision: u64 = args[1].parse().context("修订必须是非负整数")?;
+            let digest = &args[2];
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!("请提供requests中的完整小写SHA256操作摘要，不可省略或使用通配符");
+            }
+            json!({"type":"decide_request","request_id":args[0],"expected_revision":revision,"approve":options.command=="approve","action_digest":digest})
+        }
         "cancel" => {
             arity(options, 1, 1)?;
             json!({"type":"cancel_task","task_id":args[0]})
@@ -219,9 +259,19 @@ fn command(options: &Options) -> Result<Option<Value>> {
             }
             value
         }
-        "sessions" | "status" | "settings" | "models" | "follow" | "changes" => return Ok(None),
+        "sessions" | "status" | "settings" | "models" | "follow" | "changes" | "requests" => {
+            return Ok(None)
+        }
         _ => bail!("未知命令，使用 --help 查看用法"),
     };
+    if let Some(path) = &options.controls {
+        let controls: Value =
+            serde_json::from_str(&input(path, true)?).context("执行控制JSON格式无效")?;
+        if !controls.is_object() {
+            bail!("执行控制必须为JSON对象");
+        }
+        value["controls"] = controls;
+    }
     Ok(Some(value))
 }
 
@@ -238,7 +288,7 @@ fn validate_follow(options: &Options, command: Option<&Value>) -> Result<()> {
     }
     if !matches!(
         options.command.as_str(),
-        "run" | "steer" | "continue" | "command"
+        "run" | "steer" | "continue" | "answer" | "approve" | "deny" | "command"
     ) || !matches!(
         command.and_then(|value| value["type"].as_str()),
         Some(
@@ -249,10 +299,12 @@ fn validate_follow(options: &Options, command: Option<&Value>) -> Result<()> {
                 | "start_plan"
                 | "resume_plan"
                 | "cancel_task"
+                | "answer_request"
+                | "decide_request"
         )
     ) {
         bail!(
-            "--follow 仅适用于返回任务ID的run、steer、continue或command指令；已有任务请使用follow"
+            "--follow 仅适用于返回任务ID的run、steer、continue、answer、approve、deny或command指令；已有任务请使用follow"
         )
     }
     Ok(())
@@ -288,7 +340,18 @@ fn is_terminal(task: &Value) -> bool {
     )
 }
 
+fn cleanup_notice(task: &Value) -> Option<&'static str> {
+    match task["execution_cleanup"].as_str() {
+        Some("pending") => Some("在途文件操作仍在清理；即使任务已进入终态，也不能断言副作用已停止，请使用status查询并检查实际改动。"),
+        Some("unknown") => Some("后台中断后文件操作结果未知；请检查实际改动，不会自动重放。"),
+        _ => None,
+    }
+}
+
 fn terminal_result(task: &Value) -> Result<()> {
+    if let Some(notice) = cleanup_notice(task) {
+        eprintln!("注意：{notice}");
+    }
     if task["status"] != "completed" {
         bail!("任务未成功完成");
     }
@@ -309,10 +372,12 @@ fn print_task_snapshot(
     cursor: u64,
     reset: bool,
 ) -> Result<()> {
-    write_ndjson(
-        output,
-        &json!({"type":"task_snapshot", "task":task, "event_cursor":cursor, "reset":reset}),
-    )
+    let mut envelope =
+        json!({"type":"task_snapshot", "task":task, "event_cursor":cursor, "reset":reset});
+    if let Some(notice) = cleanup_notice(task) {
+        envelope["cleanup_notice"] = json!(notice);
+    }
+    write_ndjson(output, &envelope)
 }
 
 const MAX_SSE_FRAME_BYTES: usize = 512 * 1024;
@@ -598,6 +663,12 @@ async fn follow_loop(
 async fn run(options: Options) -> Result<()> {
     let command = command(&options)?;
     validate_follow(&options, command.as_ref())?;
+    if options.command == "requests" {
+        arity(&options, 0, 1)?;
+        if options.wait.is_some() || options.follow {
+            bail!("requests为只读查询，不支持--wait或--follow");
+        }
+    }
     let changes_path = (options.command == "changes")
         .then(|| changes_route(&options))
         .transpose()?;
@@ -647,6 +718,20 @@ async fn run(options: Options) -> Result<()> {
             .await?
     } else {
         match options.command.as_str() {
+            "requests" => {
+                let snapshot = client.request("GET", "/api/v1/snapshot", None).await?;
+                let requests = snapshot["execution_requests"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                json!(requests
+                    .into_iter()
+                    .filter(|request| options
+                        .args
+                        .first()
+                        .is_none_or(|id| request["task_id"] == *id))
+                    .collect::<Vec<_>>())
+            }
             "sessions" | "status" => {
                 arity(&options, 0, usize::from(options.command == "status"))?;
                 let snapshot = client.request("GET", "/api/v1/snapshot", None).await?;
@@ -851,6 +936,102 @@ mod tests {
         assert!(changes_route(&parsed(&["changes"])).is_err());
         assert!(changes_route(&parsed(&["--wait", "1", "changes", "t"])).is_err());
         assert!(changes_route(&parsed(&["--follow", "changes", "t"])).is_err());
+    }
+
+    #[test]
+    fn decisions_bind_revision_and_exact_digest_and_do_not_confuse_answers() {
+        let parsed = |args: &[&str]| {
+            parse(args.iter().map(|value| (*value).to_owned()))
+                .unwrap()
+                .unwrap()
+        };
+        let digest = "a".repeat(64);
+        let answer = parsed(&["--follow", "answer", "request", "2", "保留原名"]);
+        assert_eq!(
+            command(&answer).unwrap().unwrap(),
+            json!({"type":"answer_request","request_id":"request","expected_revision":2,"answer":"保留原名"})
+        );
+        assert!(validate_follow(&answer, command(&answer).unwrap().as_ref()).is_ok());
+        for name in ["approve", "deny"] {
+            let options = parsed(&["--follow", name, "request", "0", &digest]);
+            assert_eq!(
+                command(&options).unwrap().unwrap(),
+                json!({"type":"decide_request","request_id":"request","expected_revision":0,"approve":name=="approve","action_digest":digest})
+            );
+            assert!(validate_follow(&options, command(&options).unwrap().as_ref()).is_ok());
+        }
+        for args in [
+            vec!["approve", "r", "0"],
+            vec!["approve", "r", "-1", &digest],
+            vec!["deny", "r", "0", "*"],
+            vec!["answer", "r", "not-a-revision", "yes"],
+        ] {
+            assert!(command(&parsed(&args)).is_err());
+        }
+    }
+
+    #[test]
+    fn controls_are_run_only_json_and_cannot_consume_stdin_twice() {
+        let parsed = |args: &[&str]| {
+            parse(args.iter().map(|value| (*value).to_owned()))
+                .unwrap()
+                .unwrap()
+        };
+        let file = std::env::temp_dir().join(format!("cli-controls-{}.json", new_id()));
+        std::fs::write(
+            &file,
+            r#"{"budget":{"max_runtime_seconds":12},"permissions":{"run_commands":"ask"}}"#,
+        )
+        .unwrap();
+        let options = parsed(&["--controls", file.to_str().unwrap(), "run", "s", "目标"]);
+        assert_eq!(
+            command(&options).unwrap().unwrap()["controls"],
+            json!({"budget":{"max_runtime_seconds":12},"permissions":{"run_commands":"ask"}})
+        );
+        assert!(command(&parsed(&[
+            "--controls",
+            file.to_str().unwrap(),
+            "send",
+            "s",
+            "目标"
+        ]))
+        .is_err());
+        assert!(command(&parsed(&["--controls", "-", "run", "s", "-"])).is_err());
+        std::fs::write(&file, "[]").unwrap();
+        assert!(command(&options).is_err());
+        std::fs::remove_file(file).unwrap();
+        assert!(parse(
+            ["--controls", "a", "--controls", "b", "run"]
+                .into_iter()
+                .map(String::from)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn terminal_follow_exposes_unsettled_cleanup_without_changing_exit_semantics() {
+        for state in ["pending", "unknown"] {
+            for status in ["completed", "cancelled", "failed"] {
+                let task = json!({"id":"t","status":status,"execution_cleanup":state});
+                let mut output = Vec::new();
+                print_task_snapshot(&mut output, &task, 3, false).unwrap();
+                let envelope: Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(envelope["task"]["execution_cleanup"], state);
+                assert!(envelope["cleanup_notice"].as_str().is_some());
+                assert_eq!(terminal_result(&task).is_ok(), status == "completed");
+            }
+        }
+        for task in [
+            json!({"status":"completed"}),
+            json!({"status":"completed","execution_cleanup":"settled"}),
+        ] {
+            let mut output = Vec::new();
+            print_task_snapshot(&mut output, &task, 4, true).unwrap();
+            assert!(serde_json::from_slice::<Value>(&output)
+                .unwrap()
+                .get("cleanup_notice")
+                .is_none());
+        }
     }
 
     #[test]
@@ -1112,6 +1293,30 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("无法连接本机后台服务"));
+    }
+
+    #[tokio::test]
+    async fn decision_follow_submits_once_then_reads_and_request_list_only_gets() {
+        let digest = "a".repeat(64);
+        for (args, expected) in [
+            (
+                vec!["--follow", "--wait", "3", "answer", "r", "0", "答案"],
+                json!({"type":"answer_request","request_id":"r","expected_revision":0,"answer":"答案"}),
+            ),
+            (
+                vec!["--follow", "--wait", "3", "approve", "r", "0", &digest],
+                json!({"type":"decide_request","request_id":"r","expected_revision":0,"approve":true,"action_digest":digest}),
+            ),
+        ] {
+            cli_fixture(&args,vec![
+                ("GET","/api/v1/snapshot",None,Some(snapshot_body(0,"waiting_input"))),
+                ("POST","/api/v1/commands",Some(expected),Some(json!({"status":"accepted","task_id":"t"}).to_string())),
+                ("GET","/api/v1/events?after=0",None,Some("id: 1\nevent: run_event\ndata: {\"sequence\":1,\"task_id\":\"t\",\"kind\":\"task_completed\"}\n\n".into())),
+                ("GET","/api/v1/snapshot",None,Some(snapshot_body(1,"completed"))),
+            ]).await.unwrap();
+        }
+        cli_fixture(&["requests","t"],vec![("GET","/api/v1/snapshot",None,Some(json!({"execution_requests":[{"id":"r","task_id":"t","kind":"approval","action_digest":digest}]}).to_string()))]).await.unwrap();
+        assert!(cli_fixture(&["deny","r","0",&digest],vec![("POST","/api/v1/commands",Some(json!({"type":"decide_request","request_id":"r","expected_revision":0,"approve":false,"action_digest":digest})),None)]).await.is_err());
     }
 
     struct MockReply {

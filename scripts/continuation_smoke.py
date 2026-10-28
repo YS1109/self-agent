@@ -2,10 +2,12 @@
 """Verify durable Native summaries and Codex continuation with local fixtures only."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import csv
 import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -312,6 +314,46 @@ def codex_smoke():
             time.sleep(0.25)
             assert trace(project) == before, "Daemon recovery replayed an in-flight turn"
             print("PASS Codex daemon interruption fails unknown task durably without replaying the turn")
+
+            for phase in ["config", "version"]:
+                marker = project / f"fixture-{phase}-stall"
+                marker.write_text("local deadline fixture")
+                (project / "fixture-probe-pid").unlink(missing_ok=True)
+                daemon.request("PUT", "/api/v1/settings", {"model": "success"})
+                before = len(starts(project))
+                identifier = daemon.command({"type": "run_agent", "session_id": session,
+                    "content": f"CODEX_{phase.upper()}_DEADLINE",
+                    "controls": {"budget": {"max_runtime_seconds": 1}}})["task_id"]
+                failed = wait_for(lambda: completed(daemon, identifier), timeout=15, description=f"Codex {phase} deadline")
+                assert failed["status"] == "failed" and failed["stop_reason"] == "runtime_exhausted", failed
+                assert (project / "fixture-probe-pid").exists(), "Fixture preflight process did not start"
+                pid = int((project / "fixture-probe-pid").read_text())
+                def reaped():
+                    if os.name == "nt":
+                        listing = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                            capture_output=True, text=True, check=True, timeout=5)
+                        return not any(len(row) > 1 and row[1] == str(pid)
+                            for row in csv.reader(listing.stdout.splitlines()))
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        return True
+                    return False
+                wait_for(reaped, timeout=5, description="Codex preflight child reaped")
+                assert len(starts(project)) == before, "Deadline must prevent thread/turn side effects"
+                marker.unlink()
+            print("PASS Codex version/config stalls obey task runtime deadline and reap preflight child")
+
+            daemon.request("PUT", "/api/v1/settings", {"model": "evidence-large"})
+            identifier = daemon.command({"type": "run_agent", "session_id": session,
+                "content": "CODEX_OUTPUT_BUDGET", "controls": {"budget": {"max_output_bytes": 1024}}})["task_id"]
+            bounded = wait_for(lambda: completed(daemon, identifier), timeout=15, description="Codex evidence budget")
+            assert bounded["status"] == "failed" and bounded["stop_reason"] == "output_budget_exhausted", bounded
+            assert bounded["budget_usage"]["output_bytes"] <= 1024, bounded
+            assert bounded["evidence"][-1]["exit_code"] == 0, bounded
+            assert not bounded["evidence"][-1]["output"], bounded
+            assert "证据" * 100 not in json.dumps(bounded, ensure_ascii=False), bounded
+            print("PASS Codex large command evidence obeys output cap without falsifying exit status")
         finally:
             daemon.stop()
 

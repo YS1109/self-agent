@@ -196,3 +196,7 @@ docs/                     产品计划和当前协议
 ### 0.7 开发分支的任务控制
 
 运行中明确选择补充当前任务或排队下一条；补充的接收、交付和实际结果分开展示。停止后可从指定历史任务创建新的继续任务，不重放旧任务。CLI 支持 `steer TASK_ID CONTENT`、`continue TASK_ID [CONTENT]`、`changes TASK_ID`。改动面板只展示有界执行区间差异，保留用户原文件和 index；为避免 Git filters 越权执行，概览只用有界 no-follow 解析器读取受支持的本地 SHA-1 index/HEAD/pack，不运行 Git。暂存元数据与原始工作区字节分列，转换和忽略规则未知；不支持的格式或安全失败明确显示未知。完整验证矩阵见 [0.7 验收跟踪](docs/acceptance-v0.7.md)。
+
+### 0.8 开发分支的执行控制切片
+
+设置、角色和单次任务可收紧预算与权限；Native 支持实际验收失败后的限次修复/复验、持久问题与逐次写入/命令授权。CLI 新增 `requests [TASK_ID]`、`answer REQUEST_ID REVISION TEXT|-`、`approve|deny REQUEST_ID REVISION DIGEST`，`run` 可用 `--controls FILE|-`。Codex 仅支持外层时长与公开输出限制，不支持的逐工具限制会拒绝，不能据此宣称已管理其内部 MCP。取消保留已发生副作用；在途文件写入会继续持有项目执行权直到清理完成，界面明确区分终态与清理状态。详见 [执行控制协议](docs/protocol-v7.md) 与 [0.8 迭代范围](docs/iteration-v0.8.md)。MCP / Skills、命名服务及系统凭据管理尚未由此切片交付。

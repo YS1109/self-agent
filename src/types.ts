@@ -99,6 +99,39 @@ export interface TaskContextCompaction {
   state: string;
   updated_at: string;
 }
+export type PermissionMode = "allow" | "ask" | "deny";
+export interface ExecutionBudget {
+  max_model_requests: number;
+  max_runtime_seconds: number;
+  max_retries: number;
+  max_repair_attempts: number;
+  max_output_bytes: number;
+}
+export interface TaskControls {
+  budget: ExecutionBudget;
+  permissions: { read_files: boolean; write_files: PermissionMode; run_commands: PermissionMode };
+  acceptance_commands: string[];
+}
+export interface TaskControlsInput {
+  budget?: Partial<ExecutionBudget>;
+  permissions?: Partial<TaskControls["permissions"]>;
+  acceptance_commands?: string[];
+}
+export interface BudgetUsage {
+  model_requests: number; retries: number; repair_attempts: number; output_bytes: number;
+  mutation_generation: number; started_at: string | null;
+}
+export interface VerificationAttempt {
+  id: string; command: string; exit_code: number | null; output: string;
+  mutation_generation: number; created_at: string;
+}
+export interface ExecutionRequest {
+  id: string; task_id: string; session_id: string; kind: "question" | "approval";
+  prompt: string; action: Record<string, unknown> | null; action_digest: string | null;
+  revision: number; status: "pending" | "answered" | "approved" | "denied" | "expired" | "cancelled";
+  expires_at_ms: number; answer: string | null; reason?: string;
+  created_at?: string; updated_at?: string; consumed_at?: string | null;
+}
 export interface TaskRun {
   id: string;
   session_id: string;
@@ -125,11 +158,19 @@ export interface TaskRun {
   context_compaction?: TaskContextCompaction | null;
   main_sequence?: number | null;
   evidence?: ExecutionEvidence[];
+  controls?: TaskControls | null;
+  budget_usage?: BudgetUsage | null;
+  stop_reason?: string | null;
+  execution_cleanup?: "pending" | "settled" | "unknown" | null;
+  execution_cleanup_updated_at?: string | null;
+  verification_attempts?: VerificationAttempt[];
+  waiting_request_id?: string | null;
 }
 export interface AgentProfile {
   id: string;
   name: string;
   instructions: string;
+  controls?: TaskControls | null;
   executor: "native" | "codex";
   model: string;
   context_window?: number | null;
@@ -236,6 +277,7 @@ export interface ContextState {
   updated_at: string;
 }
 export interface Snapshot {
+  execution_requests?: ExecutionRequest[];
   context_states?: ContextState[];
   event_cursor?: number;
   sessions: Session[];
@@ -252,6 +294,7 @@ export interface ModelContextConfig {
   compression_threshold: number;
 }
 export interface Settings {
+  execution_controls?: TaskControls;
   api_key_configured?: boolean;
   provider_source?: "manual" | "local_codex";
   configuration_error?: string | null;
@@ -270,9 +313,11 @@ export type Command =
   | { type: "create_session"; title: string; project_path: string }
   | { type: "select_session"; session_id: string }
   | { type: "send_message"; session_id?: string; content: string }
-  | { type: "run_agent"; session_id?: string; content: string }
-  | { type: "start_task"; session_id?: string; title: string }
+  | { type: "run_agent"; session_id?: string; content: string; controls?: TaskControlsInput }
+  | { type: "start_task"; session_id?: string; title: string; controls?: TaskControlsInput }
   | { type: "cancel_task"; task_id: string }
+  | { type: "answer_request"; request_id: string; expected_revision: number; answer: string }
+  | { type: "decide_request"; request_id: string; expected_revision: number; approve: boolean; action_digest: string }
   | { type: "steer_task"; task_id: string; content: string }
   | { type: "continue_task"; task_id: string; content?: string }
   | { type: "update_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }

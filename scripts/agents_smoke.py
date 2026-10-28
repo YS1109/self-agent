@@ -121,6 +121,9 @@ def main():
                 "api_key": "fixture-secret-not-for-storage",
                 "model_contexts": contexts,
             })
+            defaults = daemon.request("GET", "/api/v1/settings")["execution_controls"]
+            for expected in expected_agents:
+                expected["controls"] = defaults
             session_id = daemon.command({
                 "type": "create_session", "title": "角色协议验证", "project_path": str(project),
             }, REMOTE)["session_id"]

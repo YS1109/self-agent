@@ -1,3 +1,5 @@
+import { ExecutionSettings } from "./execution-settings";
+import { defaultExecutionControls, executionControlsError, intersectExecutionControls } from "../execution-controls";
 import { Bot, Plus, Trash2, Users } from "lucide-react";
 import { agentModelLabel } from "../agent-model";
 import { agentModelContext } from "../model-context";
@@ -92,6 +94,14 @@ export function AgentSettings({
             </div>
             <p className="help-text">留空分别继承所用模型的统一配置。只覆盖其中一项，另一项继续继承。</p>
             {agent.executor === "codex" && !agent.model && <p className="help-text">Codex 模型未固定时使用应用默认上下文策略；选择具体模型后可继承该模型的统一配置。</p>}
+            <details className="role-execution-controls">
+              <summary>角色执行预算与权限 · {agent.controls ? "已设额外限制" : "继承全局设置"}</summary>
+              <label className="execution-checkbox"><input type="checkbox" aria-label={`角色 ${index + 1} · 自定义执行限制`} checked={!!agent.controls} disabled={disabled}
+                onChange={event => update(agent.id, { controls: event.target.checked ? structuredClone(settings.execution_controls ?? defaultExecutionControls()) : null })} />为此角色指定额外限制</label>
+              <p className="help-text">切换模型或执行器不会清除这里的限制。取消勾选只移除角色额外限制，全局策略仍然生效。</p>
+              {agent.controls && <ExecutionSettings value={agent.controls} executor={agent.executor} scope="role" disabled={disabled} onChange={controls => update(agent.id, { controls })} />}
+              {executionControlsError(intersectExecutionControls(settings.execution_controls ?? defaultExecutionControls(), agent.controls), agent.executor) && <p className="execution-warning" role="alert">此角色继承全局限制后当前无法执行：{executionControlsError(intersectExecutionControls(settings.execution_controls ?? defaultExecutionControls(), agent.controls), agent.executor)} 不会自动放宽；请核对全局策略或选用 Native。</p>}
+            </details>
             <label>角色指令<textarea value={agent.instructions} rows={3} placeholder="描述角色职责、执行约束和结果要求" onChange={(event) => update(agent.id, { instructions: event.target.value })} /></label>
           </fieldset>
         ))}

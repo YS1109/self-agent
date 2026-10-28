@@ -40,6 +40,8 @@ jobs:
       - run: python scripts/continuation_smoke.py
       - run: python scripts/steering_smoke.py
       - run: python scripts/changes_smoke.py
+      - run: python scripts/budget_smoke.py
+      - run: python scripts/execution_control_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}
