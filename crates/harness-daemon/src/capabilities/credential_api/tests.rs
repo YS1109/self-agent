@@ -106,7 +106,7 @@ impl Fixture {
             .join("../../scripts/mcp_fixture.py")
             .canonicalize()
             .unwrap();
-        self.post("/api/v1/capabilities/commands",json!({"id":new_id(),"command":{"type":"save_mcp_server","definition":{"name":"私有环境夹具","program":python(),"args":["-I",script,"credential-json-text"],"credential_slots":["MCP_TOKEN"],"credential_refs":{},"enabled":false,"protocol":"modern2026"}}})).await["capability_id"].as_str().unwrap().into()
+        self.post("/api/v1/capabilities/commands",json!({"id":new_id(),"command":{"type":"save_mcp_server","definition":{"name":"私有环境夹具","program":python(),"args":["-I","-X","utf8",script,"credential-json-text"],"credential_slots":["MCP_TOKEN"],"credential_refs":{},"enabled":false,"protocol":"modern2026"}}})).await["capability_id"].as_str().unwrap().into()
     }
     async fn operation(&self, id: &str, status: &str) -> Value {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -136,6 +136,9 @@ impl Fixture {
                     .find(|v| v["id"] == id)
                     .unwrap()
                     .clone();
+                if status == Some("ready") && v["status"] == "unavailable" {
+                    panic!("MCP fixture discovery unavailable: {v}");
+                }
                 if status.is_none_or(|status| v["status"] == status) {
                     return v;
                 }
