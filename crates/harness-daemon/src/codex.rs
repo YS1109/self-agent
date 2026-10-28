@@ -114,8 +114,20 @@ pub(crate) async fn list_models(binary: &str) -> Result<Vec<Value>> {
 
 /// Read effective project configuration without starting a thread or invoking a model.
 /// Raw configuration (including headers) never escapes this function.
+#[allow(dead_code)]
 pub(crate) async fn probe_config_identity(binary: &str, root: &Path) -> Result<Value> {
-    let root = root.canonicalize().context("Codex 项目目录不可访问")?;
+    probe_config_identity_with_control(binary, root, &|| false).await
+}
+
+pub(crate) async fn probe_config_identity_with_control(
+    binary: &str,
+    root: &Path,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Value> {
+    if cancelled() {
+        bail!("Codex 配置检查已取消");
+    }
+    let root = root.to_path_buf();
     let mut command = Command::new(binary);
     command
         .args(["app-server", "--listen", "stdio://"])
@@ -132,18 +144,21 @@ pub(crate) async fn probe_config_identity(binary: &str, root: &Path) -> Result<V
     }
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
+    let _root_guard = open_root_nofollow(&root)?;
     let mut child = command
         .spawn()
         .map_err(|_| anyhow::anyhow!("无法读取 Codex 有效配置，请检查执行器安装"))?;
     let pid = child.id();
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
-    let result=timeout(Duration::from_secs(12),async {
+    let result = tokio::select! {
+        _ = wait_cancelled(cancelled) => Err(anyhow::anyhow!("Codex 配置检查已取消")),
+        result = timeout(Duration::from_secs(12),async {
         send(&mut stdin,json!({"id":1,"method":"initialize","params":{
             "clientInfo":{"name":"self_agent","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}
         }})).await?;
         let mut expected=1;
-        let mut private_config = None;
+        let mut private_config: Option<config_identity::PrivateConfig> = None;
         let mut total=0;
         loop {
             let mut line=Vec::new();
@@ -171,10 +186,107 @@ pub(crate) async fn probe_config_identity(binary: &str, root: &Path) -> Result<V
             }
             return private_config.as_ref().unwrap().with_account(&message["result"]);
         }
-    }).await.unwrap_or_else(|_|Err(anyhow::anyhow!("读取 Codex 有效配置超时，未启动任务")));
+    }) => result.unwrap_or_else(|_|Err(anyhow::anyhow!("读取 Codex 有效配置超时，未启动任务"))),
+    };
     drop(stdin);
     stop(&mut child, pid).await;
     result
+}
+
+/// Bounded, cancellable version inspection. Never initializes auth or a model.
+/// Kept available for newer controlled callers while the old wrapper stays valid.
+#[allow(dead_code)]
+pub(crate) async fn probe_version_with_control(
+    binary: &str,
+    root: &Path,
+    cancelled: &impl Fn() -> bool,
+) -> Result<String> {
+    if cancelled() {
+        bail!("Codex 版本检查已取消");
+    }
+    let mut command = Command::new(binary);
+    command
+        .arg("--version")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    crate::prepend_binary_directory(&mut command, binary);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let _root_guard = open_root_nofollow(root)?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("无法检查 Codex 版本"))?;
+    let pid = child.id();
+    let mut stdout = child.stdout.take().expect("piped stdout").take(4097);
+    let result = tokio::select! {
+        _ = wait_cancelled(cancelled) => Err(anyhow::anyhow!("Codex 版本检查已取消")),
+        result = timeout(Duration::from_secs(5), async {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).await.map_err(|_|anyhow::anyhow!("无法读取 Codex 版本"))?;
+            if output.len() > 4096 { bail!("Codex 版本响应超过安全预算"); }
+            if !child.wait().await.map_err(|_|anyhow::anyhow!("Codex 版本检查失败"))?.success() {
+                bail!("Codex 版本检查失败");
+            }
+            let version = std::str::from_utf8(&output).map_err(|_|anyhow::anyhow!("Codex 版本格式无效"))?.trim();
+            if version.is_empty() { bail!("Codex 版本响应为空"); }
+            Ok(version.to_owned())
+        }) => result.unwrap_or_else(|_|Err(anyhow::anyhow!("Codex 版本检查超时"))),
+    };
+    stop(&mut child, pid).await;
+    result
+}
+
+async fn wait_cancelled(cancelled: &impl Fn() -> bool) {
+    while !cancelled() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Never reinterpret a queued project path through a newly introduced symlink.
+/// Keep the checked handle alive, but do not claim portable path-based Codex
+/// cwd/sandbox parameters are an atomic capability against concurrent renames.
+fn open_root_nofollow(root: &Path) -> Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt;
+    use std::path::{Component, PathBuf};
+    if !root.is_absolute() {
+        bail!("Codex 项目根目录必须是绝对路径");
+    }
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::new();
+    for component in root.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                #[cfg(windows)]
+                if !matches!(
+                    prefix.kind(),
+                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                ) {
+                    bail!("Codex 项目根目录不能为远程或设备路径");
+                }
+                anchor.push(prefix.as_os_str());
+            }
+            Component::RootDir => anchor.push(component.as_os_str()),
+            Component::Normal(name) => names.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => bail!("Codex 项目根目录不能包含上级路径"),
+        }
+    }
+    let mut directory = cap_std::fs::Dir::open_ambient_dir(anchor, cap_std::ambient_authority())
+        .map_err(|_| anyhow::anyhow!("Codex 项目所在文件系统不可访问"))?;
+    for name in names {
+        directory = directory
+            .open_dir_nofollow(name)
+            .map_err(|_| anyhow::anyhow!("Codex 项目目录不可访问或含符号链接"))?;
+    }
+    Ok(directory)
 }
 
 #[cfg(all(test, unix))]
@@ -326,11 +438,9 @@ pub(crate) async fn execute_with_control(
     {
         bail!("Codex 任务上下文配置无效");
     }
-    let root = root
-        .canonicalize()
-        .map_err(|_| anyhow::anyhow!("Codex 项目目录不可访问"))?;
-    if !root.is_dir() {
-        bail!("Codex 项目路径必须为目录");
+    let root = root.to_path_buf();
+    if cancelled() {
+        bail!("Codex 任务已取消");
     }
     let mut command = Command::new(binary);
     command
@@ -360,6 +470,7 @@ pub(crate) async fn execute_with_control(
     }
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
+    let _root_guard = open_root_nofollow(&root)?;
     let mut child = command
         .spawn()
         .map_err(|_| anyhow::anyhow!("无法启动 Codex，请检查可执行文件路径与安装状态"))?;
@@ -534,7 +645,7 @@ async fn protocol(
     let mut assistant_items = std::collections::HashMap::<String, String>::new();
     let mut pending = std::collections::VecDeque::new();
     let mut credentials = known_secrets.to_vec();
-    let mut private_config = None;
+    let mut private_config: Option<config_identity::PrivateConfig> = None;
     let mut pending_thread = None;
     let mut text_redactor = stream_events::TextEmitter::new(&credentials);
     let mut last_usage = None;
@@ -781,8 +892,9 @@ async fn protocol(
             6 => {
                 let config = config_identity::from_config(&result["config"])?;
                 credentials.extend(config.secrets.iter().cloned());
+                // Failed account/config identity checks still produce a final
+                // diff report; give its private filter these credentials now.
                 redaction_secrets(&credentials);
-                text_redactor = stream_events::TextEmitter::new(&credentials);
                 private_config = Some(config);
                 send(
                     stdin,
@@ -792,6 +904,8 @@ async fn protocol(
                 expected = 7;
             }
             7 => {
+                credentials.extend(config_identity::account_secrets(result));
+                redaction_secrets(&credentials);
                 let actual = private_config.as_ref().unwrap().with_account(result)?;
                 if continuation
                     .and_then(|value| value.expected_config.as_ref())
@@ -799,6 +913,7 @@ async fn protocol(
                 {
                     bail!("Codex 有效配置或账户状态已变化，未恢复会话或启动新回合；请重新发送目标");
                 }
+                text_redactor = stream_events::TextEmitter::new(&credentials);
                 if continuation.is_some() && actual["reuse_safe"] != true {
                     progress("Codex 当前登录身份无法可靠核对；将新建会话并保留完整应用历史，不复用旧线程".into());
                     resuming = None;
@@ -1174,7 +1289,7 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("codex-fixture-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(path.canonicalize().unwrap())
         }
     }
 
@@ -1255,6 +1370,314 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    fn managed_account() -> Value {
+        json!({"account":{"type":"chatgpt","email":"private-user@example.test","planType":"team"},
+            "requiresOpenaiAuth":true,"workspaceRouting":{"chatgptAccountId":"private-workspace-id",
+                "backendOrigin":"https://chatgpt.com","accountRoutingOverride":"NO_CONSTRAINT"}})
+    }
+
+    fn write_managed_account(root: &Path, account: &Value) {
+        std::fs::write(
+            root.join("fixture-managed-account.json"),
+            serde_json::to_vec(account).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn managed_project() -> Project {
+        let project = Project::new();
+        std::fs::write(
+            project.0.join("fixture-routing-version"),
+            "codex-cli 0.166.0-alpha.1",
+        )
+        .unwrap();
+        write_managed_account(&project.0, &managed_account());
+        project
+    }
+
+    struct ManagedResult {
+        output: String,
+        thread: String,
+        public: String,
+    }
+
+    async fn managed_run(
+        root: &Path,
+        expected: Value,
+        saved: Option<String>,
+        mode: &str,
+        objective: &str,
+    ) -> Result<ManagedResult> {
+        let public = Mutex::new(Vec::new());
+        let lifecycle = Mutex::new(Vec::new());
+        let output = execute_with_continuation(
+            &fixture(),
+            mode,
+            root,
+            ExecutionInput {
+                objective,
+                history: &[json!({"role":"assistant","content":"MANAGED_BOOTSTRAP"})],
+                config: &ModelContextConfig::default(),
+            },
+            |progress| public.lock().unwrap().push(json!(progress)),
+            || false,
+            |evidence| {
+                public
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(evidence).unwrap())
+            },
+            Some(CodexContinuation {
+                expected_turn_id: fixture_previous_turn(root, saved.as_deref()),
+                thread_id: saved,
+                expected_config: Some(expected),
+            }),
+            &[],
+            |event| {
+                public.lock().unwrap().push(serde_json::to_value(event)?);
+                Ok(())
+            },
+            |event| {
+                lifecycle.lock().unwrap().push(event);
+                Ok(())
+            },
+        )
+        .await?;
+        let public = serde_json::to_string(&*public.lock().unwrap())?;
+        Ok(ManagedResult {
+            output,
+            thread: ready_thread(&lifecycle),
+            public,
+        })
+    }
+
+    #[tokio::test]
+    async fn complete_managed_workspace_metadata_still_rebuilds_three_fresh_processes_privately() {
+        let project = managed_project();
+        let identity = probe_config_identity(&fixture(), &project.0).await.unwrap();
+        assert_eq!(identity["reuse_safe"], false);
+        let mut saved = None;
+        for round in 1..=3 {
+            let current = probe_config_identity(&fixture(), &project.0).await.unwrap();
+            assert_eq!(current, identity);
+            let result = managed_run(
+                &project.0,
+                current,
+                saved.clone(),
+                "managed-metadata",
+                &format!("ROUND_{round}"),
+            )
+            .await
+            .unwrap();
+            if let Some(previous) = &saved {
+                assert_ne!(&result.thread, previous);
+            }
+            saved = Some(result.thread);
+            assert_eq!(result.output, "[凭证已隐藏] | [凭证已隐藏] | [凭证已隐藏]");
+            for needle in [
+                "private-user@example.test",
+                "private-workspace-id",
+                "https://chatgpt.com",
+                "workspaceRouting",
+            ] {
+                assert!(!identity.to_string().contains(needle));
+                assert!(!result.public.contains(needle));
+                assert!(!result.output.contains(needle));
+            }
+        }
+        let state: Value = serde_json::from_slice(
+            &std::fs::read(project.0.join("fixture-thread-state.json")).unwrap(),
+        )
+        .unwrap();
+        let entries = state.as_object().unwrap();
+        assert_eq!(entries.len(), 3);
+        for entry in entries.values() {
+            let inputs = entry["inputs"].as_array().unwrap();
+            assert_eq!(inputs.len(), 1);
+            assert!(inputs[0].as_str().unwrap().contains("MANAGED_BOOTSTRAP"));
+        }
+        let trace = std::fs::read_to_string(project.0.join("fixture-rpc-trace.jsonl")).unwrap();
+        assert!(!trace.contains("thread/resume"));
+        assert!(!trace.contains("thread/turns/list"));
+        assert!(!trace.contains("workspaceRouting") && !trace.contains("historyMode"));
+    }
+
+    #[tokio::test]
+    async fn changed_managed_identity_fails_before_any_thread_operation_and_refresh_bootstraps() {
+        let project = managed_project();
+        let expected = probe_config_identity(&fixture(), &project.0).await.unwrap();
+        let first = managed_run(&project.0, expected.clone(), None, "success", "FIRST")
+            .await
+            .unwrap();
+        let trace_path = project.0.join("fixture-rpc-trace.jsonl");
+        let trace = std::fs::read(&trace_path).unwrap();
+        for (pointer, value) in [
+            ("/account/type", json!("apiKey")),
+            ("/account/email", json!("other-private-user@example.test")),
+            (
+                "/workspaceRouting/chatgptAccountId",
+                json!("other-private-workspace"),
+            ),
+            (
+                "/workspaceRouting/backendOrigin",
+                json!("https://other.example.test"),
+            ),
+            ("/workspaceRouting/accountRoutingOverride", json!("us_cr")),
+        ] {
+            let mut changed = managed_account();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            write_managed_account(&project.0, &changed);
+            let fresh = probe_config_identity(&fixture(), &project.0).await.unwrap();
+            assert_ne!(fresh["fingerprint"], expected["fingerprint"]);
+            for saved in [None, Some(first.thread.clone())] {
+                let error = managed_run(
+                    &project.0,
+                    expected.clone(),
+                    saved,
+                    "success",
+                    "MUST_NOT_START",
+                )
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+                assert!(error.contains("有效配置或账户状态已变化"));
+                assert!(!error.contains("private") && !error.contains("https://"));
+                assert_eq!(std::fs::read(&trace_path).unwrap(), trace);
+            }
+        }
+        let fresh = probe_config_identity(&fixture(), &project.0).await.unwrap();
+        // The store chooses None after the identity hash changes; no hidden replay.
+        let second = managed_run(&project.0, fresh, None, "success", "SECOND")
+            .await
+            .unwrap();
+        assert_ne!(second.thread, first.thread);
+        let state: Value = serde_json::from_slice(
+            &std::fs::read(project.0.join("fixture-thread-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(state[second.thread]["inputs"][0]
+            .as_str()
+            .unwrap()
+            .contains("MANAGED_BOOTSTRAP"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_version_and_missing_routing_preserve_fresh_managed_history() {
+        for case in [
+            "unsupported",
+            "missing",
+            "null",
+            "missing-field",
+            "bad-origin",
+            "bad-policy",
+            "missing-principal",
+        ] {
+            let project = managed_project();
+            let mut account = managed_account();
+            match case {
+                "unsupported" => std::fs::write(
+                    project.0.join("fixture-routing-version"),
+                    "codex-cli 0.166.0-alpha.2",
+                )
+                .unwrap(),
+                "missing" => {
+                    account.as_object_mut().unwrap().remove("workspaceRouting");
+                }
+                "null" => account["workspaceRouting"] = Value::Null,
+                "missing-field" => {
+                    account["workspaceRouting"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("chatgptAccountId");
+                }
+                "bad-origin" => {
+                    account["workspaceRouting"]["backendOrigin"] = json!("http://chatgpt.com")
+                }
+                "bad-policy" => {
+                    account["workspaceRouting"]["accountRoutingOverride"] = json!("unknown")
+                }
+                "missing-principal" => account["account"]["email"] = Value::Null,
+                _ => unreachable!(),
+            }
+            write_managed_account(&project.0, &account);
+            let identity = probe_config_identity(&fixture(), &project.0).await.unwrap();
+            assert_eq!(identity["reuse_safe"], false, "{case}");
+            let first = managed_run(&project.0, identity.clone(), None, "success", "FIRST")
+                .await
+                .unwrap();
+            let second = managed_run(
+                &project.0,
+                identity,
+                Some(first.thread.clone()),
+                "success",
+                "SECOND",
+            )
+            .await
+            .unwrap();
+            assert_ne!(first.thread, second.thread, "{case}");
+            let trace = std::fs::read_to_string(project.0.join("fixture-rpc-trace.jsonl")).unwrap();
+            assert!(!trace.contains("thread/resume"));
+            assert!(second.public.contains("不复用旧线程"));
+            let init =
+                std::fs::read_to_string(project.0.join("fixture-initialize-trace.jsonl")).unwrap();
+            assert!(init
+                .lines()
+                .all(
+                    |line| serde_json::from_str::<Value>(line).unwrap()["capabilities"]
+                        ["experimentalApi"]
+                        == false
+                ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellable_preflight_reaps_stalled_version_and_config_without_a_thread() {
+        for marker in ["fixture-version-stall", "fixture-config-stall"] {
+            let project = Project::new();
+            std::fs::write(project.0.join(marker), "yes").unwrap();
+            let started = Instant::now();
+            let cancelled = || started.elapsed() > Duration::from_millis(500);
+            let error = if marker == "fixture-version-stall" {
+                probe_version_with_control(&fixture(), &project.0, &cancelled)
+                    .await
+                    .map(|_| Value::Null)
+            } else {
+                probe_config_identity_with_control(&fixture(), &project.0, &cancelled).await
+            }
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("已取消"));
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let pid = std::fs::read_to_string(project.0.join("fixture-probe-pid")).unwrap();
+            assert!(!Command::new("/bin/kill")
+                .args(["-0", &pid])
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .unwrap()
+                .success());
+            assert!(!project.0.join("fixture-rpc-trace.jsonl").exists());
+        }
+        let project = Project::new();
+        assert!(
+            probe_config_identity_with_control(&fixture(), &project.0, &|| true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("已取消")
+        );
+        assert!(std::fs::read_dir(&project.0).unwrap().next().is_none());
+        std::fs::write(project.0.join("fixture-version-oversize"), "yes").unwrap();
+        assert!(
+            probe_version_with_control(&fixture(), &project.0, &|| false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("安全预算")
+        );
     }
 
     #[tokio::test]
@@ -1879,6 +2302,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_account_checks_still_supply_private_material_for_final_diff_filtering() {
+        for case in ["account-error", "config-changed", "managed-changed"] {
+            let project = if case == "managed-changed" {
+                managed_project()
+            } else {
+                Project::new()
+            };
+            let expected = probe_config_identity(&fixture(), &project.0).await.unwrap();
+            let needle = match case {
+                "account-error" => {
+                    std::fs::write(project.0.join("fixture-account-error"), "yes").unwrap();
+                    "private-fixture-config-value"
+                }
+                "config-changed" => {
+                    std::fs::write(project.0.join("fixture-config-changed"), "yes").unwrap();
+                    "private-changed-value"
+                }
+                _ => {
+                    let mut account = managed_account();
+                    account["workspaceRouting"]["chatgptAccountId"] =
+                        json!("private-changed-workspace");
+                    write_managed_account(&project.0, &account);
+                    "private-changed-workspace"
+                }
+            };
+            let collected = Mutex::new(Vec::new());
+            let result = execute_with_control(
+                &fixture(),
+                "success",
+                &project.0,
+                ExecutionInput {
+                    objective: "NEVER_START",
+                    history: &[],
+                    config: &ModelContextConfig::default(),
+                },
+                |_| {},
+                || false,
+                |_| {},
+                Some(CodexContinuation {
+                    thread_id: None,
+                    expected_turn_id: None,
+                    expected_config: Some(expected),
+                }),
+                &[],
+                |_| Ok(()),
+                |_| Ok(()),
+                || Ok(vec![]),
+                |_, _| Ok(()),
+                |values| collected.lock().unwrap().extend_from_slice(values),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(
+                collected.lock().unwrap().contains(&needle.to_owned()),
+                "{case}"
+            );
+            assert!(!project.0.join("fixture-rpc-trace.jsonl").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_project_symlink_is_rejected_before_preflight_or_execution() {
+        let project = Project::new();
+        let outside = Project::new();
+        let selected = project.0.join("selected");
+        std::os::unix::fs::symlink(&outside.0, &selected).unwrap();
+        let error = probe_config_identity(&fixture(), &selected)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("符号链接"));
+        let error = run("success", &selected).await.unwrap_err().to_string();
+        assert!(error.contains("符号链接"));
+        assert!(std::fs::read_dir(&outside.0).unwrap().next().is_none());
+        assert!(
+            probe_version_with_control(&fixture(), Path::new("relative-root"), &|| false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn private_redaction_material_is_available_before_any_thread_operation() {
         let project = Project::new();
         let received = AtomicBool::new(false);
@@ -1904,7 +2409,7 @@ mod tests {
                 assert!(!project.0.join("fixture-rpc-trace.jsonl").exists());
                 assert!(secrets.contains(&"private-fixture-config-value".to_owned()));
                 assert!(secrets.contains(&"private-harness-value".to_owned()));
-                assert!(!received.swap(true, Ordering::SeqCst));
+                received.store(true, Ordering::SeqCst);
             },
         )
         .await

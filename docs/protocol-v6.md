@@ -1,8 +1,8 @@
 # 第七阶段协议：持久事件与会话续接
 
-日期：2026-10-28。状态：0.7 开发分支第四切片，尚未发布完整 0.7；应用版本号暂仍为 0.6.0。本文描述本分支已实现接口，未列能力继续沿用 [0.6 协议](protocol-v5.md)。
+日期：2026-10-28。状态：0.7 开发分支第五切片，尚未发布完整 0.7；应用版本号暂仍为 0.6.0。本文描述本分支已实现接口，未列能力继续沿用 [0.6 协议](protocol-v5.md)。
 
-本分支贯通共享 Rust 后台、Native/Codex 执行事件、桌面和浏览器消费、HTTP 恢复及 CLI 跟随，并新增 Codex 主会话续接和 Native 跨任务摘要。已增加执行中补充、明确继续、上下文估算及有界只读区间改动面板；没有人工审批界面，也不扩大工具权限。普通托管登录的原生 thread 复用和Git 状态概览仍有下述部分读取限制，不能称完整 0.7 验收已经结束。
+本分支贯通共享 Rust 后台、Native/Codex 执行事件、桌面和浏览器消费、HTTP 恢复及 CLI 跟随，并新增 Codex 主会话续接和 Native 跨任务摘要。已增加执行中补充、明确继续、上下文估算及有界只读区间改动面板；没有人工审批界面，也不扩大工具权限。普通托管登录的原生 thread 复用和 Git 状态概览仍有下述部分读取限制，不能称完整 0.7 验收已经结束。
 
 ## 事件与事实来源
 
@@ -79,11 +79,12 @@ self-agent-cli --wait 600 follow TASK_ID
 协议依据本机 `codex-cli 0.166.0-alpha.1` 生成的 stable app-server JSON schema 核实；不使用标注实验性的 `history` 或不稳定的 `path` 恢复参数。执行器的实际回复、工具始末、累计用量及压缩通知映射到上述事件；按 thread/turn 标识过滤、重复通知去重。工具输出随完成事件提交，不伪造逐字节命令输出或隐藏推理。
 
 - 主任务使用持久 thread，独立子任务继续 `ephemeral:true`。应用会话、角色、规范项目路径、有效模型/服务配置、上下文策略、CLI 路径/版本和本应用权限策略指纹决定复用；指纹只私有保存，不能视为授权。
-- 主任务先只读 `config/read` 与 `account/read(refreshToken:false)` 确认身份，执行进程在任何 thread 操作前再次比较有效配置指纹；指纹包含显式 provider 环境凭据和 `OPENAI_API_KEY` 的内存摘要。不一致直接失败，不向变化后的服务默默发送历史。Codex 自身配置中的静态/环境请求头和令牌同样参与执行输出脱敏，原值不持久化。
+- 主任务先只读 `config/read` 与 `account/read(refreshToken:false)` 确认身份，执行进程在任何 thread 操作前再次比较有效配置指纹；指纹包含显式 provider 环境凭据、`OPENAI_API_KEY` 以及隐式 `OPENAI_BASE_URL` / `OPENAI_ORGANIZATION` / `OPENAI_PROJECT` 值的内存摘要。不一致直接失败，不向变化后的服务默默发送历史。Codex 自身配置中的静态/环境请求头和令牌同样参与执行输出脱敏，原值不持久化。
 - 首次 `thread/start` 引导应用历史一次；随后 `thread/resume` 只带当前目标。只有上一回合明确成功，应用历史恰好为前次输入加已完成回合，且 thread 处于 idle、权限与项目匹配、`thread/turns/list` 最新完成回合恰好等于保存的 turn ID，才恢复。其他 CLI/应用加入的远端回合会使恢复失败，不默默导入外部未知写入。稳定 `turn/start` 没有 expected-last-turn 原子前置条件，因此同一持久 thread 不得由其他客户端并发写入；此检查不是跨客户端排他锁。额外讨论、角色/模型/执行器或策略变化会使关联失效，保留原历史新建。
 - `thread/resume` 明确返回错误且尚未发送本回合时，允许一次新 thread 引导；进程断线、未知状态、活动回合、ID/权限不符等不按“恢复失败”自动重试。
 - thread ready、发送回合前的 inflight、真实 turn ID 和已完成状态持久化。daemon 重启将未完成关联失效，任务按原规则失败并保留实际文件；不重放可能已写入的回合。
-- 当前稳定 schema 不提供可可靠绑定的 ChatGPT workspace/account ID；email 不当作身份凭据。登录态或未知身份不能确认时，明确降级为新 thread + 完整应用历史，不恢复旧 thread。动态 `auth.command` 或 `gateway_oauth` 身份也不复用。持久恢复仅用于可确认身份的独立自定义服务，属于有意保守的兼容边界，不宣称所有登录模式均原生续接。
+- 已核实的稳定 account/read 不提供不可变 principal/user ID；0.166.0-alpha.1 的实验 workspaceRouting 虽提供 chatgptAccountId，但它是组织/工作区而非用户 ID，email 不能替代不可变用户身份。登录态或未知身份不能确认时，明确降级为新 thread + 完整应用历史，不恢复旧 thread。动态 `auth.command` 或 `gateway_oauth` 身份也不复用。持久恢复仅用于可确认身份的独立自定义服务，属于有意保守的兼容边界，不宣称所有登录模式均原生续接。
+- 发现配置凭据后立即交给私有改动过滤器，account/read 失败或后续身份不符也保留脱敏边界。配置/版本探测提供可取消、有界读取接口并等待子进程清理；0.8 的任务时长限制接线另行交付。启动前校验绝对根路径逐组件 no-follow，但路径式 Codex cwd/sandbox 参数仍不保证抵御检查后并发重命名。
 - 成功恢复不保证模型质量；本切片只用本地协议夹具。继承的 MCP/Skills 仍不是本应用可管理权限，不能用 workspace-write 声称约束远端工具。
 
 ## Native 摘要持久化

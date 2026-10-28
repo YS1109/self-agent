@@ -46,3 +46,11 @@
 第四切片 `83603bc8` 的三平台 Rust 门禁在 Rust 1.99.1 新增 Clippy 检查 `chunks_exact_to_as_chunks` 处失败（本地工具链 1.96 未报此 lint）。修复改用相同 20 字节固定数组分块，不放宽长度/顺序校验；独立格式、Clippy 与 24 项改动/Git 回归重跑后，修复提交 CI 另行跟踪。
 
 修复 `6b7537fd` 已越过三平台 Clippy；PR Windows 的 steering smoke 随后出现预期取消连接的同类 10053，streaming fixture 也曾输出该异常。两者补齐 ConnectionAbortedError，只忽略已知断连类别，直接注入未知异常仍失败。另一次 PR Windows Web 构建在产物生成后发生 Node/libuv 关闭断言，而同 SHA push Windows 桌面成功；记录为待新提交 CI 核验的间歇工具问题，未伪记通过。
+
+## 托管账户身份的已验证阻塞
+
+本地安装的 `0.166.0-alpha.1` 稳定/实验 schema 与对应源码已核对。实验 `workspaceRouting` 的 `chatgptAccountId` 是组织/工作区 ID；内部另有 `chatgpt_user_id` / 登录 owner，而公开 `account/read` 不暴露不可变用户标识。源码的同 generation 检查保证单次响应一致，但不能证明跨进程、同 email 被重新分配时仍是同一用户。因此保留新 thread + 完整应用历史，不把 email/工作区或用量快照 accountId 当作 principal 身份；不读取认证文件填补缺口，不授权较弱身份例外。
+
+证据：[固定版本 TokenData](https://github.com/openai/codex/blob/f2ed5dc90e514b59c2334f3bafb9b0250cc3e038/codex-rs/login/src/token_data.rs)、[固定版本 account/read 与工作区路由实现](https://github.com/openai/codex/blob/f2ed5dc90e514b59c2334f3bafb9b0250cc3e038/codex-rs/app-server/src/request_processors/account_processor/workspace_routing.rs)。此结论是支持协议的实际边界，不以模拟成功替代生产身份保证；其余 0.8–1.0 切片可独立继续。
+
+第五切片只保留安全 fallback 与探测/隐私加固；未启用 experimentalApi，也不引入托管复用例外。第五切片隔离冻结门禁通过：core 5、daemon 203（其中 Codex 47）、CLI 19 项，格式、全目标 Clippy、daemon/CLI 构建及十二个后台 smoke 脚本通过。前端未修改，本切片未重跑前端/桌面门禁；上一 Git 切片前端 105 项结果仅作为历史记录。 独立静态审查无剩余阻塞；实际模型、登录和 GUI 未验证，提交后单独追踪 CI。

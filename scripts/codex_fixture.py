@@ -19,12 +19,24 @@ def receive(method):
     return message
 
 
+
 if sys.argv[1:] == ["--version"]:
-    print("codex-cli 0.166.0-fixture")
+    if Path("fixture-version-stall").exists():
+        Path("fixture-probe-pid").write_text(str(os.getpid()))
+        time.sleep(60)
+    if Path("fixture-version-oversize").exists():
+        print("x" * 4097)
+        raise SystemExit(0)
+    version_file = Path("fixture-routing-version")
+    print(version_file.read_text().strip() if version_file.exists() else "codex-cli 0.166.0-fixture")
     raise SystemExit(0)
 assert sys.argv[1:] == ["app-server", "--listen", "stdio://"]
 init = receive("initialize")
+version_file = Path("fixture-routing-version")
 assert init["params"]["capabilities"]["experimentalApi"] is False
+if version_file.exists():
+    with Path("fixture-initialize-trace.jsonl").open("a") as trace:
+        trace.write(json.dumps(init["params"]) + "\n")
 send({"id": init["id"], "result": {"userAgent": "local-fixture"}})
 receive("initialized")
 thread = json.loads(sys.stdin.readline())
@@ -43,6 +55,9 @@ if thread["method"] == "model/list":
     raise SystemExit(0)
 if thread["method"] == "config/read":
     assert thread["params"]["cwd"] == str(Path.cwd().resolve())
+    if Path("fixture-config-stall").exists():
+        Path("fixture-probe-pid").write_text(str(os.getpid()))
+        time.sleep(60)
     if Path("fixture-config-error").exists():
         send({"id":thread["id"],"error":{"code":-32000,"message":"secret-config-error"}})
         raise SystemExit(0)
@@ -52,6 +67,8 @@ if thread["method"] == "config/read":
     }
     if Path("fixture-config-changed").exists():
         config["model_providers"]["fixture-provider"]["http_headers"]["x-fixture-secret"] = "private-changed-value"
+    if Path("fixture-managed-account.json").exists():
+        config = {"model":"fixture-default","model_provider":"openai","model_providers":{}}
     send({"id":thread["id"],"result":{"config":config,"origins":{}}})
     next_line = sys.stdin.readline()
     if not next_line:
@@ -65,6 +82,8 @@ if thread["method"] == "account/read":
     account = {"account":None,"requiresOpenaiAuth":False}
     if Path("fixture-account-chatgpt").exists():
         account = {"account":{"type":"chatgpt","email":"private-user@example.test","planType":"team"},"requiresOpenaiAuth":True}
+    if Path("fixture-managed-account.json").exists():
+        account = json.loads(Path("fixture-managed-account.json").read_text())
     send({"id":thread["id"],"result":account})
     next_line = sys.stdin.readline()
     if not next_line:
@@ -121,7 +140,7 @@ if mode in ("unsafe", "resume-unsafe"):
 thread_result = {
     "thread": {"id": "wrong-thread" if mode == "resume-wrong-id" and resumed else thread_id,
         "ephemeral":not persistent,"status":{"type":"active" if mode == "resume-active" else "idle"}},
-    "model":mode,"modelProvider":"fixture-provider",
+    "model":mode,"modelProvider":config["model_provider"],
     "cwd":str(root),"approvalPolicy":"never","sandbox":sandbox,
 }
 if mode == "model-missing":
@@ -295,6 +314,9 @@ command = {
 }
 if mode == "config-secret":
     command["aggregatedOutput"] = "private-fixture-config-value"
+if mode == "managed-metadata":
+    command["aggregatedOutput"] = " | ".join([account["account"]["email"],
+        account["workspaceRouting"]["chatgptAccountId"], account["workspaceRouting"]["backendOrigin"]])
 if mode == "config-secret-boundary":
     secret = "private-fixture-config-value"
     command["command"] = "fixture-check"
@@ -331,9 +353,15 @@ elif mode != "evidence-text":
     # A repeated lifecycle event must not duplicate persisted evidence.
     event("item/completed", {"item": command})
 if persistent or mode in ("stream-events","pre-ack","stream-secret","config-secret"):
-    if mode != "pre-ack":
+    if mode == "managed-metadata":
+        text = command["aggregatedOutput"]
+        cut = len(account["account"]["email"]) + 8
+        event("item/agentMessage/delta", {"itemId":"answer-1","delta":text[:cut]})
+        event("item/agentMessage/delta", {"itemId":"answer-1","delta":text[cut:]})
+    elif mode != "pre-ack":
         event("item/agentMessage/delta", {"itemId":"answer-1","delta":"fixture-" if mode == "stream-secret" else "private-fixture-" if mode == "config-secret" else "测试"})
-    event("item/agentMessage/delta", {"itemId":"answer-1","delta":"stream-secret" if mode == "stream-secret" else "config-value" if mode == "config-secret" else "执行结果"})
+    if mode != "managed-metadata":
+        event("item/agentMessage/delta", {"itemId":"answer-1","delta":"stream-secret" if mode == "stream-secret" else "config-value" if mode == "config-secret" else "执行结果"})
     event("thread/tokenUsage/updated", {"tokenUsage":{"total":{"inputTokens":10*turn_count,"outputTokens":5*turn_count},"last":{"inputTokens":10,"outputTokens":5}}})
     event("thread/tokenUsage/updated", {"tokenUsage":{"total":{"inputTokens":10*turn_count,"outputTokens":5*turn_count},"last":{"inputTokens":10,"outputTokens":5}}})
     event("item/started", {"item":{"type":"contextCompaction","id":"compact-1"}})
@@ -348,6 +376,7 @@ event(
             "text": (
                 '{"command":"python3 check.py","exitCode":0,"aggregatedOutput":"通过"}'
                 if mode == "evidence-text"
+                else command["aggregatedOutput"] if mode == "managed-metadata"
                 else "fixture-stream-secret" if mode == "stream-secret" else "private-fixture-config-value" if mode == "config-secret" else "测试执行结果"
             ),
         }

@@ -37,18 +37,35 @@ impl PrivateConfig {
             bail!("Codex 账户状态响应无效，未启动任务");
         };
         let kind = account["account"]["type"].as_str();
-        let reuse_safe = self.custom_credentials
+        let custom_reuse = self.custom_credentials
             && !requires_auth
             && (account["account"].is_null() || kind == Some("apiKey"));
         let mut identity = self.identity.clone();
         identity["fingerprint"] = json!(crate::continuation::fingerprint(
-            &json!({"version":3,"config":self.identity["fingerprint"],"account":account})
+            &json!({"version":4,"config":self.identity["fingerprint"],"account":account})
         ));
-        // Email/plan are not reliable workspace identity. Hidden credentials,
-        // ChatGPT and externally managed cloud auth never qualify for reuse.
-        identity["reuse_safe"] = json!(reuse_safe);
+        // Even experimental workspaceRouting identifies a workspace, not an
+        // immutable user principal. The audited 0.166.0-alpha.1 public schema
+        // exposes neither chatgpt_user_id nor login_owner_id. Email + workspace
+        // continuity must never silently weaken the credential identity boundary.
+        identity["reuse_safe"] = json!(custom_reuse);
         Ok(identity)
     }
+}
+
+/// Private metadata is never logged, persisted, or exposed as public identity.
+/// Redact it too if a model/tool independently echoes it into a task result.
+pub(super) fn account_secrets(account: &Value) -> Vec<String> {
+    [
+        &account["account"]["email"],
+        &account["workspaceRouting"]["chatgptAccountId"],
+        &account["workspaceRouting"]["backendOrigin"],
+    ]
+    .into_iter()
+    .filter_map(Value::as_str)
+    .filter(|value| !value.is_empty() && value.len() <= 4096)
+    .map(str::to_owned)
+    .collect()
 }
 
 pub(super) fn from_config(config: &Value) -> Result<PrivateConfig> {
@@ -83,6 +100,27 @@ fn with_environment(
     let mut secrets = Vec::new();
     let mut custom_credentials = false;
     let builtin = read("OPENAI_API_KEY");
+    let builtin_endpoint = read("OPENAI_BASE_URL");
+    // The pinned built-in provider installs these headers implicitly; they may
+    // not appear in config/read's serialized provider definitions.
+    let builtin_organization = read("OPENAI_ORGANIZATION");
+    let builtin_project = read("OPENAI_PROJECT");
+    for (name, value) in [
+        ("OPENAI_ORGANIZATION", builtin_organization),
+        ("OPENAI_PROJECT", builtin_project),
+    ] {
+        if let Some(value) = value.as_ref().and_then(|value| value.to_str()) {
+            add_secret(&mut secrets, value);
+        }
+        environment.insert(name, value.map(|value| value.as_encoded_bytes().to_vec()));
+    }
+    if let Some(value) = builtin_endpoint.as_ref().and_then(|value| value.to_str()) {
+        add_secret(&mut secrets, value);
+    }
+    environment.insert(
+        "OPENAI_BASE_URL",
+        builtin_endpoint.map(|value| value.as_encoded_bytes().to_vec()),
+    );
     if let Some(value) = &builtin {
         if let Some(value) = value.to_str() {
             add_secret(&mut secrets, value);
@@ -186,6 +224,167 @@ fn add_secret(secrets: &mut Vec<String>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_account() -> Value {
+        json!({"account":{"type":"chatgpt","email":"private-user@example.test","planType":"team"},
+            "requiresOpenaiAuth":true,"workspaceRouting":{"chatgptAccountId":"private-workspace-id",
+                "backendOrigin":"https://chatgpt.com","accountRoutingOverride":"NO_CONSTRAINT"}})
+    }
+
+    #[test]
+    fn managed_workspace_metadata_is_private_but_not_immutable_principal_identity() {
+        let account = managed_account();
+        let builtin = with_environment(&json!({}), |_| None).unwrap();
+        let expected = builtin.with_account(&account).unwrap();
+        assert_eq!(expected["reuse_safe"], false);
+        assert_eq!(builtin.with_account(&account).unwrap()["reuse_safe"], false);
+        for needle in [
+            "private-user",
+            "private-workspace",
+            "chatgpt.com",
+            "NO_CONSTRAINT",
+            "workspaceRouting",
+        ] {
+            assert!(!expected.to_string().contains(needle));
+        }
+        for (pointer, value) in [
+            ("/account/email", json!("other@example.test")),
+            (
+                "/workspaceRouting/chatgptAccountId",
+                json!("other-workspace"),
+            ),
+            (
+                "/workspaceRouting/backendOrigin",
+                json!("https://other.example.test"),
+            ),
+            ("/workspaceRouting/accountRoutingOverride", json!("us")),
+        ] {
+            let mut changed = account.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            let identity = builtin.with_account(&changed).unwrap();
+            assert_eq!(identity["reuse_safe"], false);
+            assert_ne!(identity["fingerprint"], expected["fingerprint"]);
+        }
+        for config in [
+            json!({"model_provider":"custom"}),
+            json!({"model_providers":"malformed"}),
+            json!({"chatgpt_base_url":"https://gateway.example.test"}),
+            json!({"openai_base_url":"https://gateway.example.test"}),
+            json!({"model_providers":{"openai":{"auth":{"command":"never-run"}}}}),
+            json!({"model_providers":{"openai":{"gateway_oauth":{}}}}),
+            json!({"model_providers":{"openai":{"base_url":"https://gateway.example.test"}}}),
+        ] {
+            assert_eq!(
+                with_environment(&config, |_| None)
+                    .unwrap()
+                    .with_account(&account)
+                    .unwrap()["reuse_safe"],
+                false
+            );
+        }
+        assert_eq!(
+            with_environment(&json!({}), |_| Some(OsString::from("private-api-key")))
+                .unwrap()
+                .with_account(&account)
+                .unwrap()["reuse_safe"],
+            false
+        );
+        let override_endpoint = with_environment(&json!({}), |name| {
+            (name == "OPENAI_BASE_URL")
+                .then(|| OsString::from("https://private-gateway.example.test"))
+        })
+        .unwrap();
+        let identity = override_endpoint.with_account(&account).unwrap();
+        assert_eq!(identity["reuse_safe"], false);
+        assert_ne!(identity["fingerprint"], expected["fingerprint"]);
+        assert!(!identity.to_string().contains("private-gateway"));
+        for name in ["OPENAI_ORGANIZATION", "OPENAI_PROJECT"] {
+            let config = with_environment(&json!({}), |key| {
+                (key == name).then(|| OsString::from("private-header-value"))
+            })
+            .unwrap();
+            let identity = config.with_account(&account).unwrap();
+            assert_eq!(identity["reuse_safe"], false);
+            assert_ne!(identity["fingerprint"], expected["fingerprint"]);
+            assert!(config.secrets.contains(&"private-header-value".into()));
+            assert!(!identity.to_string().contains("private-header-value"));
+        }
+    }
+
+    #[test]
+    fn incomplete_or_malformed_routing_never_qualifies_and_quota_id_is_not_identity() {
+        let builtin = with_environment(&json!({}), |_| None).unwrap();
+        for (pointer, values) in [
+            ("/account/type", vec![json!("apiKey"), Value::Null]),
+            (
+                "/account/email",
+                vec![
+                    Value::Null,
+                    json!(""),
+                    json!("x".repeat(321)),
+                    json!("a@b\nc"),
+                ],
+            ),
+            ("/account/planType", vec![Value::Null]),
+            ("/requiresOpenaiAuth", vec![json!(false)]),
+            (
+                "/workspaceRouting",
+                vec![
+                    Value::Null,
+                    json!({"accountId":"quota-only"}),
+                    json!("wrong"),
+                ],
+            ),
+            (
+                "/workspaceRouting/chatgptAccountId",
+                vec![
+                    Value::Null,
+                    json!(""),
+                    json!("x".repeat(257)),
+                    json!("contains space"),
+                ],
+            ),
+            (
+                "/workspaceRouting/accountRoutingOverride",
+                vec![Value::Null, json!("eu"), json!(true)],
+            ),
+            (
+                "/workspaceRouting/backendOrigin",
+                vec![
+                    Value::Null,
+                    json!("http://chatgpt.com"),
+                    json!("https://user:pass@chatgpt.com"),
+                    json!("https://chatgpt.com/path"),
+                    json!("https://chatgpt.com?q=x"),
+                    json!("https://chatgpt.com#x"),
+                    json!("https://chatgpt.com/"),
+                    json!("file:///tmp"),
+                ],
+            ),
+        ] {
+            for value in values {
+                let mut account = managed_account();
+                *account.pointer_mut(pointer).unwrap() = value;
+                assert_eq!(
+                    builtin.with_account(&account).unwrap()["reuse_safe"],
+                    false,
+                    "{pointer}"
+                );
+            }
+        }
+        for field in [
+            "chatgptAccountId",
+            "backendOrigin",
+            "accountRoutingOverride",
+        ] {
+            let mut account = managed_account();
+            account["workspaceRouting"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert_eq!(builtin.with_account(&account).unwrap()["reuse_safe"], false);
+        }
+    }
     #[test]
     fn referenced_provider_environment_changes_identity_without_exposing_values() {
         let config = json!({"model_provider":"custom", "model_providers":{"custom":{
@@ -194,6 +393,7 @@ mod tests {
         let make = |key: &str, header: &str, builtin: &str| {
             with_environment(&config, |name| match name {
                 "OPENAI_API_KEY" => Some(OsString::from(builtin)),
+                "OPENAI_BASE_URL" | "OPENAI_ORGANIZATION" | "OPENAI_PROJECT" => None,
                 "EXAMPLE_KEY" => Some(OsString::from(key)),
                 "EXAMPLE_HEADER" => Some(OsString::from(header)),
                 _ => panic!("unreferenced environment read"),
