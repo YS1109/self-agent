@@ -2274,8 +2274,11 @@ mod tests {
         ack: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
         events: impl Fn(ExecutionEvent) -> Result<()>,
     ) -> Result<String> {
+        // This outer test deadline includes Python startup and process-tree
+        // cleanup under a parallel CI suite; protocol ACK/count assertions below
+        // still prove bounded delivery and no replay. It is not a runtime budget.
         timeout(
-            Duration::from_secs(6),
+            Duration::from_secs(15),
             execute_with_control(
                 &fixture(),
                 mode,

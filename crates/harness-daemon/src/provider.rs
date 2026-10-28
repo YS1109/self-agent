@@ -1537,6 +1537,13 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    // Session creation canonicalizes the owner's chosen root once. Mirror
+    // that selection here: macOS's temp_dir commonly starts with /var, a
+    // system symlink. Production execution must still reject later swaps.
+    fn fixture_temp_dir() -> PathBuf {
+        std::env::temp_dir().canonicalize().unwrap()
+    }
+
     fn stream_chunk(delta: Value, finish: Value) -> String {
         format!(
             "data: {}\n\n",
@@ -1678,7 +1685,7 @@ mod tests {
                 ]}}]})
             }
         }).await;
-        let root = std::env::temp_dir().join(harness_core::new_id());
+        let root = fixture_temp_dir().join(harness_core::new_id());
         std::fs::create_dir(&root).unwrap();
         let pending = AtomicBool::new(false);
         let claims = AtomicUsize::new(0);
@@ -1729,7 +1736,7 @@ mod tests {
         let estimates = Mutex::new(Vec::new());
         execute_with_control(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "CURRENT_GOAL",
                 history: &history,
@@ -1808,7 +1815,7 @@ mod tests {
         };
         let error = execute_with_control(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "KEEP_ORIGINAL_GOAL",
                 history: &[],
@@ -1861,7 +1868,7 @@ mod tests {
         let claims = AtomicUsize::new(0);
         execute_with_control(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "GOAL",
                 history: &[],
@@ -1925,7 +1932,7 @@ mod tests {
             let outcomes = Mutex::new(Vec::new());
             assert!(execute_with_control(
                 &settings,
-                &std::env::temp_dir(),
+                &fixture_temp_dir(),
                 ExecutionInput {
                     objective: "GOAL",
                     history: &[],
@@ -1967,7 +1974,7 @@ mod tests {
             let (settings, requests, server) = memory_fixture(|_| json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[
                 {"id":"write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"not-written.txt\",\"content\":\"wrong\"}"}}
             ]}}]})).await;
-            let root = std::env::temp_dir().join(harness_core::new_id());
+            let root = fixture_temp_dir().join(harness_core::new_id());
             std::fs::create_dir(&root).unwrap();
             let cancelled = AtomicBool::new(false);
             let claims = AtomicUsize::new(0);
@@ -2035,7 +2042,7 @@ mod tests {
         };
         assert!(execute_with_control(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "GOAL",
                 history: &[],
@@ -2098,7 +2105,7 @@ mod tests {
         let saved = Mutex::new(Vec::new());
         execute_with_memory(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "CURRENT_GOAL_ONE",
                 history: &history,
@@ -2140,7 +2147,7 @@ mod tests {
         let events = Mutex::new(Vec::new());
         execute_with_memory(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "CURRENT_GOAL_TWO",
                 history: &later,
@@ -2206,7 +2213,7 @@ mod tests {
         let saved = Mutex::new(Vec::new());
         execute_with_memory(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "PROTECTED_CURRENT",
                 history: &history,
@@ -2259,7 +2266,7 @@ mod tests {
         let events = Mutex::new(Vec::new());
         execute_with_memory(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "CURRENT",
                 history: &history,
@@ -2308,7 +2315,7 @@ mod tests {
             let config = memory_policy();
             let cancelled = AtomicBool::new(false);
             let saved = AtomicUsize::new(0);
-            let result = execute_with_memory(&settings, &std::env::temp_dir(), ExecutionInput {
+            let result = execute_with_memory(&settings, &fixture_temp_dir(), ExecutionInput {
                 objective: "NEVER_EXECUTE", history: &history, config: &config,
             }, |_| {}, || cancelled.load(Ordering::Relaxed), |_| {}, |event| {
                 if mode == "cancel" && matches!(event, ExecutionEvent::ContextCompaction { state } if state == "completed") {
@@ -2341,7 +2348,7 @@ mod tests {
                     "arguments":json!({"path":"large.txt"}).to_string()}}]},"finish_reason":"tool_calls"}]})
             } else { text_completion("DONE") }
         }).await;
-        let root = std::env::temp_dir().join(harness_core::new_id());
+        let root = fixture_temp_dir().join(harness_core::new_id());
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("large.txt"), "REAL_TOOL_EVIDENCE ".repeat(700)).unwrap();
         let config = memory_policy();
@@ -2414,7 +2421,7 @@ mod tests {
             ("text/event-stream".into(), reply),
         ])
         .await;
-        let root = std::env::temp_dir().join(harness_core::new_id());
+        let root = fixture_temp_dir().join(harness_core::new_id());
         std::fs::create_dir(&root).unwrap();
         let events = Mutex::new(Vec::new());
         let config = ModelContextConfig::default();
@@ -2492,7 +2499,7 @@ mod tests {
         ])
         .await;
         settings.api_key = "fixture-stream-secret".into();
-        let root = std::env::temp_dir().join(harness_core::new_id());
+        let root = fixture_temp_dir().join(harness_core::new_id());
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("input.txt"), "普通数据").unwrap();
         let config = ModelContextConfig::default();
@@ -2551,7 +2558,7 @@ mod tests {
         for content in [complete_first, invalid_batch] {
             let (settings, requests, server) =
                 completion_fixture(vec![("text/event-stream".into(), content)]).await;
-            let root = std::env::temp_dir().join(harness_core::new_id());
+            let root = fixture_temp_dir().join(harness_core::new_id());
             std::fs::create_dir(&root).unwrap();
             let config = ModelContextConfig::default();
             let result = execute_with_context_events(
@@ -2586,7 +2593,7 @@ mod tests {
         let progress = Mutex::new(Vec::new());
         let result = execute_with_context_events(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "兼容",
                 history: &[],
@@ -2638,7 +2645,7 @@ mod tests {
         for response in responses {
             let (settings, requests, server) =
                 completion_fixture(vec![("application/json".into(), response.to_string())]).await;
-            let root = std::env::temp_dir().join(harness_core::new_id());
+            let root = fixture_temp_dir().join(harness_core::new_id());
             std::fs::create_dir(&root).unwrap();
             let config = ModelContextConfig::default();
             let result = execute_with_context_events(
@@ -2675,7 +2682,7 @@ mod tests {
             + "data: [DONE]\n\n";
         let (settings, requests, server) =
             completion_fixture(vec![("text/event-stream".into(), response)]).await;
-        let root = std::env::temp_dir().join(harness_core::new_id());
+        let root = fixture_temp_dir().join(harness_core::new_id());
         std::fs::create_dir(&root).unwrap();
         let config = ModelContextConfig::default();
         let cancelled = AtomicBool::new(false);
@@ -2710,7 +2717,7 @@ mod tests {
         let response = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"never.txt\",\"content\":\"no\"}"}}]},"finish_reason":"tool_calls"}]}).to_string();
         let (settings, requests, server) =
             completion_fixture(vec![("application/json".into(), response)]).await;
-        let root = std::env::temp_dir().join(harness_core::new_id());
+        let root = fixture_temp_dir().join(harness_core::new_id());
         std::fs::create_dir(&root).unwrap();
         let config = ModelContextConfig::default();
         let result = execute_with_context_events(
@@ -2779,7 +2786,7 @@ mod tests {
         let progress = Mutex::new(Vec::new());
         let result = execute_with_context(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: "LATEST_GOAL",
                 history: &history,
@@ -2830,7 +2837,7 @@ mod tests {
         };
         let error = execute_with_context(
             &settings,
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             ExecutionInput {
                 objective: &"当前目标".repeat(1000),
                 history: &[],
@@ -2856,7 +2863,7 @@ mod tests {
                 model: String::new(),
                 ..Settings::default()
             },
-            &std::env::temp_dir(),
+            &fixture_temp_dir(),
             "本地目标",
             |_| {},
             || false
@@ -2870,8 +2877,8 @@ mod tests {
     async fn records_actual_failed_command_and_redacts_bounded_output() {
         let arguments = json!({"command":"printf 'private-test-key'; printf '失败' >&2; exit 7"});
         let value = tool(
-            &std::env::temp_dir(),
-            &ScopedProject::open(&std::env::temp_dir().canonicalize().unwrap()).unwrap(),
+            &fixture_temp_dir(),
+            &ScopedProject::open(&fixture_temp_dir()).unwrap(),
             "run_command",
             arguments.clone(),
             true,
@@ -2968,7 +2975,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_redacts_matched_source_before_character_limit() {
-        let root = std::env::temp_dir().join(harness_core::new_id());
+        let root = fixture_temp_dir().join(harness_core::new_id());
         std::fs::create_dir(&root).unwrap();
         // macOS temp_dir may use /var while scoped_path returns /private/var.
         let root = root.canonicalize().unwrap();
@@ -3001,7 +3008,7 @@ mod tests {
 
     #[test]
     fn rejects_traversal_and_nonexistent_parent() {
-        let root = std::env::temp_dir();
+        let root = fixture_temp_dir();
         assert!(scoped_path(&root, "../secret", false).is_err());
         assert!(scoped_path(&root, "/etc/passwd", false).is_err());
         assert!(scoped_path(&root, "missing-harness-parent/new.txt", true).is_err());
@@ -3010,9 +3017,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejects_symlinks_outside_root_for_read_and_new_write() {
-        let root = std::env::temp_dir().join(harness_core::new_id());
+        let root = fixture_temp_dir().join(harness_core::new_id());
         std::fs::create_dir_all(&root).unwrap();
-        std::os::unix::fs::symlink(std::env::temp_dir(), root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(fixture_temp_dir(), root.join("outside")).unwrap();
         assert!(scoped_path(&root, "outside", false).is_err());
         assert!(scoped_path(&root, "outside/new.txt", true).is_err());
         std::fs::remove_dir_all(root).unwrap();

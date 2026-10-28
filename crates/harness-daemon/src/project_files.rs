@@ -445,8 +445,10 @@ mod tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("self-agent-files-{}", harness_core::new_id()));
+            // Darwin's sockaddr_un has a short path limit. A short unique
+            // fixture basename keeps the actual socket test enabled there.
+            let id = harness_core::new_id();
+            let path = std::env::temp_dir().join(format!("saf-{}", &id[..12]));
             std::fs::create_dir(&path).unwrap();
             Self(path.canonicalize().unwrap())
         }
@@ -484,6 +486,8 @@ mod tests {
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(scoped.read("new.txt").unwrap(), "done");
+        // Windows keeps the directory handle open until the capability drops.
+        drop(scoped);
         std::fs::remove_dir_all(root).unwrap();
     }
 
