@@ -44,3 +44,5 @@
 第三切片修复 `365942c3` 的 Windows smoke 已通过换行断言，随后发现取消连接以 ConnectionAbortedError（10053）结束的预期差异；`7142474c89e33e4c8a0b6fa473b5dcf9b1182708` 单行补齐该异常类别，意外异常仍记录失败。该精确提交的 push `40746966975` / PR `40746977940` 均已成功，两次各六项三平台检查；第四切片仍须自己的 CI。
 
 第四切片 `83603bc8` 的三平台 Rust 门禁在 Rust 1.99.1 新增 Clippy 检查 `chunks_exact_to_as_chunks` 处失败（本地工具链 1.96 未报此 lint）。修复改用相同 20 字节固定数组分块，不放宽长度/顺序校验；独立格式、Clippy 与 24 项改动/Git 回归重跑后，修复提交 CI 另行跟踪。
+
+修复 `6b7537fd` 已越过三平台 Clippy；PR Windows 的 steering smoke 随后出现预期取消连接的同类 10053，streaming fixture 也曾输出该异常。两者补齐 ConnectionAbortedError，只忽略已知断连类别，直接注入未知异常仍失败。另一次 PR Windows Web 构建在产物生成后发生 Node/libuv 关闭断言，而同 SHA push Windows 桌面成功；记录为待新提交 CI 核验的间歇工具问题，未伪记通过。

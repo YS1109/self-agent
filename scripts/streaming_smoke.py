@@ -53,7 +53,7 @@ class Model(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             self.respond()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             # Cancellation is supposed to close the model request before late output.
             pass
         finally:

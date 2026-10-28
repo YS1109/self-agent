@@ -69,7 +69,7 @@ class Model(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 self.pause(goal)  # HTTP accepted, but no completion body yet.
             self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except Exception as error:
             with self.lock:
