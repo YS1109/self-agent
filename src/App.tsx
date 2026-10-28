@@ -47,7 +47,10 @@ import {
 } from "lucide-react";
 import { api, dispatch } from "./api";
 import { useDaemonSnapshot } from "./use-daemon-snapshot";
-import { LiveTaskMessage, ToolActivity, TaskUsage } from "./components/task-stream";
+import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
+import { TaskSupplements, ContinueTask } from "./components/task-controls";
+import { TaskChanges } from "./components/task-changes";
+import { canContinue, canSteer, createCommandGate, inputCommand, type InputTarget } from "./task-controls";
 import { PlanPanel } from "./components/plan-panel";
 import { PlanChanges } from "./components/plan-changes";
 import { ExecutionEvidence } from "./components/execution-evidence";
@@ -205,6 +208,8 @@ export default function App() {
   const [planIds, setPlanIds] = useState<Record<string, string>>({});
   const [planDrafts, setPlanDrafts] = useState<Record<string, PlanDraft>>({});
   const [planLayouts, setPlanLayouts] = useState<Record<string, PlanLayoutDraft>>({});
+  const commandGate = useRef(createCommandGate());
+  const [inputTargets, setInputTargets] = useState<Record<string, InputTarget>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [settings, setSettings] = useState<Settings>({
     base_url: "",
@@ -245,6 +250,8 @@ export default function App() {
   const sessionId = snapshot.selections.find((s) =>
     sameSource(s.source, DESKTOP_SOURCE),
   )?.session_id;
+  const currentSessionId = useRef(sessionId);
+  currentSessionId.current = sessionId;
   const session = snapshot.sessions.find((s) => s.id === sessionId);
   const tasks = snapshot.tasks.filter((t) => t.session_id === sessionId);
   const plans = (snapshot.plans ?? []).filter((p) => p.session_id === sessionId);
@@ -259,6 +266,11 @@ export default function App() {
   );
   const draftKey = sessionId ?? "new";
   const draft = drafts[draftKey] ?? "";
+  const inputTarget = inputTargets[draftKey] ?? { mode: "queue" as const };
+  const steerableTasks = tasks.filter(canSteer);
+  const currentRunningTask = tasks.find(task => task.task_kind === "main" && task.status === "running");
+  const steeringTask = inputTarget.mode === "steer" ? tasks.find(task => task.id === inputTarget.taskId) : undefined;
+  const steeringUnavailable = inputTarget.mode === "steer" && !canSteer(steeringTask);
   const events = snapshot.events.filter(
     (e) => !sessionId || e.session_id === sessionId,
   );
@@ -340,22 +352,24 @@ export default function App() {
       setNotice("该计划在桌面还有未保存的结构修改，请先保存或重新加载草稿，再应用调整建议。");
       return undefined;
     }
-    setBusy(true);
-    setNotice("");
-    try {
-      const receipt = await dispatch(source, value);
-      if (applyingPlan) {
-        setPlanDrafts((current) => discardCleanPlanDraft(applyingPlan, current));
-        setPlanLayouts((current) => updatePlanLayouts(applyingPlan, applyingPlan.nodes, current, current[applyingPlan.id]));
+    return commandGate.current.run(async () => {
+      setBusy(true);
+      setNotice("");
+      try {
+        const receipt = await dispatch(source, value);
+        if (applyingPlan) {
+          setPlanDrafts((current) => discardCleanPlanDraft(applyingPlan, current));
+          setPlanLayouts((current) => updatePlanLayouts(applyingPlan, applyingPlan.nodes, current, current[applyingPlan.id]));
+        }
+        await refresh();
+        return receipt;
+      } catch (error) {
+        setNotice(errorMessage(error));
+        return undefined;
+      } finally {
+        setBusy(false);
       }
-      await refresh();
-      return receipt;
-    } catch (error) {
-      setNotice(errorMessage(error));
-      return undefined;
-    } finally {
-      setBusy(false);
-    }
+    });
   }
   async function createSession(event: FormEvent) {
     event.preventDefault();
@@ -372,12 +386,16 @@ export default function App() {
     }
   }
   async function send() {
-    if (!session || !draft.trim()) return;
+    if (!session || !draft.trim() || busy || !connected) return;
     const key = draftKey;
-    const receipt = await command({ type: "run_agent", session_id: session.id, content: draft.trim() });
+    let value: Command;
+    try { value = inputCommand(session.id, inputTarget, draft, tasks); }
+    catch (error) { setNotice(errorMessage(error)); return; }
+    const receipt = await command(value);
     if (receipt) {
       setDrafts((old) => old[key] === draft ? { ...old, [key]: "" } : old);
-      if (receipt.task_id) setTaskId(receipt.task_id);
+      if (receipt.task_id && currentSessionId.current === session.id) setTaskId(receipt.task_id);
+      if (receipt.supplement_id) setNotice(`补充已接收 · ${receipt.supplement_id.slice(0, 8)}，等待执行器应用；接收不代表已生效。`);
     }
   }
   async function saveSettings(event: FormEvent) {
@@ -806,6 +824,21 @@ export default function App() {
                 {running.length > 0 && <span>主智能体 仍可接收指令</span>}
                 {connected && <span className={`event-connection event-connection-${eventStatus}`} title={eventStatus === "connected" ? "通过持久事件实时更新；断线后自动补发。" : "实时事件暂未连接，仍定期读取权威快照。"}>{eventStatus === "connected" ? "实时更新" : eventStatus === "error" ? "快照更新 · 事件桥暂不可用" : "快照更新 · 正在连接事件"}</span>}
               </div>
+              {session && <div className="input-routing">
+                <div className="input-route-options" role="group" aria-label="指令作用方式">
+                  <Button size="small" variant={inputTarget.mode === "queue" ? "secondary" : "ghost"} disabled={busy} onClick={() => setInputTargets(current => ({ ...current, [draftKey]: { mode: "queue" } }))}>排队下一条</Button>
+                  <Button size="small" variant={inputTarget.mode === "steer" ? "secondary" : "ghost"} disabled={busy || (!steerableTasks.length && inputTarget.mode !== "steer")} onClick={() => {
+                    if (steerableTasks[0]) setInputTargets(current => ({ ...current, [draftKey]: { mode: "steer", taskId: steerableTasks[0].id } }));
+                  }}>补充当前任务</Button>
+                </div>
+                {inputTarget.mode === "steer" ? <>
+                  <Select aria-label="补充目标任务" value={inputTarget.taskId} disabled={busy}
+                    options={[...(steeringUnavailable ? [{ value: inputTarget.taskId, label: `原目标 ${inputTarget.taskId.slice(0, 8)} 已结束或不可用`, disabled: true }] : []),
+                      ...steerableTasks.map(task => ({ value: task.id, label: `${task.status === "running" ? "执行中" : "排队中"} · ${task.id.slice(0, 8)} · ${task.title}` }))]}
+                    onValueChange={taskId => setInputTargets(current => ({ ...current, [draftKey]: { mode: "steer", taskId } }))} />
+                  <p className="help-text">目标会话：{session.title} · 任务：{inputTarget.taskId}。{steeringUnavailable ? "请重新选择目标，或改为排队下一条；不会自动转投新任务。" : "接收后在执行器支持的安全边界应用，不保证立即生效。"}</p>
+                </> : <p className="help-text">目标会话：{session.title} · {session.id.slice(0, 8)}。创建独立主任务，已有任务运行时顺序排队；不会补充当前执行。</p>}
+              </div>}
               <div
                 className={`composer ${!session ? "composer-inactive" : ""}`}
               >
@@ -813,7 +846,7 @@ export default function App() {
                   aria-label="向主智能体 发送指令"
                   placeholder={
                     session
-                      ? "告诉主智能体你想做什么，或继续补充当前工作…"
+                      ? inputTarget.mode === "steer" ? "补充所选任务的要求，不会创建下一条任务…" : "输入下一条独立任务，按会话顺序执行…"
                       : "先创建一个会话，开始你的工作…"
                   }
                   value={draft}
@@ -843,13 +876,15 @@ export default function App() {
                   <div className="composer-submit">
                     <Button
                       size="small"
-                      disabled={!connected || !session || !draft.trim() || busy}
+                      disabled={!connected || !session || !draft.trim() || busy || steeringUnavailable}
                       onClick={() => void send()}
                       title="主智能体直接处理（⌘/Ctrl + Enter）"
                     >
                       <ArrowUp size={14} />
-                      <span>发送</span>
+                      <span>{inputTarget.mode === "steer" ? "提交补充" : "排队下一条"}</span>
                     </Button>
+                    {currentRunningTask && <Button size="small" variant="danger" disabled={busy || !connected}
+                      onClick={() => void command({ type: "cancel_task", task_id: currentRunningTask.id })} title={`停止任务 ${currentRunningTask.id}`}><Square size={12} />停止当前 · {currentRunningTask.id.slice(0, 8)}</Button>}
                   </div>
                 </div>
               </div>
@@ -908,11 +943,7 @@ export default function App() {
                   layouts={planLayouts} setLayouts={setPlanLayouts}
                 />
               ) : panel === "changes" ? (
-                <EmptyPanel
-                  icon={<FileCode2 />}
-                  title="代码更改"
-                  detail="此版本尚未接入结构化差异视图。任务的真实执行记录可在活动面板中查看。"
-                />
+                selectedTask ? <TaskChanges key={selectedTask.id} task={selectedTask} connected={connected} /> : <EmptyPanel icon={<FileCode2 />} title="代码更改" detail="选择一个任务后读取其只读改动报告。" />
               ) : panel === "artifacts" ? (
                 selectedTask?.result ? (
                   <div className="task-detail">
@@ -1000,6 +1031,10 @@ export default function App() {
                   )}
                   <ToolActivity task={selectedTask} events={snapshot.events} />
                   <TaskUsage taskId={selectedTask.id} events={snapshot.events} />
+                  <TaskContext task={selectedTask} events={snapshot.events} />
+                  <TaskSupplements task={selectedTask} />
+                  {selectedTask.continued_from && <p className="help-text">继续自任务 {selectedTask.continued_from}；这是新的执行，不是原任务重放。</p>}
+                  {canContinue(selectedTask) && <ContinueTask key={selectedTask.id} task={selectedTask} disabled={busy || !connected} onCommand={command} onCreated={id => { if (currentSessionId.current === selectedTask.session_id) setTaskId(id); }} />}
                   <ExecutionEvidence evidence={selectedTask.evidence} />
                   <div className="detail-divider" />
                   <div className="section-label">指令来源 / 回传位置</div>

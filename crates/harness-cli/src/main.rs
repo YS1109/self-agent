@@ -19,6 +19,9 @@ const HELP: &str = r#"Self Agent 命令行客户端
   send <会话ID> <内容|->            远程编排：生成计划或讨论
   status [任务ID]                   查询完整状态或单个任务
   cancel <任务ID>                   取消任务
+  steer <任务ID> <内容|->           补充指定任务（接收不代表已应用）
+  continue <任务ID> [内容|-]        从终态主任务创建新的继续任务
+  changes <任务ID>                  查看只读执行区间改动报告
   follow <任务ID>                   跟随已有任务的持久化事件与终态
   settings [JSON文件|-]             查看公开设置或提交设置补丁
   models [JSON文件|-]               从当前或草稿Endpoint获取模型
@@ -27,7 +30,7 @@ const HELP: &str = r#"Self Agent 命令行客户端
 先独立启动 harness-daemon。客户端读取同一数据目录的私有 daemon.json，
 自动进行本机认证；不需要桌面窗口。所有成功输出为JSON，错误写入标准错误。
 --wait 适用于返回任务ID的命令及follow；终态失败或超时会返回非零退出码。
---follow 用于run或返回任务ID的command，逐行输出JSON收据、事件和任务快照。
+--follow 用于run、steer、continue或返回任务ID的command，逐行输出JSON收据、事件和任务快照。
 follow先输出当前快照再跟随新事件；自动重连，恢复快照带reset:true。
 跟随默认等待3600秒，可用--wait覆盖；超时不会取消后台任务。
 输入密钥时请使用受保护的JSON文件或标准输入，避免写入命令参数。
@@ -191,6 +194,18 @@ fn command(options: &Options) -> Result<Option<Value>> {
             json!({"type":if options.command=="run" {"run_agent"} else {"send_message"},
                 "session_id":args[0], "content":input(&args[1],false)?})
         }
+        "steer" => {
+            arity(options, 2, 2)?;
+            json!({"type":"steer_task","task_id":args[0],"content":input(&args[1],false)?})
+        }
+        "continue" => {
+            arity(options, 1, 2)?;
+            let mut value = json!({"type":"continue_task","task_id":args[0]});
+            if let Some(content) = args.get(1) {
+                value["content"] = json!(input(content, false)?);
+            }
+            value
+        }
         "cancel" => {
             arity(options, 1, 1)?;
             json!({"type":"cancel_task","task_id":args[0]})
@@ -204,7 +219,7 @@ fn command(options: &Options) -> Result<Option<Value>> {
             }
             value
         }
-        "sessions" | "status" | "settings" | "models" | "follow" => return Ok(None),
+        "sessions" | "status" | "settings" | "models" | "follow" | "changes" => return Ok(None),
         _ => bail!("未知命令，使用 --help 查看用法"),
     };
     Ok(Some(value))
@@ -221,15 +236,43 @@ fn validate_follow(options: &Options, command: Option<&Value>) -> Result<()> {
     if !options.follow || options.command == "follow" {
         return Ok(());
     }
-    if !matches!(options.command.as_str(), "run" | "command")
-        || !matches!(
-            command.and_then(|value| value["type"].as_str()),
-            Some("run_agent" | "start_task" | "start_plan" | "resume_plan" | "cancel_task")
+    if !matches!(
+        options.command.as_str(),
+        "run" | "steer" | "continue" | "command"
+    ) || !matches!(
+        command.and_then(|value| value["type"].as_str()),
+        Some(
+            "run_agent"
+                | "steer_task"
+                | "continue_task"
+                | "start_task"
+                | "start_plan"
+                | "resume_plan"
+                | "cancel_task"
         )
-    {
-        bail!("--follow 仅适用于返回任务ID的run或command指令；已有任务请使用follow")
+    ) {
+        bail!(
+            "--follow 仅适用于返回任务ID的run、steer、continue或command指令；已有任务请使用follow"
+        )
     }
     Ok(())
+}
+
+fn changes_route(options: &Options) -> Result<String> {
+    arity(options, 1, 1)?;
+    if options.wait.is_some() || options.follow {
+        bail!("changes 为只读查询，不支持 --wait 或 --follow");
+    }
+    let id = &options.args[0];
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        bail!("任务ID格式无效");
+    }
+    Ok(format!("/api/v1/tasks/{id}/changes"))
 }
 
 fn snapshot_cursor(snapshot: &Value) -> Result<u64> {
@@ -555,7 +598,15 @@ async fn follow_loop(
 async fn run(options: Options) -> Result<()> {
     let command = command(&options)?;
     validate_follow(&options, command.as_ref())?;
+    let changes_path = (options.command == "changes")
+        .then(|| changes_route(&options))
+        .transpose()?;
     let client = Client::open(&options.directory)?;
+    if let Some(path) = changes_path {
+        let response = client.request("GET", &path, None).await?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
     if options.command == "follow" {
         arity(&options, 1, 1)?;
         let snapshot = client.request("GET", "/api/v1/snapshot", None).await?;
@@ -753,6 +804,56 @@ mod tests {
     }
 
     #[test]
+    fn supplements_and_continuations_keep_explicit_task_and_optional_content() {
+        let parsed = |args: &[&str]| {
+            parse(args.iter().map(|value| (*value).to_owned()))
+                .unwrap()
+                .unwrap()
+        };
+        let steer = parsed(&["--follow", "steer", "old-task", "补充"]);
+        assert_eq!(
+            command(&steer).unwrap().unwrap(),
+            json!({"type":"steer_task","task_id":"old-task","content":"补充"})
+        );
+        assert!(validate_follow(&steer, command(&steer).unwrap().as_ref()).is_ok());
+        let next = parsed(&["--follow", "continue", "terminal"]);
+        assert_eq!(
+            command(&next).unwrap().unwrap(),
+            json!({"type":"continue_task","task_id":"terminal"})
+        );
+        assert!(validate_follow(&next, command(&next).unwrap().as_ref()).is_ok());
+        assert_eq!(
+            command(&parsed(&["continue", "terminal", "修复"]))
+                .unwrap()
+                .unwrap()["content"],
+            "修复"
+        );
+        assert!(command(&parsed(&["steer", "task"])).is_err());
+        assert!(command(&parsed(&["continue", "task", "one", "two"])).is_err());
+    }
+
+    #[test]
+    fn changes_is_read_only_and_rejects_path_injection_and_follow_options() {
+        let parsed = |args: &[&str]| {
+            parse(args.iter().map(|value| (*value).to_owned()))
+                .unwrap()
+                .unwrap()
+        };
+        let options = parsed(&["changes", "task-1"]);
+        assert!(command(&options).unwrap().is_none());
+        assert_eq!(
+            changes_route(&options).unwrap(),
+            "/api/v1/tasks/task-1/changes"
+        );
+        for id in ["", "../snapshot", "a?target=x", "a%2fb", "a/b", "#x"] {
+            assert!(changes_route(&parsed(&["changes", id])).is_err());
+        }
+        assert!(changes_route(&parsed(&["changes"])).is_err());
+        assert!(changes_route(&parsed(&["--wait", "1", "changes", "t"])).is_err());
+        assert!(changes_route(&parsed(&["--follow", "changes", "t"])).is_err());
+    }
+
+    #[test]
     fn decoder_handles_utf8_crlf_and_multiline_data_at_every_byte_boundary() {
         let bytes = "\u{3a} keepalive\r\n\r\nevent: run_event\r\nid: 9\r\ndata: {\"sequence\":9,\r\ndata: \"text\":\"中文\"}\r\n\r\n".as_bytes();
         for split in 0..=bytes.len() {
@@ -884,6 +985,133 @@ mod tests {
         assert!(terminal_result(&json!({"status":"failed"})).is_err());
         assert!(terminal_result(&json!({"status":"cancelled"})).is_err());
         assert!(snapshot_cursor(&json!({})).is_err());
+    }
+
+    async fn cli_fixture(
+        args: &[&str],
+        replies: Vec<(&str, &str, Option<Value>, Option<String>)>,
+    ) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = std::env::temp_dir().join(format!("self-agent-cli-command-{}", new_id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        std::fs::write(directory.join("daemon.json"), json!({
+            "base_url":format!("http://{}",listener.local_addr().unwrap()), "token":"fixture-private", "pid":1
+        }).to_string()).unwrap();
+        let replies: Vec<_> = replies
+            .into_iter()
+            .map(|(method, path, command, body)| {
+                (method.to_owned(), path.to_owned(), command, body)
+            })
+            .collect();
+        let server = tokio::spawn(async move {
+            for (method, path, command, body) in replies {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(4), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    bytes.push(byte[0]);
+                    assert!(bytes.len() < 16384);
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                assert!(
+                    headers.starts_with(&format!("{method} {path} HTTP/1.1\r\n")),
+                    "{headers}"
+                );
+                let lower = headers.to_ascii_lowercase();
+                assert!(lower.contains("authorization: bearer fixture-private\r\n"));
+                let length = lower
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .map(|value| value.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                let mut bytes = vec![0; length];
+                socket.read_exact(&mut bytes).await.unwrap();
+                if let Some(command) = command {
+                    let envelope: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(envelope["command"], command);
+                    assert!(envelope["command_id"].as_str().is_some());
+                } else {
+                    assert!(bytes.is_empty());
+                }
+                if let Some(body) = body {
+                    let content_type = if path.starts_with("/api/v1/events?") {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+                // None deliberately drops the connection after reading a POST.
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err(),
+                "unexpected retry or extra request"
+            );
+        });
+        let mut options = parse(args.iter().map(|arg| (*arg).to_owned()))
+            .unwrap()
+            .unwrap();
+        options.directory = directory.clone();
+        let result = run(options).await;
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn steer_and_continue_follow_post_once_then_only_read_events() {
+        for (args, command) in [
+            (
+                vec!["--follow", "--wait", "3", "steer", "t", "补充"],
+                json!({"type":"steer_task","task_id":"t","content":"补充"}),
+            ),
+            (
+                vec!["--follow", "--wait", "3", "continue", "old", "继续"],
+                json!({"type":"continue_task","task_id":"old","content":"继续"}),
+            ),
+        ] {
+            cli_fixture(&args,vec![
+                ("GET","/api/v1/snapshot",None,Some(snapshot_body(0,"running"))),
+                ("POST","/api/v1/commands",Some(command),Some(json!({"status":"accepted","task_id":"t"}).to_string())),
+                ("GET","/api/v1/events?after=0",None,Some("id: 1\nevent: run_event\ndata: {\"sequence\":1,\"task_id\":\"t\",\"kind\":\"task_completed\"}\n\n".into())),
+                ("GET","/api/v1/snapshot",None,Some(snapshot_body(1,"completed"))),
+            ]).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_uses_only_get_and_uncertain_continuation_post_is_not_retried() {
+        cli_fixture(
+            &["changes", "t"],
+            vec![(
+                "GET",
+                "/api/v1/tasks/t/changes",
+                None,
+                Some(json!({"state":"expired","reason":"已过期"}).to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let error = cli_fixture(
+            &["continue", "old"],
+            vec![(
+                "POST",
+                "/api/v1/commands",
+                Some(json!({"type":"continue_task","task_id":"old"})),
+                None,
+            )],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("无法连接本机后台服务"));
     }
 
     struct MockReply {

@@ -8,7 +8,7 @@
 
 ## 当前版本
 
-**0.7 开发分支（未发布）**：已打通 Native/Codex 统一执行事件、桌面/浏览器流式消费、持久游标恢复及 CLI 跟随，新增 Codex 主 thread 续接与 Native 跨任务摘要。详见 [事件与会话协议](docs/protocol-v6.md)。执行中补充、上下文估算和改动面板待后续切片；运行版本号暂不变。
+**0.7 开发分支（未发布）**：已打通 Native/Codex 统一执行事件、桌面/浏览器流式消费、持久游标恢复及 CLI 跟随，新增 Codex 主 thread 续接与 Native 跨任务摘要。详见 [事件与会话协议](docs/protocol-v6.md)。第三切片增加执行中补充、明确排队/继续、持久上下文估算和有界只读区间 diff。完整 Git 状态及托管登录原生续接仍有安全兼容边界，运行版本号暂不变。
 
 当前版本 **0.6.0** 增加主智能体直接执行、可调界面缩放、自定义模型 Endpoint、模型上下文与子角色覆盖，以及无头命令行客户端：
 
@@ -43,7 +43,7 @@
 
 ## 后续规划与接手
 
-下一阶段为 **0.7：持续会话与实时执行体验**，核心是流式输出与事件恢复、Codex 会话续接及原生摘要复用，随后完善执行中补充要求和代码改动查看。本开发分支已实现事件消费与会话复用切片，P1 及联合验收继续推进，完整 0.7 尚未发布。
+下一阶段为 **0.7：持续会话与实时执行体验**，核心是流式输出与事件恢复、Codex 会话续接及原生摘要复用，随后完善执行中补充要求和代码改动查看。本开发分支已实现事件、会话复用、补充控制与区间改动切片，剩余安全兼容边界及联合验收继续推进，完整 0.7 尚未发布。
 
 完整的 0.7 至 1.0 分版目标、依赖与验收见 [分版路线图](docs/roadmap.md)。接手开发先读 [0.7 交接记录](docs/handoff-v0.7.md)，再按 [0.7 迭代计划](docs/iteration-v0.7.md) 推进。后续自主执行、MCP / Skills、真实通讯、H5、候选 App 与稳定发布均已分开记录；平台和上线日期未定的项目明确标注待确认。
 
@@ -162,6 +162,8 @@ python3 scripts/plan_change_smoke.py
 python3 scripts/headless_smoke.py
 python3 scripts/streaming_smoke.py
 python3 scripts/continuation_smoke.py
+python3 scripts/steering_smoke.py
+python3 scripts/changes_smoke.py
 python3 scripts/web_stream_smoke.py
 pnpm test
 pnpm build:web
@@ -189,4 +191,8 @@ scripts/                  开发、sidecar 和端到端验证
 docs/                     产品计划和当前协议
 ```
 
-完整设计见 [产品与架构计划](docs/architecture-plan.md)，当前协议见 [主智能体与无头协议](docs/protocol-v5.md)，画布见 [第五阶段协议](docs/protocol-v4.md)，运行控制见 [第四阶段协议](docs/protocol-v3.md)，角色与执行器见 [第三阶段协议](docs/protocol-v2.md)，基础编排见 [第二阶段协议](docs/protocol-v1-draft.md)。开发进度见 [实施状态](docs/implementation-status.md)。
+完整设计见 [产品与架构计划](docs/architecture-plan.md)，本分支协议见 [持久事件与会话续接](docs/protocol-v6.md)，0.6 基线见 [主智能体与无头协议](docs/protocol-v5.md)，画布见 [第五阶段协议](docs/protocol-v4.md)，运行控制见 [第四阶段协议](docs/protocol-v3.md)，角色与执行器见 [第三阶段协议](docs/protocol-v2.md)，基础编排见 [第二阶段协议](docs/protocol-v1-draft.md)。开发进度见 [实施状态](docs/implementation-status.md)。
+
+### 0.7 开发分支的任务控制
+
+运行中明确选择补充当前任务或排队下一条；补充的接收、交付和实际结果分开展示。停止后可从指定历史任务创建新的继续任务，不重放旧任务。CLI 支持 `steer TASK_ID CONTENT`、`continue TASK_ID [CONTENT]`、`changes TASK_ID`。改动面板只展示有界执行区间差异，保留用户原文件和 index；为避免 Git filters 越权执行，当前 Git 暂存/工作树概览明确未采集。完整验证矩阵见 [0.7 验收跟踪](docs/acceptance-v0.7.md)。

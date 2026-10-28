@@ -52,4 +52,34 @@ describe("持久事件与快照合并",()=>{
   const items=taskTools([finish(1),start(2),finish(3),start(4)],{...task,status:"cancelled"});
   expect(items.map(x=>x.status)).toEqual(["completed","completed","interrupted"]);expect(items[0].missingStart).toBe(true);
  });
+ it("上下文状态保存在任务上，超过300条事件及重开快照仍保留",()=>{
+  const estimate:RunEvent={...delta(1,""),kind:"context_estimate",data:{kind:"context_estimate",estimated_input_tokens:4567,context_window:128000,compression_threshold:80,source:"native_local",phase:"request"}};
+  const compaction:RunEvent={...delta(2,""),kind:"context_compaction",data:{kind:"context_compaction",state:"completed"}};
+  let s=receiveSnapshot(createEventState(),snapshot(0));
+  s=receiveEvent(s,estimate);s=receiveEvent(s,compaction);
+  for(let n=3;n<=700;n++) s=receiveEvent(s,delta(n,"x",n%2?"t":"other-task"));
+  expect(s.snapshot.events).toHaveLength(300);
+  expect(s.snapshot.events.some(event=>event.kind.startsWith("context_"))).toBe(false);
+  expect(s.snapshot.tasks[0].context_estimate).toMatchObject({estimated_input_tokens:4567,updated_at:"now"});
+  expect(s.snapshot.tasks[0].context_compaction).toEqual({state:"completed",updated_at:"now"});
+  const persisted=JSON.parse(JSON.stringify({...s.snapshot,events:[]})) as Snapshot;
+  const reopened=receiveSnapshot(createEventState(),persisted);
+  expect(reopened.snapshot.tasks[0].context_estimate).toEqual(s.snapshot.tasks[0].context_estimate);
+  expect(reopened.snapshot.tasks[0].context_compaction).toEqual(s.snapshot.tasks[0].context_compaction);
+ });
+ it("迟到快照重放新的上下文状态，重复和终态迟到事件不覆盖",()=>{
+  const estimate={estimated_input_tokens:10,context_window:128000,compression_threshold:80,source:"native_local",phase:"request",updated_at:"before"};
+  let s=receiveSnapshot(createEventState(),snapshot(1,"",[{...task,context_estimate:estimate}]));
+  const newer:RunEvent={...delta(2,""),kind:"context_estimate",data:{kind:"context_estimate",estimated_input_tokens:20,context_window:128000,compression_threshold:80,source:"native_local",phase:"request"}};
+  s=receiveEvent(s,newer);
+  s=receiveEvent(s,{...delta(3,""),kind:"context_compaction",data:{kind:"context_compaction",state:"completed"}});
+  s=receiveSnapshot(s,snapshot(1,"",[{...task,context_estimate:estimate}]));
+  expect(s.snapshot.tasks[0].context_estimate?.estimated_input_tokens).toBe(20);
+  expect(s.snapshot.tasks[0].context_compaction?.state).toBe("completed");
+  s=receiveEvent(s,{...newer,data:{kind:"context_estimate",...estimate,estimated_input_tokens:999}});
+  s=receiveEvent(s,{...delta(4,""),kind:"task_cancelled",data:undefined});
+  s=receiveEvent(s,{...newer,sequence:5,data:{kind:"context_estimate",...estimate,estimated_input_tokens:888}});
+  expect(s.snapshot.tasks[0].context_estimate?.estimated_input_tokens).toBe(20);
+ });
+
 });

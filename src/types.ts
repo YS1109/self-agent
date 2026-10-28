@@ -29,6 +29,68 @@ export interface ExecutionEvidence {
   exit_code: number;
   output: string;
 }
+export interface TaskSupplement {
+  id: string;
+  task_id: string;
+  content: string;
+  status: "pending" | "delivering" | "applied" | "not_applied" | "unknown";
+  reason?: string | null;
+  applied_via?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+export interface ChangesSummary {
+  state: string;
+  visible_files?: number;
+  skipped_files?: number;
+  partial?: boolean;
+  excluded_count?: number;
+  attribution?: string;
+}
+export interface GitObservation {
+  state: "available" | "partial" | "not_git" | "unavailable";
+  reason?: string;
+  omitted_count?: number;
+  entries: { path: string; index: string; worktree: string; untracked: boolean }[];
+}
+export interface ChangesReport {
+  version?: number;
+  reason?: string;
+  task_id?: string;
+  summary?: ChangesSummary;
+  state?: string;
+  scope?: string;
+  coverage?: string;
+  attribution?: string;
+  notice?: string;
+  files?: {
+    path: string; status: "added" | "modified" | "deleted" | "renamed"; previous_path?: string;
+    binary: boolean; before_bytes: number | null; after_bytes: number | null;
+    before_readonly: boolean | null; after_readonly: boolean | null;
+    before_mode: number | null; after_mode: number | null;
+    diff_state: "available" | "binary_not_shown" | "diff_budget_exceeded"; diff?: string;
+  }[];
+  skipped?: { path: string; reason: string }[];
+  baseline_git?: GitObservation;
+  current_git?: GitObservation;
+  partial?: boolean;
+  excluded_count?: number;
+  sensitive_file_count?: number;
+  limits?: Record<string, number>;
+  exclusions?: string;
+}
+export interface TaskContextEstimate {
+  estimated_input_tokens: number;
+  context_window: number;
+  compression_threshold: number;
+  source: string;
+  phase: string;
+  updated_at: string;
+}
+export interface TaskContextCompaction {
+  state: string;
+  updated_at: string;
+}
 export interface TaskRun {
   id: string;
   session_id: string;
@@ -38,6 +100,9 @@ export interface TaskRun {
   created_at: string;
   updated_at: string;
   result?: string;
+  supplements?: TaskSupplement[];
+  continued_from?: string | null;
+  changes_summary?: ChangesSummary | null;
   stream_output?: string;
   stream_output_truncated?: boolean;
   error?: string;
@@ -48,6 +113,8 @@ export interface TaskRun {
   task_kind?: "worker" | "plan" | "main";
   agent?: AgentProfile | null;
   context_config?: ModelContextConfig | null;
+  context_estimate?: TaskContextEstimate | null;
+  context_compaction?: TaskContextCompaction | null;
   main_sequence?: number | null;
   evidence?: ExecutionEvidence[];
 }
@@ -132,7 +199,8 @@ export type ExecutionEvent =
   | { kind: "tool_started"; call_id: string; name: string }
   | { kind: "tool_finished"; call_id: string; name: string; success: boolean; output: string }
   | { kind: "usage"; input_tokens: number | null; output_tokens: number | null; scope?: string }
-  | { kind: "context_compaction"; state: string };
+  | { kind: "context_compaction"; state: string }
+  | { kind: "context_estimate"; estimated_input_tokens: number; context_window: number; compression_threshold: number; source: string; phase: string };
 export interface RunEvent {
   id: string;
   sequence?: number;
@@ -197,6 +265,8 @@ export type Command =
   | { type: "run_agent"; session_id?: string; content: string }
   | { type: "start_task"; session_id?: string; title: string }
   | { type: "cancel_task"; task_id: string }
+  | { type: "steer_task"; task_id: string; content: string }
+  | { type: "continue_task"; task_id: string; content?: string }
   | { type: "update_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
   | { type: "patch_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
   | { type: "set_plan_layout"; plan_id: string; expected_layout_revision: number; layout: PlanLayout }
@@ -213,6 +283,7 @@ export interface Receipt {
   session_id?: string;
   task_id?: string;
   plan_id?: string;
+  supplement_id?: string;
   job_id?: string;
   change_id?: string;
 }

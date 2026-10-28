@@ -5,10 +5,11 @@
 use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
 
 use crate::context::ExecutionInput;
+use crate::steering::InputAcknowledgement;
 use anyhow::{bail, Context, Result};
 #[cfg(all(test, unix))]
 use harness_core::ModelContextConfig;
-use harness_core::{CommandEvidence, ExecutionEvent};
+use harness_core::{CommandEvidence, ExecutionEvent, TaskSupplement};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -21,6 +22,9 @@ mod stream_events;
 
 #[path = "codex/config_identity.rs"]
 mod config_identity;
+
+#[path = "codex/steering.rs"]
+mod steering;
 
 const MAX_LINE: usize = 256 * 1024;
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
@@ -253,6 +257,7 @@ pub(crate) async fn execute_with_context(
 }
 
 // Keep the established executor callbacks explicit at the integration boundary.
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_with_continuation(
     binary: &str,
@@ -266,6 +271,42 @@ pub(crate) async fn execute_with_continuation(
     known_secrets: &[String],
     events: impl Fn(ExecutionEvent) -> Result<()>,
     lifecycle: impl Fn(CodexLifecycle) -> Result<()>,
+) -> Result<String> {
+    execute_with_control(
+        binary,
+        model,
+        root,
+        input,
+        progress,
+        cancelled,
+        evidence,
+        continuation,
+        known_secrets,
+        events,
+        lifecycle,
+        || Ok(Vec::new()),
+        |_, _| Ok(()),
+        |_| {},
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_with_control(
+    binary: &str,
+    model: &str,
+    root: &Path,
+    input: ExecutionInput<'_>,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+    evidence: impl Fn(CommandEvidence),
+    continuation: Option<CodexContinuation>,
+    known_secrets: &[String],
+    events: impl Fn(ExecutionEvent) -> Result<()>,
+    lifecycle: impl Fn(CodexLifecycle) -> Result<()>,
+    claim_inputs: impl Fn() -> Result<Vec<TaskSupplement>>,
+    ack_inputs: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
+    redaction_secrets: impl Fn(&[String]),
 ) -> Result<String> {
     if cancelled() {
         bail!("Codex 任务已取消");
@@ -330,7 +371,7 @@ pub(crate) async fn execute_with_continuation(
     let result = tokio::select! {
         result = timeout(TURN_TIMEOUT, protocol(
             &mut stdin, stdout, model, &root, input,
-            ProtocolCallbacks { progress: &progress, evidence: &evidence, events: &events, lifecycle: &lifecycle, cancelled: &cancelled, known_secrets },
+            ProtocolCallbacks { progress: &progress, evidence: &evidence, events: &events, lifecycle: &lifecycle, cancelled: &cancelled, known_secrets, claim_inputs: &claim_inputs, ack_inputs: &ack_inputs, redaction_secrets: &redaction_secrets },
             &mut ids, continuation.as_ref(),
         )) => match result {
             Ok(result) => result,
@@ -388,13 +429,16 @@ async fn send(stdin: &mut ChildStdin, message: Value) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("Codex 协议连接已关闭"))
 }
 
-struct ProtocolCallbacks<'a, P, E, V, L, C> {
+struct ProtocolCallbacks<'a, P, E, V, L, C, Q, A, R> {
     progress: &'a P,
     evidence: &'a E,
     events: &'a V,
     lifecycle: &'a L,
     cancelled: &'a C,
     known_secrets: &'a [String],
+    claim_inputs: &'a Q,
+    ack_inputs: &'a A,
+    redaction_secrets: &'a R,
 }
 
 fn thread_params(model: &str, root: &Path, context: &harness_core::ModelContextConfig) -> Value {
@@ -450,6 +494,9 @@ async fn protocol(
         impl Fn(ExecutionEvent) -> Result<()>,
         impl Fn(CodexLifecycle) -> Result<()>,
         impl Fn() -> bool,
+        impl Fn() -> Result<Vec<TaskSupplement>>,
+        impl Fn(&[String], InputAcknowledgement) -> Result<()>,
+        impl Fn(&[String]),
     >,
     ids: &mut RunIds,
     continuation: Option<&CodexContinuation>,
@@ -461,6 +508,9 @@ async fn protocol(
         lifecycle,
         cancelled,
         known_secrets,
+        claim_inputs,
+        ack_inputs,
+        redaction_secrets,
     } = callbacks;
     progress("正在连接 Codex 执行器".into());
     send(stdin, json!({"id":1,"method":"initialize","params":{
@@ -468,6 +518,11 @@ async fn protocol(
         "capabilities":{"experimentalApi":false}
     }})).await?;
     let mut reader = BufReader::new(stdout);
+    // read_until is cancellation safe only when its partial bytes survive polls.
+    let mut line = Vec::new();
+    let mut poll_inputs = tokio::time::interval(Duration::from_millis(100));
+    poll_inputs.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut steering = steering::Steering::default();
     let mut total = 0usize;
     let mut count = 0usize;
     let mut expected = 1u64;
@@ -491,23 +546,54 @@ async fn protocol(
         let message: Value = if (expected == 0 || expected == 9) && !pending.is_empty() {
             pending.pop_front().unwrap()
         } else {
-            let mut line = Vec::new();
-            let bytes = (&mut reader)
-                .take((MAX_LINE + 1) as u64)
-                .read_until(b'\n', &mut line)
-                .await
-                .map_err(|_| anyhow::anyhow!("读取 Codex 协议消息失败"))?;
-            if bytes == 0 {
-                bail!("Codex 在回合完成前关闭了连接");
-            }
-            total += bytes;
-            count += 1;
-            if bytes > MAX_LINE || total > MAX_OUTPUT || count > MAX_LINES {
+            let remaining = (MAX_LINE + 1).saturating_sub(line.len());
+            if remaining == 0 {
                 bail!("Codex 协议输出超过安全预算");
             }
-            serde_json::from_slice(&line)
-                .map_err(|_| anyhow::anyhow!("Codex 返回了无法解析的协议消息"))?
+            let mut limited = (&mut reader).take(remaining as u64);
+            let read = tokio::select! {
+                bytes = limited.read_until(b'\n', &mut line) => Some(bytes.map_err(|_|anyhow::anyhow!("读取 Codex 协议消息失败"))?),
+                _ = poll_inputs.tick() => None,
+            };
+            let Some(bytes) = read else {
+                if cancelled() {
+                    bail!("Codex 任务已取消");
+                }
+                if expected == 0 && !steering.is_pending() {
+                    if let (Some(thread), Some(turn)) = (&ids.thread, &ids.turn) {
+                        let inputs = claim_inputs()?;
+                        if let Some(request) = steering.prepare(inputs, thread, turn, ack_inputs)? {
+                            // Persistence already marked these inputs delivering.
+                            // A failed/partial send is unknown and must not retry.
+                            if cancelled() {
+                                bail!("Codex 任务已取消");
+                            }
+                            send(stdin, request).await?;
+                        }
+                    }
+                }
+                continue;
+            };
+            if bytes == 0 && line.is_empty() {
+                bail!("Codex 在回合完成前关闭了连接");
+            }
+            total += line.len();
+            count += 1;
+            if line.len() > MAX_LINE || total > MAX_OUTPUT || count > MAX_LINES {
+                bail!("Codex 协议输出超过安全预算");
+            }
+            let message = serde_json::from_slice(&line)
+                .map_err(|_| anyhow::anyhow!("Codex 返回了无法解析的协议消息"))?;
+            line.clear();
+            message
         };
+        if cancelled() {
+            bail!("Codex 任务已取消");
+        }
+        if steering.response(&message, ids.turn.as_deref(), ack_inputs)? {
+            continue;
+        }
+
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             if let Some(id) = message.get("id") {
                 let response = match method {
@@ -695,6 +781,7 @@ async fn protocol(
             6 => {
                 let config = config_identity::from_config(&result["config"])?;
                 credentials.extend(config.secrets.iter().cloned());
+                redaction_secrets(&credentials);
                 text_redactor = stream_events::TextEmitter::new(&credentials);
                 private_config = Some(config);
                 send(
@@ -801,6 +888,18 @@ async fn protocol(
                 if objective.len() > 2 * 1024 * 1024 {
                     bail!("Codex 新会话历史超过 2 MiB 输入预算，未启动回合");
                 }
+                events(ExecutionEvent::ContextEstimate {
+                    estimated_input_tokens: crate::context::estimate_text(&objective) as u64,
+                    context_window: input.config.context_window,
+                    compression_threshold: input.config.compression_threshold,
+                    source: if resuming.is_some() {
+                        "codex_current_input_only"
+                    } else {
+                        "codex_local_bootstrap"
+                    }
+                    .into(),
+                    phase: "before_turn".into(),
+                })?;
                 if cancelled() {
                     bail!("Codex 任务已取消");
                 }
@@ -1274,6 +1373,24 @@ mod tests {
                 matches!(&lifecycle[3],CodexLifecycle::TurnCompleted {thread_id,turn_id} if thread_id == &id && turn_id == &format!("fixture-turn-{round}"))
             );
             let events = events.lock().unwrap();
+            let estimate = events
+                .iter()
+                .find(|event| event["kind"] == "context_estimate")
+                .unwrap();
+            assert_eq!(
+                estimate["source"],
+                if round == 1 {
+                    "codex_local_bootstrap"
+                } else {
+                    "codex_current_input_only"
+                }
+            );
+            if round > 1 {
+                assert_eq!(
+                    estimate["estimated_input_tokens"],
+                    crate::context::estimate_text(&format!("ROUND_{round}"))
+                );
+            }
             assert_eq!(
                 events
                     .iter()
@@ -1713,6 +1830,281 @@ mod tests {
         }
     }
 
+    fn supplement() -> TaskSupplement {
+        TaskSupplement {
+            id: "input-1".into(),
+            task_id: "task-1".into(),
+            content: "运行中补充目标".into(),
+            status: "delivering".into(),
+            reason: None,
+            applied_via: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    async fn control_run(
+        mode: &str,
+        root: &Path,
+        cancelled: impl Fn() -> bool,
+        claim: impl Fn() -> Result<Vec<TaskSupplement>>,
+        ack: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
+        events: impl Fn(ExecutionEvent) -> Result<()>,
+    ) -> Result<String> {
+        timeout(
+            Duration::from_secs(6),
+            execute_with_control(
+                &fixture(),
+                mode,
+                root,
+                ExecutionInput {
+                    objective: "本地测试目标",
+                    history: &[],
+                    config: &ModelContextConfig::default(),
+                },
+                |_| {},
+                cancelled,
+                |_| {},
+                None,
+                &[],
+                events,
+                |_| Ok(()),
+                claim,
+                ack,
+                |_| {},
+            ),
+        )
+        .await
+        .expect("steering fixture terminates")
+    }
+
+    #[tokio::test]
+    async fn private_redaction_material_is_available_before_any_thread_operation() {
+        let project = Project::new();
+        let received = AtomicBool::new(false);
+        execute_with_control(
+            &fixture(),
+            "success",
+            &project.0,
+            ExecutionInput {
+                objective: "本地测试目标",
+                history: &[],
+                config: &ModelContextConfig::default(),
+            },
+            |_| {},
+            || false,
+            |_| {},
+            None,
+            &["private-harness-value".into()],
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(vec![]),
+            |_, _| Ok(()),
+            |secrets| {
+                assert!(!project.0.join("fixture-rpc-trace.jsonl").exists());
+                assert!(secrets.contains(&"private-fixture-config-value".to_owned()));
+                assert!(secrets.contains(&"private-harness-value".to_owned()));
+                assert!(!received.swap(true, Ordering::SeqCst));
+            },
+        )
+        .await
+        .unwrap();
+        assert!(received.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn steering_polls_silent_turns_preserves_partial_utf8_and_deduplicates_ack() {
+        for mode in ["steer-silent", "steer-partial", "steer-duplicate"] {
+            let project = Project::new();
+            let claimed = AtomicBool::new(false);
+            let acks = Mutex::new(Vec::new());
+            let events = Mutex::new(Vec::new());
+            let queued_after = Instant::now() + Duration::from_millis(350);
+            control_run(
+                mode,
+                &project.0,
+                || false,
+                || {
+                    if Instant::now() < queued_after || claimed.swap(true, Ordering::SeqCst) {
+                        Ok(vec![])
+                    } else {
+                        Ok(vec![supplement()])
+                    }
+                },
+                |ids, status| {
+                    acks.lock().unwrap().push((ids.to_vec(), status));
+                    Ok(())
+                },
+                |event| {
+                    events.lock().unwrap().push(serde_json::to_value(event)?);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            let acks = acks.lock().unwrap();
+            assert_eq!(acks.len(), 1);
+            assert_eq!(acks[0].0, vec!["input-1"]);
+            assert!(
+                matches!(&acks[0].1,InputAcknowledgement::Applied {via} if via=="codex_turn_steer")
+            );
+            let events = events.lock().unwrap();
+            let estimate = events
+                .iter()
+                .find(|event| event["kind"] == "context_estimate")
+                .unwrap();
+            assert_eq!(estimate["source"], "codex_local_bootstrap");
+            assert_eq!(estimate["phase"], "before_turn");
+            if mode == "steer-partial" {
+                let text = events
+                    .iter()
+                    .filter_map(|event| event["text"].as_str())
+                    .collect::<String>();
+                assert!(text.starts_with("分片"));
+            }
+            let trace = std::fs::read_to_string(project.0.join("fixture-rpc-trace.jsonl")).unwrap();
+            assert_eq!(
+                trace
+                    .lines()
+                    .filter(
+                        |line| serde_json::from_str::<Value>(line).unwrap()["method"]
+                            == "turn/steer"
+                    )
+                    .count(),
+                1
+            );
+            assert_eq!(
+                trace
+                    .lines()
+                    .filter(
+                        |line| serde_json::from_str::<Value>(line).unwrap()["method"]
+                            == "turn/start"
+                    )
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_rejects_errors_and_never_acks_uncertain_or_late_responses() {
+        for (mode, success, not_applied) in [
+            ("steer-reject", true, true),
+            ("steer-mismatch", false, false),
+            ("steer-wrong-id", true, false),
+            ("steer-complete-first", true, false),
+            ("steer-disconnect", false, false),
+        ] {
+            let project = Project::new();
+            let claimed = AtomicBool::new(false);
+            let acks = Mutex::new(Vec::new());
+            let result = control_run(
+                mode,
+                &project.0,
+                || false,
+                || {
+                    Ok(if claimed.swap(true, Ordering::SeqCst) {
+                        vec![]
+                    } else {
+                        vec![supplement()]
+                    })
+                },
+                |ids, status| {
+                    acks.lock().unwrap().push((ids.to_vec(), status));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .await;
+            assert_eq!(result.is_ok(), success, "{mode}: {result:?}");
+            let acks = acks.lock().unwrap();
+            assert_eq!(acks.len(), usize::from(not_applied), "{mode}");
+            if not_applied {
+                assert!(
+                    matches!(&acks[0].1,InputAcknowledgement::NotApplied {reason} if !reason.contains("private-steer-error"))
+                );
+            }
+            let trace = std::fs::read_to_string(project.0.join("fixture-rpc-trace.jsonl")).unwrap();
+            assert_eq!(
+                trace
+                    .lines()
+                    .filter(
+                        |line| serde_json::from_str::<Value>(line).unwrap()["method"]
+                            == "turn/steer"
+                    )
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_with_inflight_steering_preserves_unknown_receipt_and_interrupts() {
+        let project = Project::new();
+        let cancel = AtomicBool::new(false);
+        let claimed = AtomicBool::new(false);
+        let task = control_run(
+            "steer-cancel",
+            &project.0,
+            || cancel.load(Ordering::SeqCst),
+            || {
+                Ok(if claimed.swap(true, Ordering::SeqCst) {
+                    vec![]
+                } else {
+                    vec![supplement()]
+                })
+            },
+            |_, _| panic!("unconfirmed receipt"),
+            |_| Ok(()),
+        );
+        let cancellation = async {
+            timeout(Duration::from_secs(4), async {
+                while !project.0.join("fixture-steer-received").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            cancel.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::join!(task, cancellation);
+        assert!(result.unwrap_err().to_string().contains("已取消"));
+        assert!(project.0.join("fixture-interrupted").exists());
+    }
+
+    #[tokio::test]
+    async fn steering_ack_storage_failure_never_replays_the_input() {
+        let project = Project::new();
+        let claimed = AtomicBool::new(false);
+        let error = control_run(
+            "steer-silent",
+            &project.0,
+            || false,
+            || {
+                Ok(if claimed.swap(true, Ordering::SeqCst) {
+                    vec![]
+                } else {
+                    vec![supplement()]
+                })
+            },
+            |_, _| bail!("回执保存失败"),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("回执保存失败"));
+        let trace = std::fs::read_to_string(project.0.join("fixture-rpc-trace.jsonl")).unwrap();
+        assert_eq!(
+            trace
+                .lines()
+                .filter(
+                    |line| serde_json::from_str::<Value>(line).unwrap()["method"] == "turn/steer"
+                )
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn model_catalog_paginates_without_starting_a_thread() {
         let models = list_models(&fixture()).await.unwrap();
@@ -2032,18 +2424,25 @@ mod tests {
     async fn cancelling_hanging_turn_interrupts_and_reaps_process() {
         let project = Project::new();
         let cancel = AtomicBool::new(false);
+        let acknowledged = AtomicBool::new(false);
         let binary = fixture();
         let task = execute(
             &binary,
             "hang",
             &project.0,
             "本地测试目标",
-            |_| {},
+            |message| {
+                if message == "Codex 正在处理任务" {
+                    acknowledged.store(true, Ordering::SeqCst);
+                }
+            },
             || cancel.load(Ordering::SeqCst),
         );
         let cancel_later = async {
             timeout(Duration::from_secs(5), async {
-                while !project.0.join("fixture-started").exists() {
+                // A server-side file only proves it wrote the ACK, not that
+                // our client has consumed it and knows the interrupt turn ID.
+                while !acknowledged.load(Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })

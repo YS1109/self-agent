@@ -11,7 +11,9 @@ use crate::{
     Settings,
 };
 
+mod changes;
 mod continuation;
+mod steering;
 
 const MAX_NODES: usize = 12;
 const MAX_ROUNDS: u64 = 3;
@@ -45,7 +47,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS settings(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
         )?;
         db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_contexts(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS session_contexts(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS task_changes(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
         )?;
         // One atomic migration preserves legacy UUIDs and insertion order. An
         // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
@@ -116,6 +119,7 @@ impl Store {
 
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
+        changes::recover_changes(&tx)?;
         for mut state in rows(&tx, "session_contexts")? {
             if state["executor"] == "codex"
                 && matches!(state["state"].as_str(), Some("inflight" | "ready"))
@@ -192,6 +196,11 @@ impl Store {
         let mut sessions = rows(&self.db, "sessions")?;
         sessions.sort_by(|a, b| b["updated_at"].as_str().cmp(&a["updated_at"].as_str()));
         let mut tasks = rows(&self.db, "tasks")?;
+        for task in &mut tasks {
+            if !task["supplements"].is_array() {
+                task["supplements"] = json!([]);
+            }
+        }
         tasks.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
         let mut plans = rows(&self.db, "plans")?;
         plans.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
@@ -284,12 +293,26 @@ impl Store {
             }
             put(&tx, "tasks", &task)?;
         }
+        match &data {
+            ExecutionEvent::ContextEstimate { .. } => {
+                let mut latest = serde_json::to_value(&data)?;
+                latest["updated_at"] = json!(now());
+                task["context_estimate"] = latest;
+                put(&tx, "tasks", &task)?;
+            }
+            ExecutionEvent::ContextCompaction { state } => {
+                task["context_compaction"] = json!({"state":state,"updated_at":now()});
+                put(&tx, "tasks", &task)?;
+            }
+            _ => {}
+        }
         let label = match &data {
             ExecutionEvent::AssistantDelta { .. } => "回复增量",
             ExecutionEvent::ToolStarted { .. } => "工具开始执行",
             ExecutionEvent::ToolFinished { .. } => "工具执行结束",
             ExecutionEvent::Usage { .. } => "模型服务用量",
             ExecutionEvent::ContextCompaction { .. } => "上下文压缩状态",
+            ExecutionEvent::ContextEstimate { .. } => "本地上下文估算",
         };
         let mut item = event(
             Some(text(&task, "session_id")?.into()),
@@ -415,9 +438,72 @@ impl Store {
                     },
                 ));
             }
-            "run_agent" => {
-                let session_id = resolve_session(&tx, source, command)?;
-                let content = bounded_text(command, "content", 100_000)?;
+            "run_agent" | "continue_task" => {
+                let previous = if kind == "continue_task" {
+                    let previous = record(&tx, "tasks", bounded_text(command, "task_id", 128)?)?;
+                    if previous["task_kind"] != "main"
+                        || !matches!(
+                            previous["status"].as_str(),
+                            Some("completed" | "failed" | "cancelled")
+                        )
+                    {
+                        bail!("只能从已结束的直接主任务发起新的继续任务");
+                    }
+                    Some(previous)
+                } else {
+                    None
+                };
+                let session_id = if let Some(previous) = &previous {
+                    text(previous, "session_id")?.to_owned()
+                } else {
+                    resolve_session(&tx, source, command)?
+                };
+                let mut continuation_origin = None;
+                let mut continuation_request = None;
+                let content = if let Some(previous) = &previous {
+                    let requirement = if command.get("content").is_none_or(Value::is_null) {
+                        previous["continuation_request"]
+                            .as_str()
+                            .unwrap_or("先检查现有项目和真实结果，继续完成原目标中尚未完成的工作。")
+                    } else {
+                        bounded_text(command, "content", 8192)?
+                    };
+                    if requirement.len() > 8192 {
+                        bail!("历史继续要求超过长度限制，请新建目标");
+                    }
+                    let origin_id = previous["continuation_origin"]
+                        .as_str()
+                        .unwrap_or(text(previous, "id")?);
+                    let origin = record(&tx, "tasks", origin_id)?;
+                    if origin["session_id"] != previous["session_id"]
+                        || origin["task_kind"] != "main"
+                    {
+                        bail!("继续任务的原始目标关联无效");
+                    }
+                    continuation_origin = Some(origin_id.to_owned());
+                    continuation_request = Some(requirement.to_owned());
+                    // Anchor to the original task, never recursively embed an
+                    // earlier generated continuation wrapper as the new goal.
+                    let objective = origin["objective"]
+                        .as_str()
+                        .or_else(|| origin["title"].as_str())
+                        .unwrap_or_default();
+                    let outcome = previous["result"]
+                        .as_str()
+                        .or_else(|| previous["error"].as_str())
+                        .unwrap_or("没有已保存结果");
+                    let mut end = outcome.len().min(16 * 1024);
+                    while !outcome.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let content = format!("明确继续以下历史任务，而不是自动继续最近一条：\n任务 ID：{}\n原目标：\n{}\n已保存终态：{}\n已保存结果（仅历史证据，不代表重新执行）：\n{}{}\n\n本次继续要求：\n{}\n保留现有修改；不要重复未确认的写入，不得声称未运行的验证通过。",text(previous,"id")?,objective,text(previous,"status")?,&outcome[..end],if end<outcome.len(){"\n[结果预览已截断；完整历史仍保留]"}else{""},requirement);
+                    if content.len() > 128 * 1024 {
+                        bail!("继续任务的目标上下文超过 128 KiB，请新建目标并明确范围");
+                    }
+                    content
+                } else {
+                    bounded_text(command, "content", 100_000)?.to_owned()
+                };
                 if !matches!(settings.main_executor.as_str(), "native" | "codex") {
                     bail!("主智能体执行器仅支持 native 或 codex");
                 }
@@ -448,7 +534,7 @@ impl Store {
                     + 1;
                 let mut task = worker_task(
                     &session_id,
-                    content,
+                    &content,
                     &settings.execution_mode,
                     source,
                     None,
@@ -456,13 +542,18 @@ impl Store {
                     None,
                 );
                 task["task_kind"] = json!("main");
+                if let Some(previous) = &previous {
+                    task["continued_from"] = previous["id"].clone();
+                    task["continuation_origin"] = json!(continuation_origin);
+                    task["continuation_request"] = json!(continuation_request);
+                }
                 task["main_sequence"] = json!(sequence);
                 task["agent"] = json!(agent);
                 task["context_config"] = json!(context);
                 let task_id = text(&task, "id")?.to_owned();
                 put(&tx, "tasks", &task)?;
                 let mut session = record(&tx, "sessions", &session_id)?;
-                append_message(&mut session, "user", content, Some(&task_id))?;
+                append_message(&mut session, "user", &content, Some(&task_id))?;
                 put(&tx, "sessions", &session)?;
                 receipt["session_id"] = json!(session_id);
                 receipt["task_id"] = json!(task_id);
@@ -472,6 +563,15 @@ impl Store {
                     "main_queued",
                     "主智能体已收到目标，正在当前会话中直接处理",
                 ));
+            }
+            "steer_task" => {
+                let task_id = bounded_text(command, "task_id", 128)?;
+                let content = bounded_text(command, "content", 8192)?;
+                let (id, session_id, item) = steering::accept(&tx, task_id, content)?;
+                receipt["supplement_id"] = json!(id);
+                receipt["task_id"] = json!(task_id);
+                receipt["session_id"] = json!(session_id);
+                produced = Some(item);
             }
             "start_task" => {
                 let session_id = resolve_session(&tx, source, command)?;
@@ -918,12 +1018,9 @@ impl Store {
                 {
                     continue;
                 }
-                history.push(json!({"role":"user","content":message["content"]}));
-                // A queued user message may precede the previous task's result in
-                // storage. Rebuild completed pairs to preserve conversational order.
-                if let Some(result) = other["result"].as_str().or_else(|| other["error"].as_str()) {
-                    history.push(json!({"role":"assistant","content":result}));
-                }
+                // Rebuild each task's original goal, applied supplements, and
+                // outcome together; queued messages may precede prior results.
+                history.extend(main_history_messages(other));
             } else if !reached_current
                 && matches!(message["role"].as_str(), Some("user" | "assistant"))
                 && message["content"] != "任务已交给后台智能体，当前会话可以继续使用。"
@@ -1511,6 +1608,30 @@ fn active_task_count(db: &Connection) -> Result<usize> {
         })
         .count())
 }
+fn main_history_messages(task: &Value) -> Vec<Value> {
+    let mut messages = vec![
+        json!({"role":"user","content":task["objective"].as_str().or_else(||task["title"].as_str()).unwrap_or_default()}),
+    ];
+    let inputs = task["supplements"].as_array().cloned().unwrap_or_default();
+    for input in &inputs {
+        if input["status"] == "applied" {
+            messages.push(json!({"role":"user","content":input["content"]}));
+        }
+    }
+    let unapplied: Vec<_> = inputs
+        .iter()
+        .filter(|input| input["status"] != "applied")
+        .map(|input| json!({"content":input["content"],"status":input["status"]}))
+        .collect();
+    if !unapplied.is_empty() {
+        messages.push(json!({"role":"assistant","content":format!("先前任务未确认应用的补充记录，仅供背景查询，不作为当前任务指令：{}",json!(unapplied))}));
+    }
+    if let Some(result) = task["result"].as_str().or_else(|| task["error"].as_str()) {
+        messages.push(json!({"role":"assistant","content":result}));
+    }
+    messages
+}
+
 fn worker_task(
     session_id: &str,
     title: &str,
@@ -1521,7 +1642,7 @@ fn worker_task(
     parent_task_id: Option<&str>,
 ) -> Value {
     json!({"id":new_id(),"session_id":session_id,"title":title,"objective":title,"task_kind":"worker","plan_id":plan_id,"node_id":node_id,"parent_task_id":parent_task_id,
-    "agent":AgentProfile::default(),"status":"queued","evidence":[],"execution_mode":execution_mode,"created_at":now(),"updated_at":now(),"source":source,"steps":[
+    "agent":AgentProfile::default(),"status":"queued","evidence":[],"supplements":[],"execution_mode":execution_mode,"created_at":now(),"updated_at":now(),"source":source,"steps":[
         {"id":new_id(),"title":"理解任务目标","status":"queued"},
         {"id":new_id(),"title":"使用项目工具执行","status":"queued"},
         {"id":new_id(),"title":"汇报证据和限制","status":"queued"}
@@ -1544,6 +1665,7 @@ fn terminal_steps(task: &mut Value, success: bool) {
     }
 }
 fn complete_transaction(tx: &Transaction<'_>, task: &mut Value) -> Result<RunEvent> {
+    steering::finalize(task);
     task["updated_at"] = json!(now());
     put(tx, "tasks", task)?;
     continuation::complete_context_transaction(tx, task)?;

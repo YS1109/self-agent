@@ -146,14 +146,18 @@ impl Store {
         // executor switch forces a fresh history bootstrap instead of omitting it.
         let continuous = if let Some(previous_id) = state["task_id"].as_str() {
             if let Ok(previous) = record(&tx, "tasks", previous_id) {
-                let len = history.len();
-                len >= 2
-                    && previous["status"] == "completed"
+                let tail = main_history_messages(&previous);
+                let known_inputs = previous["supplements"]
+                    .as_array()
+                    .is_none_or(|inputs| inputs.iter().all(|input| input["status"] == "applied"));
+                previous["status"] == "completed"
+                    && known_inputs
                     && previous["main_sequence"].as_u64().map(|n| n + 1)
                         == task["main_sequence"].as_u64()
-                    && history[len - 2] == json!({"role":"user","content":previous["objective"]})
-                    && history[len - 1] == json!({"role":"assistant","content":previous["result"]})
-                    && state["history_fingerprint"] == fingerprint(&json!(&history[..len - 2]))
+                    && history.len() >= tail.len()
+                    && history.ends_with(&tail)
+                    && state["history_fingerprint"]
+                        == fingerprint(&json!(&history[..history.len() - tail.len()]))
             } else {
                 false
             }

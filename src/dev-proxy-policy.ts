@@ -19,6 +19,10 @@ export function eventProxyPath(path: string): boolean {
   return !!match && Number.isSafeInteger(Number(match[1]));
 }
 
+export function changesProxyPath(path: string): boolean {
+  return /^\/api\/v1\/tasks\/[A-Za-z0-9_-]{1,128}\/changes$/.test(path);
+}
+
 export function allowDevelopmentProxy(
   method: string,
   path: string,
@@ -26,7 +30,7 @@ export function allowDevelopmentProxy(
   fetchSite: string | undefined,
   contentType: string | undefined,
 ): boolean {
-  if (!Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && eventProxyPath(path))) return false;
+  if (!Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (eventProxyPath(path) || changesProxyPath(path)))) return false;
   if (fetchSite === "cross-site") return false;
   if (origin && !localOrigins.has(origin)) return false;
   return (

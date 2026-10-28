@@ -93,4 +93,13 @@ describe("development proxy boundary", () => {
     expect(allowDevelopmentProxy("POST","/api/v1/events?after=0",undefined,"same-origin","application/json")).toBe(false);
   });
 
+  it("改动报告只允许 GET 和单一安全任务 ID，不放宽同源边界", () => {
+    const allowed = "/api/v1/tasks/task_123-ab/changes";
+    expect(allowDevelopmentProxy("GET", allowed, undefined, "same-origin", undefined)).toBe(true);
+    expect(allowDevelopmentProxy("POST", allowed, undefined, "same-origin", "application/json")).toBe(false);
+    expect(allowDevelopmentProxy("GET", allowed, "https://example.com", "cross-site", undefined)).toBe(false);
+    for (const path of ["/api/v1/tasks//changes", "/api/v1/tasks/../changes", "/api/v1/tasks/a%2fb/changes", allowed + "?token=x", allowed + "/", "/api/v1/tasks/" + "a".repeat(129) + "/changes"])
+      expect(allowDevelopmentProxy("GET", path, undefined, "same-origin", undefined)).toBe(false);
+  });
+
 });

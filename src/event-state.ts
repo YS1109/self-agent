@@ -38,6 +38,14 @@ function reduceTask(task: TaskRun, event: RunEvent): TaskRun {
   if (event.data?.kind === "assistant_delta") {
     return terminal ? task : appendText(task, event.data.text);
   }
+  if (event.data?.kind === "context_estimate") {
+    if (terminal) return task;
+    const { kind: _kind, ...estimate } = event.data;
+    return { ...task, context_estimate: { ...estimate, updated_at: event.created_at } };
+  }
+  if (event.data?.kind === "context_compaction") {
+    return terminal ? task : { ...task, context_compaction: { state: event.data.state, updated_at: event.created_at } };
+  }
   if (event.kind === "task_started") return terminal ? task : { ...task, status: "running", updated_at: event.created_at };
   if (["task_completed", "task_failed", "task_cancelled"].includes(event.kind)) {
     if (terminal) return task;

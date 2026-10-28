@@ -59,6 +59,11 @@ export function parseRunEvent(frame: SseFrame): RunEvent {
   if ((data?.kind === "tool_started" || data?.kind === "tool_finished")
     && (typeof data.call_id !== "string" || typeof data.name !== "string")) throw new Error("工具事件格式无效");
   if (data?.kind === "tool_finished" && (typeof data.success !== "boolean" || typeof data.output !== "string")) throw new Error("工具结果格式无效");
+  if (data?.kind === "context_estimate" && (
+    !validCursor(data.estimated_input_tokens) || !validCursor(data.context_window) || data.context_window === 0
+    || !Number.isInteger(data.compression_threshold) || data.compression_threshold < 1 || data.compression_threshold > 100
+    || typeof data.source !== "string" || typeof data.phase !== "string"
+  )) throw new Error("上下文估算格式无效");
   return event;
 }
 

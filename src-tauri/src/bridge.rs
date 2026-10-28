@@ -211,7 +211,22 @@ fn validate_base_url(base_url: &str) -> Result<Url, String> {
     event_stream::validate_base_url(base_url)
 }
 
+fn changes_path(path: &str) -> bool {
+    path.strip_prefix("/api/v1/tasks/")
+        .and_then(|part| part.strip_suffix("/changes"))
+        .is_some_and(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+}
+
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
+    if method == "GET" && changes_path(path) {
+        return Ok(Method::GET);
+    }
     match (method, path) {
         (
             "GET",
@@ -313,6 +328,16 @@ mod tests {
     #[test]
     fn bridge_accepts_only_known_method_and_route_pairs() {
         assert!(validate_route("GET", "/api/v1/snapshot").is_ok());
+        assert!(validate_route("GET", "/api/v1/tasks/task-123/changes").is_ok());
+        for path in [
+            "/api/v1/tasks/../changes",
+            "/api/v1/tasks//changes",
+            "/api/v1/tasks/a%2fb/changes",
+            "/api/v1/tasks/a/changes?x=1",
+        ] {
+            assert!(validate_route("GET", path).is_err());
+        }
+        assert!(validate_route("POST", "/api/v1/tasks/task-123/changes").is_err());
         assert!(validate_route("POST", "/api/v1/commands").is_ok());
         assert!(validate_route("POST", "/api/v1/models").is_ok());
         assert!(validate_route("GET", "/api/v1/provider/local-codex").is_ok());

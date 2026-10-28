@@ -39,6 +39,10 @@ pub(crate) struct Compression {
 }
 
 impl Compression {
+    pub fn protected_goal_index(&self) -> usize {
+        self.pinned.len() + 1
+    }
+
     pub fn restore(&self, summary: &str) -> Vec<Value> {
         let mut messages = self.pinned.clone();
         messages.push(summary_message(summary));
@@ -53,21 +57,45 @@ pub(crate) fn summary_message(summary: &str) -> Value {
     )})
 }
 
+#[cfg(test)]
 pub(crate) fn plan(messages: &[Value]) -> Result<Option<Compression>> {
-    let Some(latest_user) = messages
+    let Some(current_goal) = messages
         .iter()
         .rposition(|message| message["role"] == "user")
     else {
         return Ok(None);
     };
-    let mut group_starts = Vec::new();
-    let mut index = latest_user + 1;
+    plan_with_goal(messages, current_goal)
+}
+
+// The index identifies this task's original goal, not text equality or the
+// latest user message. Every subsequent user message is a live instruction and
+// must remain verbatim even when older tools are compacted.
+pub(crate) fn plan_with_goal(
+    messages: &[Value],
+    current_goal: usize,
+) -> Result<Option<Compression>> {
+    if messages
+        .get(current_goal)
+        .is_none_or(|message| message["role"] != "user")
+    {
+        bail!("当前任务目标的上下文边界无效");
+    }
+    if messages.len() > 100_000 {
+        bail!("会话上下文条数超过限制");
+    }
+    let mut retained = messages.len()..messages.len();
+    let mut index = current_goal + 1;
     while index < messages.len() {
         let message = &messages[index];
         if message["role"] == "tool" {
             bail!("上下文中存在缺少助手调用的工具结果");
         }
-        group_starts.push(index);
+        if message["role"] == "user" {
+            index += 1;
+            continue;
+        }
+        let start = index;
         if let Some(calls) = message["tool_calls"].as_array() {
             let expected: Vec<_> = calls
                 .iter()
@@ -90,27 +118,24 @@ pub(crate) fn plan(messages: &[Value]) -> Result<Option<Compression>> {
         } else {
             index += 1;
         }
+        retained = start..index;
     }
-    // Keep the newest complete tool group together, alongside the current goal.
-    let retained_start = group_starts.last().copied().unwrap_or(messages.len());
     let mut pinned = Vec::new();
     let mut source = Vec::new();
-    for (index, message) in messages.iter().enumerate().take(latest_user) {
-        if message["role"] == "system" || message["role"] == "developer" {
+    let mut tail = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if matches!(message["role"].as_str(), Some("system" | "developer")) {
             pinned.push(message.clone());
+        } else if index >= current_goal && (message["role"] == "user" || retained.contains(&index))
+        {
+            tail.push(message.clone());
         } else {
             source.push(message.clone());
         }
-        if index > 100_000 {
-            bail!("会话上下文条数超过限制");
-        }
     }
-    source.extend_from_slice(&messages[latest_user + 1..retained_start]);
     if source.is_empty() {
         return Ok(None);
     }
-    let mut tail = vec![messages[latest_user].clone()];
-    tail.extend_from_slice(&messages[retained_start..]);
     Ok(Some(Compression {
         source,
         pinned,
@@ -185,6 +210,70 @@ mod tests {
         assert_eq!(restored[2], messages[3]);
         assert_eq!(&restored[3..], &messages[6..]);
         assert!(plan(&restored).unwrap().is_some());
+    }
+
+    #[test]
+    fn compaction_pins_indexed_current_goal_and_every_supplement_across_rebuilds() {
+        let messages = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"SAME_GOAL"}),
+            json!({"role":"assistant","content":"old result"}),
+            json!({"role":"user","content":"SAME_GOAL"}),
+            json!({"role":"user","content":"SUPPLEMENT_ONE"}),
+            json!({"role":"assistant","tool_calls":[{"id":"old"}]}),
+            json!({"role":"tool","tool_call_id":"old","content":"old tool"}),
+            json!({"role":"user","content":"SUPPLEMENT_TWO"}),
+            json!({"role":"assistant","tool_calls":[{"id":"latest"}]}),
+            json!({"role":"tool","tool_call_id":"latest","content":"latest tool"}),
+        ];
+        let plan = plan_with_goal(&messages, 3).unwrap().unwrap();
+        assert_eq!(
+            plan.source,
+            [
+                messages[1].clone(),
+                messages[2].clone(),
+                messages[5].clone(),
+                messages[6].clone()
+            ]
+        );
+        let mut restored = plan.restore("summary");
+        assert_eq!(restored[plan.protected_goal_index()], messages[3]);
+        assert_eq!(
+            &restored[2..],
+            &[
+                messages[3].clone(),
+                messages[4].clone(),
+                messages[7].clone(),
+                messages[8].clone(),
+                messages[9].clone()
+            ]
+        );
+        restored.extend([
+            json!({"role":"user","content":"SUPPLEMENT_THREE"}),
+            json!({"role":"assistant","tool_calls":[{"id":"new"}]}),
+            json!({"role":"tool","tool_call_id":"new","content":"new tool"}),
+        ]);
+        let next = plan_with_goal(&restored, plan.protected_goal_index())
+            .unwrap()
+            .unwrap();
+        let final_messages = next.restore("new summary");
+        let text = serde_json::to_string(&final_messages).unwrap();
+        for instruction in [
+            "SAME_GOAL",
+            "SUPPLEMENT_ONE",
+            "SUPPLEMENT_TWO",
+            "SUPPLEMENT_THREE",
+        ] {
+            assert_eq!(text.matches(instruction).count(), 1);
+            assert!(!serde_json::to_string(&next.source)
+                .unwrap()
+                .contains(instruction));
+        }
+        assert_eq!(
+            final_messages[next.protected_goal_index()]["content"],
+            "SAME_GOAL"
+        );
+        assert_eq!(final_messages.last().unwrap()["tool_call_id"], "new");
     }
 
     #[test]

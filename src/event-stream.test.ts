@@ -79,3 +79,14 @@ describe("浏览器受控事件代理",()=>{
   const data=messages.filter(m=>m.type!=="status");expect(data[0].type).toBe("snapshot");expect(data[1].type).toBe("event");
  });
 });
+
+describe("上下文估算事件校验", () => {
+  it("只接受有界数值，未知新类型仍可兼容", () => {
+    const data={kind:"context_estimate",estimated_input_tokens:1200,context_window:128000,compression_threshold:80,source:"codex_current_input_only",phase:"before_turn"};
+    const frame={event:"run_event",id:"1",data:JSON.stringify({...event(1),data})};
+    expect(parseRunEvent(frame).data).toEqual(data);
+    for(const invalid of [{...data,estimated_input_tokens:-1},{...data,context_window:0},{...data,compression_threshold:101},{...data,source:2}])
+      expect(()=>parseRunEvent({...frame,data:JSON.stringify({...event(1),data:invalid})})).toThrow("上下文估算");
+    expect(parseRunEvent({...frame,data:JSON.stringify({...event(1),data:{kind:"future_kind"}})}).sequence).toBe(1);
+  });
+});

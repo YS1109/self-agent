@@ -13,6 +13,8 @@ rust-version = "1.96"
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 futures-util = "0.3"

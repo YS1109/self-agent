@@ -51,7 +51,7 @@ export function useDaemonSnapshot() {
       } else {
         const missingTask = !!message.event.task_id && !state.current.snapshot.tasks.some(task => task.id === message.event.task_id);
         state.current = receiveEvent(state.current, message.event);
-        if (missingTask || !["assistant_delta", "tool_started", "tool_finished", "usage", "context_compaction", "command_output"].includes(message.event.kind)) {
+        if (missingTask || !["assistant_delta", "tool_started", "tool_finished", "usage", "context_estimate", "context_compaction", "command_output"].includes(message.event.kind)) {
           if (!eventRefresh) eventRefresh = setTimeout(() => { eventRefresh = undefined; if (alive) void refresh(); }, 150);
         }
       }

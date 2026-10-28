@@ -6,13 +6,14 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
-use harness_core::{CommandEvidence, ExecutionEvent, ModelContextConfig};
+use harness_core::{CommandEvidence, ExecutionEvent, ModelContextConfig, TaskSupplement};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
     context::ExecutionInput,
     continuation::{fingerprint, NativeSummary},
+    steering::InputAcknowledgement,
     Settings,
 };
 
@@ -103,6 +104,7 @@ pub(crate) async fn execute_with_context_events(
 /// Reusable memory is a cache of a verified prefix, never a replacement for the
 /// authoritative history supplied by the store. The callback commits only a
 /// successful preflight summary before any current-task tool can run.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_with_memory(
     settings: &Settings,
@@ -114,6 +116,36 @@ pub(crate) async fn execute_with_memory(
     events: impl Fn(ExecutionEvent) -> Result<()>,
     memory: Option<&NativeSummary>,
     save_summary: impl Fn(NativeSummary) -> Result<()>,
+) -> Result<String> {
+    execute_with_control(
+        settings,
+        root,
+        input,
+        progress,
+        cancelled,
+        evidence,
+        events,
+        memory,
+        save_summary,
+        || Ok(Vec::new()),
+        |_, _| Ok(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_with_control(
+    settings: &Settings,
+    root: &Path,
+    input: ExecutionInput<'_>,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+    evidence: impl Fn(CommandEvidence),
+    events: impl Fn(ExecutionEvent) -> Result<()>,
+    memory: Option<&NativeSummary>,
+    save_summary: impl Fn(NativeSummary) -> Result<()>,
+    claim_inputs: impl Fn() -> Result<Vec<TaskSupplement>>,
+    ack_inputs: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
 ) -> Result<String> {
     let settings = crate::configuration::resolve(settings)?;
     let emitted_text = std::sync::atomic::AtomicUsize::new(0);
@@ -172,6 +204,8 @@ pub(crate) async fn execute_with_memory(
             publish,
             memory,
             save_summary,
+            claim_inputs,
+            ack_inputs,
         )
         .await?;
         // Never flush a possible credential suffix on cancellation or failure.
@@ -207,6 +241,8 @@ async fn execute_inner(
     events: impl Fn(ExecutionEvent) -> Result<()>,
     memory: Option<&NativeSummary>,
     save_summary: impl Fn(NativeSummary) -> Result<()>,
+    claim_inputs: impl Fn() -> Result<Vec<TaskSupplement>>,
+    ack_inputs: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
 ) -> Result<String> {
     let ExecutionInput {
         objective,
@@ -257,6 +293,7 @@ async fn execute_inner(
         matches!(role, "user" | "assistant").then(|| json!({"role":role,"content":content}))
     }));
     messages.push(json!({"role":"user", "content":objective}));
+    let mut current_goal = messages.len() - 1;
     let tools = tools(shell_enabled);
     let known_secrets = secrets(settings);
     for turn in 0..MAX_TURNS {
@@ -268,31 +305,74 @@ async fn execute_inner(
             turn + 1,
             MAX_TURNS
         ));
-        let summary = compact_context(
-            settings,
-            &client,
-            &endpoint,
-            &mut messages,
-            &tools,
-            context,
-            (&progress, &cancelled, &events),
-        )
-        .await?;
-        // Only turn zero contains exclusively prior history in its compression
-        // source. Later summaries also contain this task's tools and must stay
-        // execution-local rather than claim a completed conversation boundary.
-        if turn == 0 && !history.is_empty() && covered_messages < history.len() {
-            if let Some(summary) = summary {
-                if cancelled() {
-                    bail!("任务已取消");
+        // Persist only prior-history preflight compaction. Claiming supplements
+        // first would falsely include current instructions in a reusable cache.
+        if turn == 0 {
+            let summary = compact_context(
+                settings,
+                &client,
+                &endpoint,
+                &mut messages,
+                &tools,
+                context,
+                &mut current_goal,
+                (&progress, &cancelled, &events),
+            )
+            .await?;
+            if !history.is_empty() && covered_messages < history.len() {
+                if let Some(summary) = summary {
+                    if cancelled() {
+                        bail!("任务已取消");
+                    }
+                    save_summary(NativeSummary {
+                        summary: redact_all(settings, &summary),
+                        covered_messages: history.len(),
+                        prefix_fingerprint: fingerprint(&json!(history)),
+                    })?;
                 }
-                save_summary(NativeSummary {
-                    summary: redact_all(settings, &summary),
-                    covered_messages: history.len(),
-                    prefix_fingerprint: fingerprint(&json!(history)),
-                })?;
             }
         }
+        if cancelled() {
+            bail!("任务已取消");
+        }
+        let supplements = claim_inputs()?;
+        let input_ids: Vec<_> = supplements.iter().map(|input| input.id.clone()).collect();
+        let acknowledge = |outcome| {
+            if input_ids.is_empty() {
+                Ok(())
+            } else {
+                ack_inputs(&input_ids, outcome)
+            }
+        };
+        for input in supplements {
+            messages.push(json!({"role":"user", "content":input.content}));
+        }
+        if turn > 0 || !input_ids.is_empty() {
+            if let Err(error) = compact_context(
+                settings,
+                &client,
+                &endpoint,
+                &mut messages,
+                &tools,
+                context,
+                &mut current_goal,
+                (&progress, &cancelled, &events),
+            )
+            .await
+            {
+                acknowledge(InputAcknowledgement::NotApplied {
+                    reason: "补充后的上下文未通过准备检查，未发送执行请求".into(),
+                })?;
+                return Err(error);
+            }
+        }
+        events(ExecutionEvent::ContextEstimate {
+            estimated_input_tokens: crate::context::estimate(&messages, &tools) as u64,
+            context_window: context.context_window,
+            compression_threshold: context.compression_threshold,
+            source: "native_local".into(),
+            phase: "request".into(),
+        })?;
         let request_body = json!({
             "model":settings.model, "messages":messages, "tools":tools,
             "tool_choice":"auto", "stream":true, "stream_options":{"include_usage":true},
@@ -306,6 +386,7 @@ async fn execute_inner(
             &cancelled,
             &events,
             &progress,
+            &acknowledge,
         )
         .await?;
         provider_stream::validate_calls(&message)?;
@@ -496,6 +577,7 @@ impl<'a, F: Fn(ExecutionEvent) -> Result<()>> TextEvents<'a, F> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn request_completion(
     settings: &Settings,
     client: &reqwest::Client,
@@ -504,8 +586,12 @@ async fn request_completion(
     cancelled: &impl Fn() -> bool,
     events: &impl Fn(ExecutionEvent) -> Result<()>,
     progress: &impl Fn(String),
+    acknowledge: &impl Fn(InputAcknowledgement) -> Result<()>,
 ) -> Result<Value> {
     if serde_json::to_vec(body)?.len() > 2 * 1024 * 1024 {
+        acknowledge(InputAcknowledgement::NotApplied {
+            reason: "补充后的请求超过 2 MiB 预算，未发送".into(),
+        })?;
         bail!("原生执行已达到 2 MiB 请求预算，请增大压缩力度或创建后续会话");
     }
     interruptible(
@@ -516,11 +602,20 @@ async fn request_completion(
                 .await
                 .context("模型服务请求失败，请检查连接与配置")?;
             if !response.status().is_success() {
+                acknowledge(InputAcknowledgement::NotApplied {
+                    reason: format!("模型服务返回 HTTP {}，补充未应用", response.status()),
+                })?;
                 bail!(
                     "模型服务返回 HTTP {}；未自动降级或重试，请确认服务支持流式 Chat Completions",
                     response.status()
                 );
             }
+            if cancelled() {
+                bail!("任务已取消");
+            }
+            acknowledge(InputAcknowledgement::Applied {
+                via: "native_request".into(),
+            })?;
             let content_type = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -645,6 +740,7 @@ async fn request_json(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compact_context(
     settings: &Settings,
     client: &reqwest::Client,
@@ -652,6 +748,7 @@ async fn compact_context(
     messages: &mut Vec<Value>,
     tools: &[Value],
     config: &ModelContextConfig,
+    current_goal: &mut usize,
     callbacks: (
         &impl Fn(String),
         &impl Fn() -> bool,
@@ -665,11 +762,18 @@ async fn compact_context(
         bail!("模型上下文配置无效");
     }
     let estimated = crate::context::estimate(messages, tools);
+    events(ExecutionEvent::ContextEstimate {
+        estimated_input_tokens: estimated as u64,
+        context_window: config.context_window,
+        compression_threshold: config.compression_threshold,
+        source: "native_local".into(),
+        phase: "before_compaction".into(),
+    })?;
     let available = config.context_window as usize - crate::context::output_budget(config);
     if estimated < crate::context::compression_limit(config) && estimated <= available {
         return Ok(None);
     }
-    let Some(compression) = crate::context::plan(messages)? else {
+    let Some(compression) = crate::context::plan_with_goal(messages, *current_goal)? else {
         if estimated > available {
             bail!("当前目标和最新完整工具结果的估算上下文超过模型窗口，请缩短输入、减小工具输出或增大上下文窗口");
         }
@@ -755,6 +859,7 @@ async fn compact_context(
         return Ok(None);
     }
     if cancelled() { bail!("任务已取消"); }
+    *current_goal = compression.protected_goal_index();
     *messages = compacted;
     events(ExecutionEvent::ContextCompaction { state: "completed".into() })?;
     progress(format!(
@@ -1250,6 +1355,411 @@ mod tests {
             context_window: 8000,
             compression_threshold: 60,
         }
+    }
+
+    fn supplement(id: &str, content: &str) -> TaskSupplement {
+        TaskSupplement {
+            id: id.into(),
+            task_id: "fixture-task".into(),
+            content: content.into(),
+            status: "delivering".into(),
+            reason: None,
+            applied_via: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn supplements_apply_once_after_the_complete_tool_batch_and_accepted_headers() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (settings, requests, server) = memory_fixture(|body| {
+            if body["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool") {
+                text_completion("DONE")
+            } else {
+                json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[
+                    {"id":"first","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"a.txt\",\"content\":\"original\"}"}},
+                    {"id":"second","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"b.txt\",\"content\":\"original\"}"}}
+                ]}}]})
+            }
+        }).await;
+        let root = std::env::temp_dir().join(harness_core::new_id());
+        std::fs::create_dir(&root).unwrap();
+        let pending = AtomicBool::new(false);
+        let claims = AtomicUsize::new(0);
+        let acknowledgements = Mutex::new(Vec::new());
+        let result = execute_with_control(&settings, &root,
+            ExecutionInput { objective:"ORIGINAL_GOAL",history:&[],config:&ModelContextConfig::default() },
+            |_|{}, ||false, |_|{},
+            |event| { if matches!(event, ExecutionEvent::ToolFinished { ref call_id, .. } if call_id == "first") { pending.store(true,Ordering::SeqCst); } Ok(()) },
+            None, |_|Ok(()),
+            || { claims.fetch_add(1,Ordering::SeqCst); if pending.swap(false,Ordering::SeqCst) {
+                assert!(root.join("a.txt").exists() && root.join("b.txt").exists(), "Claimed mid tool batch");
+                Ok(vec![supplement("one","SUPPLEMENT_ONE"),supplement("two","SUPPLEMENT_TWO")])
+            } else { Ok(Vec::new()) } },
+            |ids, outcome| { assert_eq!(requests.lock().unwrap().len(),2,"Acknowledged before the request arrived"); acknowledgements.lock().unwrap().push((ids.to_vec(),outcome)); Ok(()) },
+        ).await.unwrap();
+        assert_eq!(result, "DONE");
+        assert_eq!(claims.load(Ordering::SeqCst), 2);
+        let acknowledgements = acknowledgements.lock().unwrap();
+        assert_eq!(acknowledgements.len(), 1);
+        assert_eq!(acknowledgements[0].0, ["one", "two"]);
+        assert!(
+            matches!(&acknowledgements[0].1,InputAcknowledgement::Applied{via} if via == "native_request")
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "Steering must not add a model turn");
+        let messages = requests[1]["messages"].as_array().unwrap();
+        assert_eq!(messages[messages.len() - 3]["tool_call_id"], "second");
+        for text in ["ORIGINAL_GOAL", "SUPPLEMENT_ONE", "SUPPLEMENT_TWO"] {
+            assert_eq!(requests[1]["messages"].to_string().matches(text).count(), 1);
+        }
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preflight_cache_excludes_supplements_and_context_estimates_describe_actual_request() {
+        let (settings, requests, server) = memory_fixture(|body| {
+            text_completion(if body.get("tools").is_some() {
+                "DONE"
+            } else {
+                "SAFE_HISTORY_SUMMARY"
+            })
+        })
+        .await;
+        let history = summary_history();
+        let config = memory_policy();
+        let saved = Mutex::new(Vec::new());
+        let estimates = Mutex::new(Vec::new());
+        execute_with_control(
+            &settings,
+            &std::env::temp_dir(),
+            ExecutionInput {
+                objective: "CURRENT_GOAL",
+                history: &history,
+                config: &config,
+            },
+            |_| {},
+            || false,
+            |_| {},
+            |event| {
+                if let ExecutionEvent::ContextEstimate {
+                    estimated_input_tokens,
+                    source,
+                    phase,
+                    context_window,
+                    compression_threshold,
+                } = event
+                {
+                    assert_eq!(source, "native_local");
+                    assert_eq!(context_window, config.context_window);
+                    assert_eq!(compression_threshold, config.compression_threshold);
+                    estimates
+                        .lock()
+                        .unwrap()
+                        .push((phase, estimated_input_tokens));
+                }
+                Ok(())
+            },
+            None,
+            |summary| {
+                saved.lock().unwrap().push(summary);
+                Ok(())
+            },
+            || Ok(vec![supplement("input", "LIVE_SUPPLEMENT")]),
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let saved = saved.lock().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].covered_messages, history.len());
+        let requests = requests.lock().unwrap();
+        for request in requests
+            .iter()
+            .filter(|request| request.get("tools").is_none())
+        {
+            assert!(!request.to_string().contains("LIVE_SUPPLEMENT"));
+            assert!(!request.to_string().contains("CURRENT_GOAL"));
+        }
+        let request = requests.last().unwrap();
+        for instruction in ["CURRENT_GOAL", "LIVE_SUPPLEMENT"] {
+            assert_eq!(
+                request["messages"].to_string().matches(instruction).count(),
+                1
+            );
+        }
+        let estimates = estimates.lock().unwrap();
+        assert_eq!(estimates.last().unwrap().0, "request");
+        assert_eq!(
+            estimates.last().unwrap().1,
+            crate::context::estimate(
+                request["messages"].as_array().unwrap(),
+                request["tools"].as_array().unwrap()
+            ) as u64
+        );
+        assert!(estimates[0].1 > estimates.last().unwrap().1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_pinned_supplement_is_not_applied_or_silently_summarized() {
+        let (settings, requests, server) = memory_fixture(|_| text_completion("UNEXPECTED")).await;
+        let outcomes = Mutex::new(Vec::new());
+        let config = ModelContextConfig {
+            context_window: 8192,
+            compression_threshold: 80,
+        };
+        let error = execute_with_control(
+            &settings,
+            &std::env::temp_dir(),
+            ExecutionInput {
+                objective: "KEEP_ORIGINAL_GOAL",
+                history: &[],
+                config: &config,
+            },
+            |_| {},
+            || false,
+            |_| {},
+            |_| Ok(()),
+            None,
+            |_| bail!("Current instructions must not be cached"),
+            || {
+                Ok(vec![supplement(
+                    "input",
+                    &"current instruction ".repeat(2000),
+                )])
+            },
+            |ids, outcome| {
+                assert_eq!(ids, ["input"]);
+                outcomes.lock().unwrap().push(outcome);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("超过模型窗口"));
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "Oversized current instructions must not be sent to a summarizer"
+        );
+        let outcomes = outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(
+            outcomes[0],
+            InputAcknowledgement::NotApplied { .. }
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn final_response_does_not_claim_late_supplements_or_start_an_extra_turn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let pending = Arc::new(AtomicBool::new(false));
+        let arriving = pending.clone();
+        let (settings, requests, server) = memory_fixture(move |_| {
+            arriving.store(true, Ordering::SeqCst);
+            text_completion("DONE")
+        })
+        .await;
+        let claims = AtomicUsize::new(0);
+        execute_with_control(
+            &settings,
+            &std::env::temp_dir(),
+            ExecutionInput {
+                objective: "GOAL",
+                history: &[],
+                config: &ModelContextConfig::default(),
+            },
+            |_| {},
+            || false,
+            |_| {},
+            |_| Ok(()),
+            None,
+            |_| Ok(()),
+            || {
+                claims.fetch_add(1, Ordering::SeqCst);
+                assert!(!pending.load(Ordering::SeqCst));
+                Ok(Vec::new())
+            },
+            |_, _| bail!("No input should be acknowledged"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(pending.load(Ordering::SeqCst));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn steering_headers_acknowledge_transport_not_model_compliance_and_failure_never_retries()
+    {
+        for status in [
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::http::StatusCode::OK,
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = calls.clone();
+            let router = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let seen = seen.clone();
+                    async move {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            status,
+                            [("content-type", "application/json")],
+                            "invalid JSON",
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let settings = Settings {
+                base_url: format!("http://{endpoint}/v1"),
+                model: "fixture-model".into(),
+                provider_source: "manual".into(),
+                ..Settings::default()
+            };
+            let outcomes = Mutex::new(Vec::new());
+            assert!(execute_with_control(
+                &settings,
+                &std::env::temp_dir(),
+                ExecutionInput {
+                    objective: "GOAL",
+                    history: &[],
+                    config: &ModelContextConfig::default()
+                },
+                |_| {},
+                || false,
+                |_| {},
+                |_| Ok(()),
+                None,
+                |_| Ok(()),
+                || Ok(vec![supplement("input", "UPDATE")]),
+                |ids, outcome| {
+                    assert_eq!(ids, ["input"]);
+                    outcomes.lock().unwrap().push(outcome);
+                    Ok(())
+                }
+            )
+            .await
+            .is_err());
+            let outcomes = outcomes.lock().unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            if status.is_success() {
+                assert!(matches!(&outcomes[0], InputAcknowledgement::Applied { .. }));
+            } else {
+                assert!(
+                    matches!(&outcomes[0],InputAcknowledgement::NotApplied{reason} if reason.contains("400"))
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_or_failed_input_ack_prevents_received_tools_and_extra_claims() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for cancel in [true, false] {
+            let (settings, requests, server) = memory_fixture(|_| json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[
+                {"id":"write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"not-written.txt\",\"content\":\"wrong\"}"}}
+            ]}}]})).await;
+            let root = std::env::temp_dir().join(harness_core::new_id());
+            std::fs::create_dir(&root).unwrap();
+            let cancelled = AtomicBool::new(false);
+            let claims = AtomicUsize::new(0);
+            let acks = AtomicUsize::new(0);
+            let error = execute_with_control(
+                &settings,
+                &root,
+                ExecutionInput {
+                    objective: "GOAL",
+                    history: &[],
+                    config: &ModelContextConfig::default(),
+                },
+                |_| {},
+                || cancelled.load(Ordering::SeqCst),
+                |_| {},
+                |_| Ok(()),
+                None,
+                |_| Ok(()),
+                || {
+                    claims.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![supplement("input", "UPDATE")])
+                },
+                |_, outcome| {
+                    assert!(matches!(outcome, InputAcknowledgement::Applied { .. }));
+                    acks.fetch_add(1, Ordering::SeqCst);
+                    if cancel {
+                        cancelled.store(true, Ordering::SeqCst);
+                        Ok(())
+                    } else {
+                        bail!("ACK persistence failed")
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(if cancel {
+                "取消"
+            } else {
+                "ACK persistence failed"
+            }));
+            assert_eq!(claims.load(Ordering::SeqCst), 1);
+            assert_eq!(acks.load(Ordering::SeqCst), 1);
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(!root.join("not-written.txt").exists());
+            server.abort();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_transport_leaves_claimed_inputs_unacknowledged_without_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 8192];
+            assert!(connection.read(&mut bytes).await.unwrap() > 0);
+            // Close without HTTP headers: delivery is unknown, never "applied".
+        });
+        let settings = Settings {
+            base_url: format!("http://{address}/v1"),
+            model: "fixture-model".into(),
+            provider_source: "manual".into(),
+            ..Settings::default()
+        };
+        assert!(execute_with_control(
+            &settings,
+            &std::env::temp_dir(),
+            ExecutionInput {
+                objective: "GOAL",
+                history: &[],
+                config: &ModelContextConfig::default()
+            },
+            |_| {},
+            || false,
+            |_| {},
+            |_| Ok(()),
+            None,
+            |_| Ok(()),
+            || Ok(vec![supplement("input", "UPDATE")]),
+            |_, _| bail!("Unknown transport must not ACK")
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("请求失败"));
+        server.await.unwrap();
     }
 
     #[test]
@@ -1919,7 +2429,12 @@ mod tests {
             |_| {},
             || false,
             |_| {},
-            |_| bail!("事件提交失败"),
+            |event| {
+                if matches!(event, ExecutionEvent::ToolStarted { .. }) {
+                    bail!("事件提交失败");
+                }
+                Ok(())
+            },
         )
         .await;
         assert!(result.unwrap_err().to_string().contains("事件提交失败"));

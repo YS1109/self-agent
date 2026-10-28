@@ -95,4 +95,24 @@ describe("private daemon transport", () => {
     expect(second.source).toEqual(REMOTE_SOURCE);
     expect(second.command.type).toBe("send_message");
   });
+  it("补充与继续保留显式目标和幂等信封，未知网络结果不重送 POST", async () => {
+    vi.stubGlobal("window", {});
+    const fetcher = vi.fn().mockResolvedValue({ok:true,json:async()=>({status:"accepted",task_id:"t",supplement_id:"s"})});
+    vi.stubGlobal("fetch",fetcher);
+    await dispatch(DESKTOP_SOURCE,{type:"steer_task",task_id:"original",content:"补充"});
+    const envelope=JSON.parse(fetcher.mock.calls[0][1].body);
+    expect(envelope.command).toEqual({type:"steer_task",task_id:"original",content:"补充"});
+    expect(envelope.command_id).toMatch(/^[a-f0-9-]{36}$/);
+    fetcher.mockRejectedValue(new Error("network lost"));
+    await expect(dispatch(DESKTOP_SOURCE,{type:"continue_task",task_id:"terminal"})).rejects.toThrow("network lost");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetcher.mock.calls[1][1].body).command).toEqual({type:"continue_task",task_id:"terminal"});
+  });
+  it("只读改动报告通过私有 Rust 桥且不向前端注入凭据", async () => {
+    vi.stubGlobal("window",{__TAURI_INTERNALS__:{}});
+    invoke.mockResolvedValue({state:"expired"});
+    await expect(api("GET","/tasks/task-1/changes")).resolves.toEqual({state:"expired"});
+    expect(invoke).toHaveBeenCalledWith("api_request",{method:"GET",path:"/api/v1/tasks/task-1/changes",body:null});
+  });
+
 });

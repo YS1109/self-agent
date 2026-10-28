@@ -1,3 +1,4 @@
+mod changes;
 mod codex;
 mod configuration;
 mod context;
@@ -7,6 +8,7 @@ mod model_config;
 mod models;
 pub mod profiles;
 pub mod provider;
+mod steering;
 pub mod store;
 
 use std::{
@@ -18,7 +20,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Query, Request, State},
+    extract::{Path as ApiPath, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{sse::Event, IntoResponse, Response, Sse},
@@ -210,6 +212,7 @@ impl AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     let private = Router::new()
         .route("/api/v1/snapshot", get(snapshot))
+        .route("/api/v1/tasks/{task_id}/changes", get(task_changes))
         .route("/api/v1/commands", post(command))
         .route("/api/v1/settings", get(settings).put(update_settings))
         .route("/api/v1/settings/check", post(check_settings))
@@ -243,6 +246,16 @@ async fn authenticate(
         return ApiError(StatusCode::UNAUTHORIZED, "需要本机身份验证".into()).into_response();
     }
     next.run(request).await
+}
+
+async fn task_changes(
+    State(state): State<Arc<AppState>>,
+    ApiPath(task_id): ApiPath<String>,
+) -> ApiResult<Json<Value>> {
+    if task_id.is_empty() || task_id.len() > 128 {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "任务标识无效".into()));
+    }
+    Ok(Json(state.store.lock().unwrap().changes(&task_id)?))
 }
 
 async fn snapshot(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
@@ -600,6 +613,8 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         drop(permit);
         return;
     }
+    let mut change_baseline = None;
+    let report_secrets = Arc::new(Mutex::new(Vec::<String>::new()));
     let result = if task["execution_mode"] == "demo" {
         demo(&state, &task_id).await
     } else {
@@ -721,115 +736,190 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             state_for_events.publish(event);
             Ok(())
         };
-        match agent.executor.as_str() {
-            "native" => {
-                async {
-                    // Pin the resolved service once for this execution. A local
-                    // Codex config edit cannot change the summary identity between
-                    // cache validation and the actual provider call.
-                    let settings = configuration::resolve(&settings)?;
-                    let config = continuation::native_identity(&settings, &root, &agent, &context)?;
-                    let memory = if task["task_kind"] == "main" {
-                        state
-                            .store
-                            .lock()
-                            .unwrap()
-                            .prepare_native_summary(&task_id, &config)?
-                    } else {
-                        None
-                    };
-                    let state_for_summary = state.clone();
-                    let task_for_summary = task_id.clone();
-                    let main = task["task_kind"] == "main";
-                    provider::execute_with_memory(
-                        &settings,
-                        &root,
-                        input,
-                        progress,
-                        is_cancelled,
-                        evidence,
-                        execution_event,
-                        memory.as_ref(),
-                        move |summary| {
-                            if main {
-                                state_for_summary
-                                    .store
-                                    .lock()
-                                    .unwrap()
-                                    .save_native_summary(&task_for_summary, &config, summary)?;
-                            }
-                            Ok(())
-                        },
-                    )
-                    .await
+        let state_for_inputs = state.clone();
+        let task_for_inputs = task_id.clone();
+        let claim_inputs = move || {
+            state_for_inputs
+                .store
+                .lock()
+                .unwrap()
+                .claim_inputs(&task_for_inputs)
+        };
+        let state_for_ack = state.clone();
+        let task_for_ack = task_id.clone();
+        let ack_inputs =
+            move |ids: &[String], outcome: steering::InputAcknowledgement| -> anyhow::Result<()> {
+                let item =
+                    state_for_ack
+                        .store
+                        .lock()
+                        .unwrap()
+                        .ack_inputs(&task_for_ack, ids, outcome)?;
+                if let Some(item) = item {
+                    state_for_ack.publish(item);
                 }
-                .await
+                Ok(())
+            };
+        let began_changes = state.store.lock().unwrap().begin_changes(&task_id);
+        if let Err(error) = began_changes {
+            finish(&state, &task_id, Err(error));
+            return;
+        }
+        let initial_secrets = continuation::known_secrets(&settings);
+        *report_secrets.lock().unwrap() = initial_secrets.clone();
+        let capture_root = root.clone();
+        match tokio::task::spawn_blocking(move || changes::capture(&capture_root, &initial_secrets))
+            .await
+        {
+            Ok(Ok(baseline)) => change_baseline = Some(baseline),
+            _ => {
+                publish_changes(
+                    &state,
+                    &task_id,
+                    json!({"state":"unavailable","reason":"无法安全采集项目基线；未启动执行器写入。"}),
+                );
+                finish(
+                    &state,
+                    &task_id,
+                    Err(anyhow::anyhow!("无法安全采集项目基线，任务未开始写入")),
+                );
+                return;
             }
-            "codex" => {
-                async {
-                    let main = task["task_kind"] == "main";
-                    let continuation = if main {
-                        let (config, expected_config) = continuation::codex_identity(
-                            &settings.codex_binary,
+        }
+        if is_cancelled() {
+            Err(anyhow::anyhow!("任务已取消"))
+        } else {
+            match agent.executor.as_str() {
+                "native" => {
+                    async {
+                        // Pin the resolved service once for this execution. A local
+                        // Codex config edit cannot change the summary identity between
+                        // cache validation and the actual provider call.
+                        let settings = configuration::resolve(&settings)?;
+                        let config =
+                            continuation::native_identity(&settings, &root, &agent, &context)?;
+                        let memory = if task["task_kind"] == "main" {
+                            state
+                                .store
+                                .lock()
+                                .unwrap()
+                                .prepare_native_summary(&task_id, &config)?
+                        } else {
+                            None
+                        };
+                        let state_for_summary = state.clone();
+                        let task_for_summary = task_id.clone();
+                        let main = task["task_kind"] == "main";
+                        provider::execute_with_control(
+                            &settings,
                             &root,
-                            &agent,
-                            &context,
+                            input,
+                            progress,
+                            is_cancelled,
+                            evidence,
+                            execution_event,
+                            memory.as_ref(),
+                            move |summary| {
+                                if main {
+                                    state_for_summary
+                                        .store
+                                        .lock()
+                                        .unwrap()
+                                        .save_native_summary(&task_for_summary, &config, summary)?;
+                                }
+                                Ok(())
+                            },
+                            claim_inputs,
+                            ack_inputs,
                         )
-                        .await?;
-                        let prior = state
-                            .store
-                            .lock()
-                            .unwrap()
-                            .prepare_codex_continuation(&task_id, &config)?;
-                        let (thread_id, expected_turn_id) = prior
-                            .map(|(thread, turn)| (Some(thread), Some(turn)))
-                            .unwrap_or_default();
-                        Some(codex::CodexContinuation {
-                            thread_id,
-                            expected_turn_id,
-                            expected_config: Some(expected_config),
-                        })
-                    } else {
-                        None
-                    };
-                    let state_for_lifecycle = state.clone();
-                    let task_for_lifecycle = task_id.clone();
-                    let known_secrets = continuation::known_secrets(&settings);
-                    codex::execute_with_continuation(
-                        &settings.codex_binary,
-                        &agent.model,
-                        &root,
-                        input,
-                        progress,
-                        is_cancelled,
-                        evidence,
-                        continuation,
-                        &known_secrets,
-                        execution_event,
-                        move |update| {
-                            if main {
-                                state_for_lifecycle
-                                    .store
-                                    .lock()
-                                    .unwrap()
-                                    .codex_lifecycle(&task_for_lifecycle, update)?;
-                            }
-                            Ok(())
-                        },
-                    )
+                        .await
+                    }
                     .await
-                    .map(|text| redact_secret(&text, &settings.api_key))
-                    .map_err(|error| {
-                        anyhow::anyhow!(redact_secret(&error.to_string(), &settings.api_key))
-                    })
                 }
-                .await
+                "codex" => {
+                    async {
+                        let main = task["task_kind"] == "main";
+                        let continuation = if main {
+                            let (config, expected_config) = continuation::codex_identity(
+                                &settings.codex_binary,
+                                &root,
+                                &agent,
+                                &context,
+                            )
+                            .await?;
+                            let prior = state
+                                .store
+                                .lock()
+                                .unwrap()
+                                .prepare_codex_continuation(&task_id, &config)?;
+                            let (thread_id, expected_turn_id) = prior
+                                .map(|(thread, turn)| (Some(thread), Some(turn)))
+                                .unwrap_or_default();
+                            Some(codex::CodexContinuation {
+                                thread_id,
+                                expected_turn_id,
+                                expected_config: Some(expected_config),
+                            })
+                        } else {
+                            None
+                        };
+                        let state_for_lifecycle = state.clone();
+                        let task_for_lifecycle = task_id.clone();
+                        let known_secrets = continuation::known_secrets(&settings);
+                        codex::execute_with_control(
+                            &settings.codex_binary,
+                            &agent.model,
+                            &root,
+                            input,
+                            progress,
+                            is_cancelled,
+                            evidence,
+                            continuation,
+                            &known_secrets,
+                            execution_event,
+                            move |update| {
+                                if main {
+                                    state_for_lifecycle
+                                        .store
+                                        .lock()
+                                        .unwrap()
+                                        .codex_lifecycle(&task_for_lifecycle, update)?;
+                                }
+                                Ok(())
+                            },
+                            claim_inputs,
+                            ack_inputs,
+                            |secrets| report_secrets.lock().unwrap().extend_from_slice(secrets),
+                        )
+                        .await
+                        .map(|text| redact_secret(&text, &settings.api_key))
+                        .map_err(|error| {
+                            anyhow::anyhow!(redact_secret(&error.to_string(), &settings.api_key))
+                        })
+                    }
+                    .await
+                }
+                _ => Err(anyhow::anyhow!("任务角色使用了不支持的执行器")),
             }
-            _ => Err(anyhow::anyhow!("任务角色使用了不支持的执行器")),
         }
     };
+    if let Some(baseline) = change_baseline {
+        let report_root = root.clone();
+        let secrets = report_secrets.lock().unwrap().clone();
+        let report = tokio::task::spawn_blocking(move || changes::finish(&report_root, baseline, &secrets))
+            .await.ok().and_then(Result::ok).unwrap_or_else(|| json!({"state":"unavailable","reason":"改动报告采集未完成；任务实际结果与文件仍保留。"}));
+        publish_changes(&state, &task_id, report);
+    }
     drop(permit);
     finish(&state, &task_id, result);
+}
+
+fn publish_changes(state: &AppState, task_id: &str, report: Value) {
+    let saved = state.store.lock().unwrap().save_changes(task_id, report);
+    match saved {
+        Ok(item) => state.publish(item),
+        Err(_) => tracing::error!(%task_id,"无法保存安全改动报告；不重放项目写入"),
+    }
 }
 
 fn redact_secret(text: &str, secret: &str) -> String {

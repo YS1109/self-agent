@@ -187,6 +187,47 @@ send(
     }
 )
 Path("fixture-started").write_text(str(os.getpid()))
+if mode.startswith("steer-"):
+    partial = None
+    if mode == "steer-partial":
+        partial = json.dumps({"method":"item/agentMessage/delta","params":{
+            "threadId":thread_id,"turnId":turn_id,"itemId":"steer-prefix","delta":"分片"}},ensure_ascii=False).encode()
+        cut = partial.index("分".encode()) + 1
+        sys.stdout.buffer.write(partial[:cut])
+        sys.stdout.buffer.flush()
+    steer = receive("turn/steer")
+    assert steer["params"] == {"threadId":thread_id,"expectedTurnId":turn_id,
+        "input":[{"type":"text","text":"运行中补充目标"}]}
+    with (root / "fixture-rpc-trace.jsonl").open("a") as trace:
+        trace.write(json.dumps({"method":"turn/steer","params":steer["params"]}) + "\n")
+    Path("fixture-steer-received").write_text("yes")
+    if partial is not None:
+        sys.stdout.buffer.write(partial[cut:] + b"\n")
+        sys.stdout.buffer.flush()
+    if mode == "steer-disconnect":
+        raise SystemExit(0)
+    if mode == "steer-cancel":
+        interrupt = receive("turn/interrupt")
+        assert interrupt["params"] == {"threadId":thread_id,"turnId":turn_id}
+        Path("fixture-interrupted").write_text("yes")
+        time.sleep(60)
+        raise SystemExit(0)
+    if mode == "steer-complete-first":
+        send({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,
+            "item":{"type":"agentMessage","id":"answer-1","phase":"final_answer","text":"测试执行结果"}}})
+        send({"method":"turn/completed","params":{"threadId":thread_id,
+            "turn":{"id":turn_id,"status":"completed","items":[],"error":None}}})
+    if mode == "steer-reject":
+        send({"id":steer["id"],"error":{"code":-32000,"message":"private-steer-error"}})
+    elif mode == "steer-mismatch":
+        send({"id":steer["id"],"result":{"turnId":"other-turn"}})
+    elif mode == "steer-wrong-id":
+        send({"id":steer["id"]+1,"result":{"turnId":turn_id}})
+    else:
+        send({"id":steer["id"],"result":{"turnId":turn_id}})
+        if mode == "steer-duplicate":
+            send({"id":steer["id"],"result":{"turnId":turn_id}})
+
 if mode == "hang":
     interrupt = receive("turn/interrupt")
     assert interrupt["params"] == {

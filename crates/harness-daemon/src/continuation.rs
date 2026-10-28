@@ -31,6 +31,11 @@ pub(crate) fn known_secrets(settings: &crate::Settings) -> Vec<String> {
             }
         }
     }
+    for name in ["HARNESS_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(value) = std::env::var(name) {
+            secrets.push(value);
+        }
+    }
     secrets.retain(|value| !value.is_empty());
     secrets
 }

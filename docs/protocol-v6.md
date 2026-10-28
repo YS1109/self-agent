@@ -1,8 +1,8 @@
 # 第七阶段协议：持久事件与会话续接
 
-日期：2026-10-28。状态：0.7 开发分支第二切片，尚未发布完整 0.7；应用版本号暂仍为 0.6.0。本文描述本分支已实现接口，未列能力继续沿用 [0.6 协议](protocol-v5.md)。
+日期：2026-10-28。状态：0.7 开发分支第三切片，尚未发布完整 0.7；应用版本号暂仍为 0.6.0。本文描述本分支已实现接口，未列能力继续沿用 [0.6 协议](protocol-v5.md)。
 
-本分支贯通共享 Rust 后台、Native/Codex 执行事件、桌面和浏览器消费、HTTP 恢复及 CLI 跟随，并新增 Codex 主会话续接和 Native 跨任务摘要。执行中补充、改动面板和上下文估算展示仍待后续切片；没有人工审批界面，也不扩大工具权限。
+本分支贯通共享 Rust 后台、Native/Codex 执行事件、桌面和浏览器消费、HTTP 恢复及 CLI 跟随，并新增 Codex 主会话续接和 Native 跨任务摘要。已增加执行中补充、明确继续、上下文估算及有界只读区间改动面板；没有人工审批界面，也不扩大工具权限。普通托管登录的原生 thread 复用和完整 Git 状态概览仍有下述明确限制，不能称完整 0.7 验收已经结束。
 
 ## 事件与事实来源
 
@@ -28,6 +28,7 @@ data: {"id":"event-uuid","sequence":42,"session_id":"session-id","task_id":"task
 | `tool_finished` | `call_id`, `name`, `success`, `output` | 实际工具结果，输出有界并脱敏 |
 | `usage` | `input_tokens`, `output_tokens`, `scope` | 上游明确提供的用量，可为 null；Native 为 `request`，Codex 为 `thread_total`，累计值不能反复相加 |
 | `context_compaction` | `state` | 实际压缩状态，包括 `reused` 表示已使用校验过的 Native 历史摘要 |
+| `context_estimate` | `estimated_input_tokens`, `context_window`, `compression_threshold`, `source`, `phase` | 本地启发式估算，窗口与阈值来自任务策略；不是服务报告用量 |
 
 本切片的命令输出随 `tool_finished.output` 和已有命令证据交付，不提供逐字节命令 stdout/stderr 流。工具开始事件不代表工具已成功；失败或取消时，仍应以任务终态与实际证据为准。
 
@@ -102,8 +103,44 @@ Tauri 使用 Rust 私有桥 `start_event_stream({subscriptionId,after,channel})`
 
 前端以序号去重并有界保留快照请求期间的新事件，避免旧轮询快照覆盖新输出；恢复快照替换而非拼接。慢消费者/缓存超过边界重新取权威快照。1.5 秒快照轮询保留为状态刷新兜底，回复和工具过程由真实事件实时驱动；工具面板最多最近 30 条，明确开始不代表成功，服务用量与估算不混淆。
 
+## 任务补充、排队与继续
+
+继续使用带 `command_id` / 固定 `source` 的 `POST /api/v1/commands`。相同信封只返回原收据；同 ID 不同正文拒绝。新增：
+
+```json
+{"type":"steer_task","task_id":"正在运行的主任务ID","content":"保留原有接口，再补一个测试"}
+{"type":"continue_task","task_id":"已结束的主任务ID","content":"可选的新要求"}
+```
+
+- `steer_task` 只接受正在运行的非演示直接主任务，不能附到另一任务、计划节点或已结束任务。每条最多 8192 UTF-8 字节，每任务最多 32 条、总 64 KiB。收据新增 `supplement_id`；已接收不等于已应用。
+- `task.supplements` 为持久列表，旧任务也返回 `[]`。每项含 `id/task_id/content/status/reason/applied_via/created_at/updated_at`。状态为 `pending`（待安全边界）、`delivering`（已领取待确认）、`applied`（执行器确认接收）、`not_applied`（明确未应用）、`unknown`（终态前未获得确认）。Applied 只表示输入交付，不代表模型遵守或工具已改变行为。
+- 每批最多领取 8 条，按收据顺序原子转为 delivering。Native 首次只总结先前历史，随后才领取补充；只在完整工具批结束后的模型边界加入，当前原目标和全部补充在压缩时保留。含补充请求取得 2xx 响应头后整批确认，非 2xx 明确未应用；断线不重试请求或工具。
+- Codex 在真实 turn ID 已确认后用 `turn/steer`，带 `threadId`、`expectedTurnId` 和文本输入；仅一条 RPC 在途，精确匹配响应 ID 与 turn ID 后确认。静默回合每 100ms 检查补充，读取缓冲保留跨轮询的 JSON/UTF-8 分片。拒绝、取消、完成与迟到 ACK 不会注入下一任务或重发未知请求。
+- 终态事务将 pending 转为 not_applied、未确认的 delivering 转为 unknown；重启同样不重放。已应用补充进入后续权威历史；未应用记录只作为明确标注的背景，不作为新任务指令。存在未确认输入时 Codex 关联保守失效。
+- 「排队下一条」仍是 `run_agent`，沿用同会话 main_sequence；「停止当前任务」是 `cancel_task`，与暂停计划/取消整图不同。
+- `continue_task` 只能引用已完成、失败或取消的直接主任务，创建新任务并保存 `continued_from`，不重新执行旧任务。输入明确携带所选任务的原目标、终态与最多 16 KiB 结果预览；不能用无映射 UUID 让模型猜测目标。重复继续由 `continuation_origin` 锚定原始目标并保留 `continuation_request`，不递归嵌套生成的提示。可选新要求最多 8192 字节，生成上下文最多 128 KiB；原始证据不删除。
+
+CLI 新增 `steer TASK_ID CONTENT`、`continue TASK_ID [CONTENT]`；可使用 `--follow` 跟随目标/新任务，POST 仍只发一次。`changes TASK_ID` 只读 JSON，不接受 `--follow` / `--wait`。
+
+## 持久上下文展示
+
+Native 估算 source=`native_local`，phase=`before_compaction` / `request`，包含本地发送的消息与工具定义。Codex 新 thread 的 source=`codex_local_bootstrap`，恢复时为 `codex_current_input_only`，phase=`before_turn`；只估算本次输入，不包括 Codex 内部历史、系统或工具上下文，不能冒充完整 thread 占用。
+
+任务持久保存最新 `context_estimate`（事件字段加 `updated_at`）和 `context_compaction`（state/updated_at），快照在全局 300 条事件窗口之外仍可恢复。前端优先使用任务字段，实时事件更新这些字段；较早快照与终态迟到事件不得覆盖较新状态。窗口/压缩阈值、本地估算、实际 Usage 以及压缩进度分别标注。
+
+## 有界只读改动报告
+
+任务取得项目写锁、首个执行器写入前，在内存中采集基线；排队期间外部变化不会归入此任务新增。结束、失败或取消后，在释放项目锁前采集尾状态。报告仅称「执行期间观察到的变化」，不保证与外部编辑独占归因。演示任务不伪造改动。
+
+- 使用 cap-std / cap-fs-ext 的目录能力与逐级 no-follow 文件访问；隐藏/敏感/依赖目录、符号链接、包含已知凭据的文件排除。执行中才获知的 Codex 凭据会回溯过滤 before/after；原始基线不序列化、不写数据库。
+- 文件、字节、目录深度与差异均有界；支持中文路径、增删、相同内容重命名、只读/权限变化。二进制、大文件和超预算内容明确说明，不假造文本 diff。报告自身列出 limits/exclusions/partial。
+- 不修改 Git index/config，不执行 stage/reset/revert/commit。**生产采集不启动任何 Git 或其他子进程**：git status 会触发仓库 clean/process filters，不能在授权与沙箱之外执行。因此 baseline_git/current_git 当前明确 unavailable（原因 repository_filter_execution_disabled），不能声称已读取 staged/unstaged/HEAD 差异；项目根无 `.git` 时只表示根目录未检测到标记，不判断父目录仓库。
+- 快照只含 `task.changes_summary`，状态 pending/available/unavailable/expired 及可见文件数、排除数、partial 等；数量不是完整项目改动总数。取消终态可能早于报告完成，前端显示待采集而非空 diff。
+- 认证 `GET /api/v1/tasks/{task_id}/changes` 按需返回安全报告（files/skipped/baseline_git/current_git 等），或 HTTP 200 的 `{state,task_id,reason,summary}` 不可用/过期状态。不存在任务仍报错误，不当成空报告。
+- 每份报告最多 512 KiB，最多保留最新 128 份（详情总量不超过 64 MiB）；过期保留任务和摘要。后台重启丢失内存基线时明确 unavailable，不恢复或重放写入。HTTP、桌面受控桥、浏览器代理和 CLI 共用同一详情接口。
+
 ## 验证与剩余切片
 
-默认只使用本地 HTTP/stdio 夹具，不调用真实模型。`streaming_smoke.py` 覆盖字节分片、完整工具、恢复、取消、凭据脱敏及 CLI；`continuation_smoke.py` 覆盖至少三轮、重启续接、摘要后缀、配置失效、隔离与未知写入不重放；`web_stream_smoke.py` 覆盖真实代理流式与鉴权边界。Codex 可执行夹具在 Unix 运行，Windows 明确跳过该部分但继续 Native 场景。
+默认仅本地 HTTP/stdio 夹具，不调用真实模型。原八组回归保持；`streaming_smoke.py` 覆盖流式/恢复，`continuation_smoke.py` 覆盖续接，`steering_smoke.py` 覆盖补充、ACK、取消及未知交付，`changes_smoke.py` 覆盖已有文件/index 保留、失败/取消改动、重启、锁后基线和恶意 Git filters 不执行；代理另有 `web_stream_smoke.py`。Codex 可执行夹具只在 Unix 运行，Windows 明确跳过该部分但继续 Native 场景。
 
-后续补齐上下文占用/阈值估算展示、执行中补充、停止后继续与改动面板，并进行完整 0.7 验收。真实模型、原生 GUI 和跨平台结果分别记录；schema 探测不等于真实模型执行验证，单机无头结果不代替视觉验收。
+剩余 0.7 验收边界：托管登录身份的安全 thread 复用、不会执行项目配置且有严格资源边界的 Git 状态概览，以及受环境阻止的原生/浏览器视觉验收。实际服务与 GUI 未验证不能写作通过；应用版本仍为 0.6.0，完整 0.7 未发布。切片跟踪见 `acceptance-v0.7.md`。

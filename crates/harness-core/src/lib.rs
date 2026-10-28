@@ -143,6 +143,50 @@ pub struct TaskRun {
     pub steps: Vec<TaskStep>,
     #[serde(default)]
     pub evidence: Vec<CommandEvidence>,
+    #[serde(default)]
+    pub supplements: Vec<TaskSupplement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes_summary: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimate: Option<TaskContextEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compaction: Option<TaskContextCompaction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskContextEstimate {
+    pub estimated_input_tokens: u64,
+    pub context_window: u32,
+    pub compression_threshold: u8,
+    pub source: String,
+    pub phase: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskContextCompaction {
+    pub state: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskSupplement {
+    pub id: String,
+    pub task_id: String,
+    pub content: String,
+    pub status: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub applied_via: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 fn worker_kind() -> String {
@@ -320,6 +364,13 @@ pub enum ExecutionEvent {
     ContextCompaction {
         state: String,
     },
+    ContextEstimate {
+        estimated_input_tokens: u64,
+        context_window: u32,
+        compression_threshold: u8,
+        source: String,
+        phase: String,
+    },
 }
 
 impl ExecutionEvent {
@@ -330,6 +381,7 @@ impl ExecutionEvent {
             Self::ToolFinished { .. } => "tool_finished",
             Self::Usage { .. } => "usage",
             Self::ContextCompaction { .. } => "context_compaction",
+            Self::ContextEstimate { .. } => "context_estimate",
         }
     }
 }
@@ -408,6 +460,15 @@ pub enum Command {
         session_id: Option<String>,
         content: String,
     },
+    SteerTask {
+        task_id: String,
+        content: String,
+    },
+    ContinueTask {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
     StartTask {
         #[serde(default)]
         session_id: Option<String>,
@@ -479,6 +540,8 @@ pub struct CommandReceipt {
     pub job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplement_id: Option<String>,
 }
 
 #[cfg(test)]

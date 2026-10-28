@@ -3022,3 +3022,25 @@ textarea {
 .context-state strong { color: var(--ink); font-weight: 500; }
 .context-state p { margin-top: 4px; overflow-wrap: anywhere; }
 .task-usage { margin-top: 9px; color: var(--secondary); font-size: 12px; line-height: 1.7; }
+
+/* P1 controls remain neutral gray/blue; statuses do not imply model compliance. */
+.input-routing { margin-bottom: 8px; display: grid; gap: 7px; }
+.input-route-options { display: flex; gap: 6px; }
+.input-routing .help-text { margin: 0; overflow-wrap: anywhere; }
+.input-routing .select-trigger { max-width: 100%; }
+.task-context, .task-supplements, .continue-task { margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); font-size: 12px; }
+.task-context p, .task-supplements p, .continue-task p { line-height: 1.6; }
+.task-supplements h3, .continue-task h3, .changes-report h3 { margin: 5px 0 10px; font-size: 13px; }
+.supplement-item { padding: 10px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.supplement-item p { white-space: pre-wrap; margin: 5px 0; }
+.supplement-item small { color: var(--muted); }
+.continue-task textarea { width: 100%; margin: 8px 0; resize: vertical; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+.changes-report { margin-top: 14px; font-size: 12px; }
+.changes-notice, .changes-warning { border-left: 2px solid var(--accent); padding: 8px 10px; line-height: 1.7; }
+.changes-file, .changes-git, .changes-skipped { border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin: 10px 0; }
+.changes-report summary { cursor: pointer; overflow-wrap: anywhere; }
+.changes-file summary span { margin-right: 8px; }
+.changes-git ul, .changes-skipped ul { padding-left: 16px; }
+.changes-git li, .changes-skipped li { overflow-wrap: anywhere; margin: 6px 0; }
+.changes-git li span { display: block; color: var(--muted); }
+.changes-diff { overflow: auto; max-height: 420px; padding: 10px; background: var(--surface); white-space: pre; font-size: 11px; border-radius: 4px; }
