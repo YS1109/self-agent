@@ -211,9 +211,9 @@ fn validate_base_url(base_url: &str) -> Result<Url, String> {
     event_stream::validate_base_url(base_url)
 }
 
-fn changes_path(path: &str) -> bool {
+fn task_path(path: &str, suffix: &str) -> bool {
     path.strip_prefix("/api/v1/tasks/")
-        .and_then(|part| part.strip_suffix("/changes"))
+        .and_then(|part| part.strip_suffix(suffix))
         .is_some_and(|id| {
             !id.is_empty()
                 && id.len() <= 128
@@ -224,20 +224,28 @@ fn changes_path(path: &str) -> bool {
 }
 
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
-    if method == "GET" && changes_path(path) {
+    if method == "GET" && task_path(path, "/changes") {
         return Ok(Method::GET);
+    }
+    if method == "POST" && task_path(path, "/cleanup-resolution") {
+        return Ok(Method::POST);
     }
     match (method, path) {
         (
             "GET",
             "/api/v1/snapshot"
             | "/api/v1/settings"
+            | "/api/v1/capabilities"
             | "/api/v1/codex/status"
             | "/api/v1/provider/local-codex",
         ) => Ok(Method::GET),
-        ("POST", "/api/v1/commands" | "/api/v1/models" | "/api/v1/settings/check") => {
-            Ok(Method::POST)
-        }
+        (
+            "POST",
+            "/api/v1/commands"
+            | "/api/v1/capabilities/commands"
+            | "/api/v1/models"
+            | "/api/v1/settings/check",
+        ) => Ok(Method::POST),
         ("PUT", "/api/v1/settings") => Ok(Method::PUT),
         _ => Err("不允许使用此本机接口路径或请求方法".into()),
     }
@@ -328,6 +336,11 @@ mod tests {
     #[test]
     fn bridge_accepts_only_known_method_and_route_pairs() {
         assert!(validate_route("GET", "/api/v1/snapshot").is_ok());
+        assert!(validate_route("GET", "/api/v1/capabilities").is_ok());
+        assert!(validate_route("POST", "/api/v1/capabilities/commands").is_ok());
+        assert!(validate_route("POST", "/api/v1/tasks/task-123/cleanup-resolution").is_ok());
+        assert!(validate_route("GET", "/api/v1/tasks/task-123/cleanup-resolution").is_err());
+        assert!(validate_route("POST", "/api/v1/tasks/../cleanup-resolution").is_err());
         assert!(validate_route("GET", "/api/v1/tasks/task-123/changes").is_ok());
         for path in [
             "/api/v1/tasks/../changes",

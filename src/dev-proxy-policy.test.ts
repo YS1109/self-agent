@@ -102,4 +102,17 @@ describe("development proxy boundary", () => {
       expect(allowDevelopmentProxy("GET", path, undefined, "same-origin", undefined)).toBe(false);
   });
 
+  it("能力管理和所有者清理确认仅开放准确同源端点，禁用通配和GET确认", () => {
+    expect(allowDevelopmentProxy("GET","/api/v1/capabilities",undefined,"same-origin",undefined)).toBe(true);
+    for(const path of ["/api/v1/capabilities/commands","/api/v1/tasks/task-1/cleanup-resolution"]){
+      expect(allowDevelopmentProxy("POST",path,"http://127.0.0.1:1420","same-origin","application/json")).toBe(true);
+      expect(allowDevelopmentProxy("GET",path,undefined,"same-origin",undefined)).toBe(false);
+      expect(allowDevelopmentProxy("POST",path,"https://evil.invalid","cross-site","application/json")).toBe(false);
+      expect(allowDevelopmentProxy("POST",path,undefined,"same-origin","text/plain")).toBe(false);
+      expect(allowDevelopmentProxy("POST",path+"?target=remote",undefined,"same-origin","application/json")).toBe(false);
+    }
+    for(const path of ["/api/v1/tasks/../cleanup-resolution","/api/v1/tasks/t%2Fx/cleanup-resolution","/api/v1/capabilities/secret"])
+      expect(allowDevelopmentProxy("POST",path,undefined,"same-origin","application/json")).toBe(false);
+  });
+
 });

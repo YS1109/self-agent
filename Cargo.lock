@@ -1432,6 +1432,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "harness-core",
+ "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -1444,6 +1445,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

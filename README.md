@@ -200,3 +200,8 @@ docs/                     产品计划和当前协议
 ### 0.8 开发分支的执行控制切片
 
 设置、角色和单次任务可收紧预算与权限；Native 支持实际验收失败后的限次修复/复验、持久问题与逐次写入/命令授权。CLI 新增 `requests [TASK_ID]`、`answer REQUEST_ID REVISION TEXT|-`、`approve|deny REQUEST_ID REVISION DIGEST`，`run` 可用 `--controls FILE|-`。Codex 仅支持外层时长与公开输出限制，不支持的逐工具限制会拒绝，不能据此宣称已管理其内部 MCP。取消保留已发生副作用；在途文件写入会继续持有项目执行权直到清理完成，界面明确区分终态与清理状态。详见 [执行控制协议](docs/protocol-v7.md) 与 [0.8 迭代范围](docs/iteration-v0.8.md)。MCP / Skills、命名服务及系统凭据管理尚未由此切片交付。
+
+
+### 0.8 托管能力开发切片
+
+开发分支已实现并通过本地模拟门禁的应用管理 MCP 与固定版本 Skills，详见 [协议 v8](docs/protocol-v8.md)。MCP 注册/发现/启用不等于工具授权或实际执行；默认拒绝外部工具，Native 任务按固定目录和具体审批调用。MCP 是可信本机程序，不是文件/网络沙箱。Skills 只加载明确选择的正文，不自动运行旁边脚本。真实模型、外部服务、系统凭据及本地桌面 GUI 不在本轮模拟验证范围内。

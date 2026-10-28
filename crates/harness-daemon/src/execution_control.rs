@@ -43,17 +43,46 @@ impl RunControl {
     pub fn stopped(&self) -> bool {
         // Codex cannot translate an application file/tool restriction mid-turn.
         // Stop it instead of pretending the new owner policy is enforced.
+        let current = self
+            .state
+            .settings
+            .read()
+            .unwrap()
+            .execution_controls
+            .clone();
+        let mut builtin_permissions = current.permissions.clone();
+        builtin_permissions.managed_tools = PermissionMode::Deny;
         if self.executor == "codex"
-            && self
-                .state
-                .settings
-                .read()
-                .unwrap()
-                .execution_controls
-                .permissions
-                != harness_core::TaskPermissions::default()
+            && builtin_permissions != harness_core::TaskPermissions::default()
         {
             self.stop("permission_revoked");
+            return true;
+        }
+        if self
+            .controls
+            .capabilities
+            .mcp_servers
+            .iter()
+            .any(|id| !current.capabilities.mcp_servers.contains(id))
+            || self
+                .controls
+                .capabilities
+                .skills
+                .iter()
+                .any(|id| !current.capabilities.skills.contains(id))
+            || (!self.controls.capabilities.mcp_servers.is_empty()
+                && (current.permissions.managed_tools == PermissionMode::Deny
+                    || !current.permissions.read_files
+                    || current.permissions.write_files == PermissionMode::Deny))
+            || self
+                .state
+                .store
+                .lock()
+                .unwrap()
+                .check_task_capabilities(&self.task_id)
+                .is_err()
+        {
+            self.stop("capability_revoked");
             return true;
         }
         if self.started.elapsed()
@@ -86,6 +115,133 @@ impl RunControl {
             .charge_execution(&self.task_id, charge)
     }
 
+    pub(crate) fn capability_state(
+        &self,
+    ) -> Result<crate::store::capabilities::TaskCapabilityState> {
+        self.check()?;
+        self.state
+            .store
+            .lock()
+            .unwrap()
+            .task_capability_state(&self.task_id)
+    }
+
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(
+            self.started + Duration::from_secs(self.controls.budget.max_runtime_seconds.into()),
+        )
+    }
+
+    pub(crate) fn begin_capability_call(
+        &self,
+        server: &str,
+        revision: u64,
+        tool: &str,
+        digest: &str,
+    ) -> Result<String> {
+        self.check()?;
+        self.state.store.lock().unwrap().begin_capability_call(
+            &self.task_id,
+            server,
+            revision,
+            tool,
+            digest,
+        )
+    }
+
+    pub(crate) fn finish_capability_call(
+        &self,
+        id: &str,
+        status: &'static str,
+        reason: &'static str,
+    ) -> Result<()> {
+        self.state
+            .store
+            .lock()
+            .unwrap()
+            .finish_capability_call(id, status, Some(reason))
+            .map(|_| ())
+    }
+
+    /// MCP is arbitrary owner-selected local code. Read-only server annotations
+    /// are not permissions, and a file-scoped policy cannot constrain this process.
+    pub(crate) async fn authorize_managed(
+        &self,
+        binding: &Value,
+        safe_action: Value,
+    ) -> Result<PermissionMode> {
+        self.check()?;
+        let mode = self.controls.permissions.managed_tools.intersect(
+            self.state
+                .settings
+                .read()
+                .unwrap()
+                .execution_controls
+                .permissions
+                .managed_tools,
+        );
+        if mode == PermissionMode::Deny {
+            self.stop("permission_denied");
+            bail!("任务未获得托管外部工具权限，未启动服务");
+        }
+        if mode == PermissionMode::Ask {
+            let request = self.state.store.lock().unwrap().create_decision_request(
+                &self.task_id, "approval",
+                "此操作会启动受信任的本机 MCP 程序并调用所列工具。该程序没有文件或网络沙箱；工具只读提示不构成限制。批准仅适用于本次参数和修订。",
+                Some(json!({"tool":"managed_mcp","arguments_digest":fingerprint(binding),"details":safe_action})),
+                self.controls.budget.max_runtime_seconds.min(300).into(),
+            )?;
+            let decided = self.wait_for_request(request).await?;
+            if decided["status"] != "approved" {
+                self.stop("approval_denied");
+                bail!("MCP 操作未获有效授权，未启动服务");
+            }
+        }
+        self.check()?;
+        if self
+            .state
+            .settings
+            .read()
+            .unwrap()
+            .execution_controls
+            .permissions
+            .managed_tools
+            == PermissionMode::Deny
+        {
+            self.stop("permission_revoked");
+            bail!("MCP 权限已撤销，未启动服务");
+        }
+        self.recheck_managed_authorization(mode)?;
+        Ok(mode)
+    }
+
+    pub(crate) fn recheck_managed_authorization(&self, granted: PermissionMode) -> Result<()> {
+        self.check()?;
+        let current = self
+            .state
+            .settings
+            .read()
+            .unwrap()
+            .execution_controls
+            .permissions
+            .clone();
+        let effective = self
+            .controls
+            .permissions
+            .managed_tools
+            .intersect(current.managed_tools)
+            .intersect(self.controls.permissions.write_files)
+            .intersect(current.write_files);
+        if !current.read_files
+            || effective == PermissionMode::Deny
+            || (effective == PermissionMode::Ask && granted != PermissionMode::Ask)
+        {
+            self.stop("permission_revoked");
+            bail!("MCP 权限在服务准备期间收紧，工具请求未发送；请建立新任务重新授权");
+        }
+        Ok(())
+    }
+
     pub fn read_files_allowed(&self) -> bool {
         self.controls.permissions.read_files
             && self
@@ -104,6 +260,14 @@ impl RunControl {
             .lock()
             .unwrap()
             .set_execution_cleanup(&self.task_id, pending)
+    }
+
+    pub(crate) fn cleanup_unknown(&self) -> Result<()> {
+        self.state
+            .store
+            .lock()
+            .unwrap()
+            .mark_execution_cleanup_unknown(&self.task_id)
     }
 
     pub fn verification_complete(&self) -> Result<bool> {

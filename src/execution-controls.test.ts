@@ -16,17 +16,31 @@ describe("预算与权限输入",()=>{
  });
  it("不能用不受沙箱限制的 shell 绕过文件限制或逐次批准",()=>{
   for(const permissions of [{read_files:false,write_files:"allow" as const,run_commands:"ask" as const},{read_files:true,write_files:"deny" as const,run_commands:"allow" as const},{read_files:true,write_files:"ask" as const,run_commands:"allow" as const}])
-    expect(executionControlsError({...defaultExecutionControls(),permissions},"native")).toBeDefined();
-  expect(executionControlsError({...defaultExecutionControls(),permissions:{read_files:false,write_files:"deny",run_commands:"deny"}},"native")).toBeUndefined();
+    expect(executionControlsError({...defaultExecutionControls(),permissions:{...permissions,managed_tools:"deny"}},"native")).toBeDefined();
+  expect(executionControlsError({...defaultExecutionControls(),permissions:{read_files:false,write_files:"deny",run_commands:"deny",managed_tools:"deny"}},"native")).toBeUndefined();
  });
  it("Codex 只发支持的两维，不发送看似默认但无法执行的模型预算",()=>{
   const value=defaultExecutionControls();value.budget.max_runtime_seconds=30;value.budget.max_output_bytes=1024;
-  expect(controlsForTask(value,"codex")).toEqual({budget:{max_runtime_seconds:30,max_output_bytes:1024}});
+  expect(controlsForTask(value,"codex")).toEqual({budget:{max_runtime_seconds:30,max_output_bytes:1024},capabilities:{mcp_servers:[],skills:[]}});
   const restricted=defaultExecutionControls();restricted.permissions.write_files="ask";restricted.permissions.run_commands="ask";
   expect(()=>controlsForTask(restricted,"codex")).toThrow("不会静默放宽");
   expect(restricted.permissions.write_files).toBe("ask");
   const lower=defaultExecutionControls();lower.budget.max_model_requests=2;
   expect(()=>controlsForTask(lower,"codex")).toThrow();
+ });
+ it("托管能力默认拒绝、调用预算有界，角色/任务范围只能取交集",()=>{
+  const first="00000000-0000-0000-0000-000000000001", second="00000000-0000-0000-0000-000000000002";
+  const base=defaultExecutionControls();base.capabilities={mcp_servers:[first],skills:[first,second]};base.permissions.managed_tools="ask";
+  const role=defaultExecutionControls();role.capabilities={mcp_servers:[second],skills:[second]};role.budget.max_external_calls=3;
+  const result=intersectExecutionControls(base,role);
+  expect(result.capabilities).toEqual({mcp_servers:[],skills:[second]});expect(result.permissions.managed_tools).toBe("deny");expect(result.budget.max_external_calls).toBe(3);
+  expect(base.capabilities.skills).toEqual([first,second]);
+  expect(()=>controlsForTask(base,"codex")).toThrow("MCP 仅支持 Native");
+  role.capabilities.mcp_servers=[];
+  expect(controlsForTask(role,"codex")).toMatchObject({capabilities:{mcp_servers:[],skills:[second]}});
+  base.permissions.write_files="deny";base.permissions.run_commands="deny";
+  expect(executionControlsError(base,"native")).toContain("托管工具");
+  const invalid=defaultExecutionControls();invalid.capabilities.skills=[first,first];expect(executionControlsError(invalid,"native")).toContain("注册标识");
  });
  it("验收命令 UTF-8 上限与后台16000字节一致",()=>{
   expect(MAX_ACCEPTANCE_COMMAND_BYTES).toBe(16000);

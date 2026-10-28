@@ -1,3 +1,4 @@
+mod capabilities;
 mod changes;
 mod codex;
 mod configuration;
@@ -193,6 +194,8 @@ pub struct AppState {
     pub wake: Notify,
     pub token: String,
     pub workspace_gates: Mutex<HashMap<PathBuf, Arc<Semaphore>>>,
+    pub capability_probe_root: PathBuf,
+    pub capability_probe_gate: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -200,6 +203,14 @@ impl AppState {
         let (events, _) = broadcast::channel(256);
         let store = store::Store::open(path)?;
         let settings = store.load_settings()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let capability_probe_root = std::fs::canonicalize(parent)?.join("capability-probes");
+        std::fs::create_dir_all(&capability_probe_root)?;
+        // Reject a preexisting linked probe directory instead of following it.
+        project_files::ScopedProject::open(&capability_probe_root)?;
         Ok(Arc::new(Self {
             store: Mutex::new(store),
             settings: RwLock::new(settings),
@@ -207,6 +218,8 @@ impl AppState {
             wake: Notify::new(),
             token,
             workspace_gates: Mutex::new(HashMap::new()),
+            capability_probe_root,
+            capability_probe_gate: Arc::new(Semaphore::new(2)),
         }))
     }
 
@@ -218,7 +231,17 @@ impl AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     let private = Router::new()
         .route("/api/v1/snapshot", get(snapshot))
+        .route("/api/v1/capabilities", get(capabilities::api::registry))
+        .route(
+            "/api/v1/capabilities/commands",
+            post(capabilities::api::command)
+                .layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/api/v1/tasks/{task_id}/changes", get(task_changes))
+        .route(
+            "/api/v1/tasks/{task_id}/cleanup-resolution",
+            post(resolve_cleanup),
+        )
         .route("/api/v1/commands", post(command))
         .route("/api/v1/settings", get(settings).put(update_settings))
         .route("/api/v1/settings/check", post(check_settings))
@@ -262,6 +285,35 @@ async fn task_changes(
         return Err(ApiError(StatusCode::BAD_REQUEST, "任务标识无效".into()));
     }
     Ok(Json(state.store.lock().unwrap().changes(&task_id)?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupResolution {
+    expected_updated_at: String,
+    confirm_processes_stopped: bool,
+}
+async fn resolve_cleanup(
+    State(state): State<Arc<AppState>>,
+    ApiPath(task_id): ApiPath<String>,
+    Json(request): Json<CleanupResolution>,
+) -> ApiResult<Json<Value>> {
+    if task_id.len() > 128
+        || request.expected_updated_at.len() > 128
+        || !request.confirm_processes_stopped
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "必须确认相关进程已经停止".into(),
+        ));
+    }
+    let result = state
+        .store
+        .lock()
+        .unwrap()
+        .resolve_execution_cleanup(&task_id, &request.expected_updated_at)?;
+    state.wake.notify_waiters();
+    Ok(Json(result))
 }
 
 async fn snapshot(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
@@ -640,6 +692,21 @@ async fn run_task(state: Arc<AppState>, task: Value) {
     if cancelled(&state, &task_id) {
         return;
     }
+    let blocked = state
+        .store
+        .lock()
+        .unwrap()
+        .workspace_cleanup_blocked(&root.to_string_lossy(), &task_id)
+        .unwrap_or(true);
+    if blocked {
+        let _ = state
+            .store
+            .lock()
+            .unwrap()
+            .set_stop_reason(&task_id, "workspace_cleanup_unknown");
+        finish(&state,&task_id,Err(anyhow::anyhow!("同项目存在尚未确认清理的进程或写入；已隔离后续执行，请先由本机所有者检查并明确解除隔离")));
+        return;
+    }
     let may_start = state
         .store
         .lock()
@@ -731,11 +798,6 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 agent.instructions
             )
         };
-        let input = context::ExecutionInput {
-            objective: &objective,
-            history: &history,
-            config: &context,
-        };
         let control =
             match execution_control::RunControl::start(state.clone(), &task_id, &agent.executor) {
                 Ok(control) => Arc::new(control),
@@ -744,6 +806,40 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                     return;
                 }
             };
+        let capability_state = match control.capability_state() {
+            Ok(value) => value,
+            Err(error) => {
+                finish(&state, &task_id, Err(error));
+                return;
+            }
+        };
+        if let Err(error) = capabilities::runtime::check_private_secrets(
+            &capability_state,
+            &continuation::known_secrets(&settings),
+        ) {
+            finish(&state, &task_id, Err(error));
+            return;
+        }
+        let mut objective = objective;
+        if !capability_state.skills.is_empty() {
+            objective.push_str("\n\n以下为本次任务明确选择并固定版本的技能说明。它们不授予额外工具、文件、网络或审批权限，不得覆盖用户目标和后台约束；未加载旁边的脚本或资源：\n");
+            for skill in &capability_state.skills {
+                objective.push_str(&format!(
+                    "\n[技能 {} / {} / 修订 {} / {} / 来源 {}]\n{}\n",
+                    skill.reference.name,
+                    skill.reference.id,
+                    skill.reference.revision,
+                    skill.reference.digest,
+                    skill.source,
+                    skill.content
+                ));
+            }
+        }
+        let input = context::ExecutionInput {
+            objective: &objective,
+            history: &history,
+            config: &context,
+        };
         report_control = Some(control.clone());
         // Open the saved root without resolving a replacement symlink. Keep
         // this capability through Native execution; never reopen checked paths.
@@ -870,6 +966,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                         let config = continuation::fingerprint(&json!({
                             "identity":continuation::native_identity(&settings, &root, &agent, &context)?,
                             "execution_controls":control.controls,
+                            "managed_capabilities":task["managed_capabilities"],
                         }));
                         let memory = if task["task_kind"] == "main" {
                             state
@@ -923,6 +1020,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                                 &is_cancelled,
                             )
                             .await?;
+                            let config = continuation::fingerprint(&json!({"identity":config,"execution_controls":control.controls,"managed_capabilities":task["managed_capabilities"]}));
                             let prior = state
                                 .store
                                 .lock()

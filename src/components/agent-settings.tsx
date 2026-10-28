@@ -1,8 +1,10 @@
 import { ExecutionSettings } from "./execution-settings";
-import { defaultExecutionControls, executionControlsError, intersectExecutionControls } from "../execution-controls";
+import { defaultExecutionControls, normalizeExecutionControls, executionControlsError, intersectExecutionControls } from "../execution-controls";
 import { Bot, Plus, Trash2, Users } from "lucide-react";
 import { agentModelLabel } from "../agent-model";
 import { agentModelContext } from "../model-context";
+import { CapabilityScopeSummary } from "./capabilities-settings";
+import type { ManagedCapabilities } from "../capabilities-client";
 import type { AgentProfile, Settings } from "../types";
 import { Button } from "./ui/button";
 import { ModelSelect, type ModelCatalog } from "./model-select";
@@ -19,7 +21,8 @@ export const DEFAULT_AGENT: AgentProfile = {
 export function normalizeSettings(settings: Settings): Settings {
   return {
     ...settings,
-    agents: settings.agents?.length ? settings.agents : [{ ...DEFAULT_AGENT }],
+    execution_controls: normalizeExecutionControls(settings.execution_controls),
+    agents: (settings.agents?.length ? settings.agents : [{ ...DEFAULT_AGENT }]).map(agent => agent.controls ? {...agent,controls:normalizeExecutionControls(agent.controls)} : agent),
     default_agent_id: settings.default_agent_id || "coder",
     codex_binary: settings.codex_binary || "codex",
     main_executor: settings.main_executor || "native",
@@ -29,9 +32,10 @@ export function normalizeSettings(settings: Settings): Settings {
 }
 
 export function AgentSettings({
-  settings, onChange, disabled, nativeModels, codexModels, codexPathChanged,
+  settings, onChange, disabled, nativeModels, codexModels, codexPathChanged, registry,
 }: {
   settings: Settings;
+  registry?: ManagedCapabilities;
   onChange: (settings: Settings) => void;
   disabled: boolean;
   nativeModels: ModelCatalog;
@@ -99,7 +103,8 @@ export function AgentSettings({
               <label className="execution-checkbox"><input type="checkbox" aria-label={`角色 ${index + 1} · 自定义执行限制`} checked={!!agent.controls} disabled={disabled}
                 onChange={event => update(agent.id, { controls: event.target.checked ? structuredClone(settings.execution_controls ?? defaultExecutionControls()) : null })} />为此角色指定额外限制</label>
               <p className="help-text">切换模型或执行器不会清除这里的限制。取消勾选只移除角色额外限制，全局策略仍然生效。</p>
-              {agent.controls && <ExecutionSettings value={agent.controls} executor={agent.executor} scope="role" disabled={disabled} onChange={controls => update(agent.id, { controls })} />}
+              {agent.controls && <ExecutionSettings registry={registry} value={agent.controls} executor={agent.executor} scope="role" disabled={disabled} onChange={controls => update(agent.id, { controls })} />}
+              {!agent.controls && <CapabilityScopeSummary registry={registry} value={(settings.execution_controls ?? defaultExecutionControls()).capabilities} label="角色继承的全局能力范围" />}
               {executionControlsError(intersectExecutionControls(settings.execution_controls ?? defaultExecutionControls(), agent.controls), agent.executor) && <p className="execution-warning" role="alert">此角色继承全局限制后当前无法执行：{executionControlsError(intersectExecutionControls(settings.execution_controls ?? defaultExecutionControls(), agent.controls), agent.executor)} 不会自动放宽；请核对全局策略或选用 Native。</p>}
             </details>
             <label>角色指令<textarea value={agent.instructions} rows={3} placeholder="描述角色职责、执行约束和结果要求" onChange={(event) => update(agent.id, { instructions: event.target.value })} /></label>
@@ -112,7 +117,7 @@ export function AgentSettings({
       })}><Plus size={15} />添加子智能体预设</Button>
       <label className="codex-binary">Codex 可执行文件
         <input required value={settings.codex_binary} placeholder="codex 或本机绝对路径" onChange={(event) => onChange({ ...settings, codex_binary: event.target.value })} />
-        <small>使用本机已安装 CLI 的登录状态和配置。请先在终端确认此命令可用并完成登录。当前版本不管理 MCP 服务和 Skills。</small>
+        <small>使用本机已安装 CLI 的登录状态和配置。请先在终端确认此命令可用并完成登录。应用管理的 MCP 仅供 Native 使用；Skills 可注入任务上下文，但不代表管理 Codex 自行加载的工具或权限。</small>
       </label>
     </section>
   );

@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 // Bump when effective tool/approval policy changes; cache reuse never grants authority.
-const CONTINUATION_POLICY_REVISION: &str = "v0.7-local-tools-1";
+const CONTINUATION_POLICY_REVISION: &str = "v0.8-managed-capabilities-1";
 
 pub(crate) fn fingerprint(value: &Value) -> String {
     format!(

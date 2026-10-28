@@ -1,3 +1,6 @@
+import type { CapabilitySelection, ManagedCapabilities } from "./capabilities-client";
+export type { CapabilitySelection, ManagedCapabilities, McpServerView, SkillView } from "./capabilities-client";
+
 export interface SourceContext {
   channel_id: string;
   actor_id: string;
@@ -106,19 +109,23 @@ export interface ExecutionBudget {
   max_retries: number;
   max_repair_attempts: number;
   max_output_bytes: number;
+  max_external_calls: number;
 }
 export interface TaskControls {
   budget: ExecutionBudget;
-  permissions: { read_files: boolean; write_files: PermissionMode; run_commands: PermissionMode };
+  permissions: { read_files: boolean; write_files: PermissionMode; run_commands: PermissionMode; managed_tools: PermissionMode };
   acceptance_commands: string[];
+  capabilities: CapabilitySelection;
 }
 export interface TaskControlsInput {
   budget?: Partial<ExecutionBudget>;
   permissions?: Partial<TaskControls["permissions"]>;
   acceptance_commands?: string[];
+  capabilities?: CapabilitySelection;
 }
 export interface BudgetUsage {
   model_requests: number; retries: number; repair_attempts: number; output_bytes: number;
+  external_calls?: number;
   mutation_generation: number; started_at: string | null;
 }
 export interface VerificationAttempt {
@@ -132,7 +139,16 @@ export interface ExecutionRequest {
   expires_at_ms: number; answer: string | null; reason?: string;
   created_at?: string; updated_at?: string; consumed_at?: string | null;
 }
+export interface CapabilityReference { id: string; revision: number; name: string; digest: string }
+export interface TaskCapabilities { mcp_servers: CapabilityReference[]; skills: CapabilityReference[] }
+export interface CapabilityCallRecord {
+  id: string; task_id: string; server_id: string; revision: number; tool: string; digest: string;
+  status: string; reason: string | null; created_at: string; updated_at: string;
+}
 export interface TaskRun {
+  managed_capabilities?: TaskCapabilities;
+  capability_calls?: CapabilityCallRecord[];
+  execution_cleanup_owner_ack?: {expected_updated_at:string;confirmed_at:string;source:"local_owner"} | null;
   id: string;
   session_id: string;
   title: string;
@@ -277,6 +293,7 @@ export interface ContextState {
   updated_at: string;
 }
 export interface Snapshot {
+  managed_capabilities?: ManagedCapabilities;
   execution_requests?: ExecutionRequest[];
   context_states?: ContextState[];
   event_cursor?: number;

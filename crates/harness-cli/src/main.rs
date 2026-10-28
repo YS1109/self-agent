@@ -23,6 +23,9 @@ const HELP: &str = r#"Self Agent 命令行客户端
   continue <任务ID> [内容|-]        从终态主任务创建新的继续任务
   changes <任务ID>                  查看只读执行区间改动报告
   requests [任务ID]                 列出持久化问题与逐次授权请求
+  capabilities                     查看托管 MCP / Skills 配置与发现状态
+  resolve-cleanup <任务ID> <JSON文件|-> 本机所有者确认解除未知清理隔离
+  capability-command <JSON文件|->   管理能力，幂等ID用--command-id指定
   answer <请求ID> <修订> <回答|->   回答问题（不授予执行权限）
   approve <请求ID> <修订> <摘要>    仅批准此请求绑定的具体操作
   deny <请求ID> <修订> <摘要>       拒绝此操作
@@ -42,7 +45,13 @@ follow先输出当前快照再跟随新事件；自动重连，恢复快照带re
 --controls 仅用于run，读取任务预算/权限JSON；只能收紧全局与角色限制。
 Codex仅支持runtime/output限制，内部请求/修复及逐工具权限不可伪装成受控。
 批准/拒绝必须先核对requests中的任务、操作、修订与完整action_digest；回答不是授权。
-输入密钥时请使用受保护的JSON文件或标准输入，避免写入命令参数。
+MCP 配置、启用、发现目录不等于实际调用或任务授权。probe 必须 confirm_start:true，
+它会启动可信未沙箱化本机进程，可能写文件或联网；是否可用以后台真实发现状态为准。
+能力命令仅从文件或标准输入读取，不在参数输入原始密钥；本切片拒绝凭据绑定。
+capability-command 不重试POST，也不支持--follow/--wait；用capabilities刷新发现状态。
+resolve-cleanup 须先在操作系统确认进程全部停止并检查改动，JSON包含快照中的
+expected_updated_at 和 confirm_processes_stopped:true；只记录所有者确认，不改写原任务/调用结果。
+输入模型密钥时请使用受保护的JSON文件或标准输入，避免写入命令参数。
 "#;
 
 #[derive(Debug)]
@@ -259,9 +268,8 @@ fn command(options: &Options) -> Result<Option<Value>> {
             }
             value
         }
-        "sessions" | "status" | "settings" | "models" | "follow" | "changes" | "requests" => {
-            return Ok(None)
-        }
+        "sessions" | "status" | "settings" | "models" | "follow" | "changes" | "requests"
+        | "capabilities" | "capability-command" | "resolve-cleanup" => return Ok(None),
         _ => bail!("未知命令，使用 --help 查看用法"),
     };
     if let Some(path) = &options.controls {
@@ -273,6 +281,91 @@ fn command(options: &Options) -> Result<Option<Value>> {
         value["controls"] = controls;
     }
     Ok(Some(value))
+}
+
+fn capability_body(options: &Options) -> Result<Option<Value>> {
+    if !matches!(
+        options.command.as_str(),
+        "capabilities" | "capability-command"
+    ) {
+        return Ok(None);
+    }
+    if options.wait.is_some() || options.follow {
+        bail!("能力管理不支持--wait或--follow；使用capabilities读取最新状态");
+    }
+    if options.command == "capabilities" {
+        arity(options, 0, 0)?;
+        return Ok(None);
+    }
+    arity(options, 1, 1)?;
+    let content = input(&options.args[0], true)?;
+    if content.len() > 256 * 1024 {
+        bail!("能力命令超过256 KiB限制");
+    }
+    let value: Value = serde_json::from_str(&content).context("能力命令JSON格式无效")?;
+    if !value.is_object()
+        || !matches!(
+            value["type"].as_str(),
+            Some(
+                "save_mcp_server"
+                    | "set_capability_enabled"
+                    | "probe_mcp_server"
+                    | "save_skill"
+                    | "import_skill"
+                    | "delete_capability"
+            )
+        )
+    {
+        bail!("不支持的能力管理命令，请使用已定义的type对象");
+    }
+    if value["type"] == "probe_mcp_server" && value["confirm_start"] != true {
+        bail!("发现工具会启动未沙箱化本机进程，必须显式confirm_start:true");
+    }
+    if value["type"] == "save_mcp_server"
+        && value["definition"]
+            .get("credential_refs")
+            .is_some_and(|refs| !refs.as_object().is_some_and(|refs| refs.is_empty()))
+    {
+        bail!("本切片不支持凭据绑定；不要在能力配置或命令参数输入原始密钥");
+    }
+    let envelope = json!({"id":options.command_id,"command":value});
+    if serde_json::to_vec(&envelope)?.len() > 256 * 1024 {
+        bail!("能力管理信封超过256 KiB限制");
+    }
+    Ok(Some(envelope))
+}
+
+fn cleanup_resolution_request(options: &Options) -> Result<Option<(String, Value)>> {
+    if options.command != "resolve-cleanup" {
+        return Ok(None);
+    }
+    arity(options, 2, 2)?;
+    if options.wait.is_some() || options.follow {
+        bail!("解除隔离不支持--wait或--follow，也不会重启任务");
+    }
+    let id = &options.args[0];
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    {
+        bail!("任务ID无效");
+    }
+    let body: Value =
+        serde_json::from_str(&input(&options.args[1], true)?).context("所有者确认JSON格式无效")?;
+    if body.as_object().is_none_or(|map| map.len() != 2)
+        || body["confirm_processes_stopped"] != true
+        || !body["expected_updated_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+    {
+        bail!("先确认相关进程全部停止并检查项目改动；仅提交expected_updated_at和confirm_processes_stopped:true");
+    }
+    Ok(Some((
+        format!("/api/v1/tasks/{id}/cleanup-resolution"),
+        body,
+    )))
 }
 
 fn task<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value> {
@@ -343,7 +436,7 @@ fn is_terminal(task: &Value) -> bool {
 fn cleanup_notice(task: &Value) -> Option<&'static str> {
     match task["execution_cleanup"].as_str() {
         Some("pending") => Some("在途文件操作仍在清理；即使任务已进入终态，也不能断言副作用已停止，请使用status查询并检查实际改动。"),
-        Some("unknown") => Some("后台中断后文件操作结果未知；请检查实际改动，不会自动重放。"),
+        Some("unknown") => Some("执行清理结果未知，同项目后续执行已隔离；请在操作系统核对相关进程及实际改动，使用resolve-cleanup显式记录所有者确认，不会自动重放。"),
         _ => None,
     }
 }
@@ -662,6 +755,8 @@ async fn follow_loop(
 
 async fn run(options: Options) -> Result<()> {
     let command = command(&options)?;
+    let capability_request = capability_body(&options)?;
+    let cleanup_request = cleanup_resolution_request(&options)?;
     validate_follow(&options, command.as_ref())?;
     if options.command == "requests" {
         arity(&options, 0, 1)?;
@@ -673,6 +768,22 @@ async fn run(options: Options) -> Result<()> {
         .then(|| changes_route(&options))
         .transpose()?;
     let client = Client::open(&options.directory)?;
+    if let Some((path, body)) = cleanup_request {
+        let response = client.request("POST", &path, Some(body)).await?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+    if options.command == "capabilities" || capability_request.is_some() {
+        let response = if let Some(body) = capability_request {
+            client
+                .request("POST", "/api/v1/capabilities/commands", Some(body))
+                .await?
+        } else {
+            client.request("GET", "/api/v1/capabilities", None).await?
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
     if let Some(path) = changes_path {
         let response = client.request("GET", &path, None).await?;
         println!("{}", serde_json::to_string_pretty(&response)?);
@@ -1215,8 +1326,18 @@ mod tests {
                 socket.read_exact(&mut bytes).await.unwrap();
                 if let Some(command) = command {
                     let envelope: Value = serde_json::from_slice(&bytes).unwrap();
-                    assert_eq!(envelope["command"], command);
-                    assert!(envelope["command_id"].as_str().is_some());
+                    if path.ends_with("/cleanup-resolution") {
+                        assert_eq!(envelope, command);
+                    } else {
+                        assert_eq!(envelope["command"], command);
+                        assert!(envelope[if path == "/api/v1/capabilities/commands" {
+                            "id"
+                        } else {
+                            "command_id"
+                        }]
+                        .as_str()
+                        .is_some());
+                    }
                 } else {
                     assert!(bytes.is_empty());
                 }
@@ -1647,5 +1768,120 @@ mod tests {
             assert!(error.to_string().contains(expected), "{error}");
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn capability_and_cleanup_input_are_explicit_and_bounded() {
+        let parsed = |args: &[&str]| {
+            parse(args.iter().map(|arg| (*arg).to_owned()))
+                .unwrap()
+                .unwrap()
+        };
+        let path = std::env::temp_dir().join(format!("harness-cap-cli-{}.json", new_id()));
+        let file = path.to_str().unwrap();
+        let command =
+            json!({"type":"probe_mcp_server","id":"m","expected_revision":2,"confirm_start":true});
+        std::fs::write(&path, command.to_string()).unwrap();
+        let options = parsed(&["--command-id", "stable", "capability-command", file]);
+        assert_eq!(
+            capability_body(&options).unwrap().unwrap(),
+            json!({"id":"stable","command":command})
+        );
+        assert!(capability_body(&parsed(&["--wait", "1", "capability-command", file])).is_err());
+        assert!(capability_body(&parsed(&["--follow", "capabilities"])).is_err());
+        std::fs::write(
+            &path,
+            json!({"type":"probe_mcp_server","confirm_start":false}).to_string(),
+        )
+        .unwrap();
+        assert!(capability_body(&options).is_err());
+        std::fs::write(&path,json!({"type":"save_mcp_server","definition":{"credential_refs":{"TOKEN":"raw-secret"}}}).to_string()).unwrap();
+        assert!(capability_body(&options).is_err());
+        std::fs::write(
+            &path,
+            json!({"expected_updated_at":"stamp","confirm_processes_stopped":true}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            cleanup_resolution_request(&parsed(&["resolve-cleanup", "task-1", file]))
+                .unwrap()
+                .unwrap()
+                .0,
+            "/api/v1/tasks/task-1/cleanup-resolution"
+        );
+        for id in ["..", "t/x", "t?token=a", ""] {
+            assert!(cleanup_resolution_request(&parsed(&["resolve-cleanup", id, file])).is_err());
+        }
+        assert!(
+            cleanup_resolution_request(&parsed(&["--follow", "resolve-cleanup", "t", file]))
+                .is_err()
+        );
+        std::fs::write(
+            &path,
+            json!({"expected_updated_at":"stamp","confirm_processes_stopped":false}).to_string(),
+        )
+        .unwrap();
+        assert!(cleanup_resolution_request(&parsed(&["resolve-cleanup", "t", file])).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn capability_management_and_owner_cleanup_use_dedicated_routes_without_post_retry() {
+        cli_fixture(
+            &["capabilities"],
+            vec![(
+                "GET",
+                "/api/v1/capabilities",
+                None,
+                Some(json!({"mcp_servers":[],"skills":[]}).to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("harness-cap-cli-http-{}.json", new_id()));
+        let file = path.to_str().unwrap();
+        let command = json!({"type":"save_skill","name":"fixture","content":"local fixture"});
+        std::fs::write(&path, command.to_string()).unwrap();
+        cli_fixture(
+            &["--command-id", "stable", "capability-command", file],
+            vec![(
+                "POST",
+                "/api/v1/capabilities/commands",
+                Some(command.clone()),
+                Some(json!({"command_id":"stable","status":"completed"}).to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        assert!(cli_fixture(
+            &["capability-command", file],
+            vec![("POST", "/api/v1/capabilities/commands", Some(command), None)]
+        )
+        .await
+        .is_err());
+        let body = json!({"expected_updated_at":"stamp","confirm_processes_stopped":true});
+        std::fs::write(&path, body.to_string()).unwrap();
+        cli_fixture(
+            &["resolve-cleanup", "t", file],
+            vec![(
+                "POST",
+                "/api/v1/tasks/t/cleanup-resolution",
+                Some(body.clone()),
+                Some(json!({"task_id":"t","resolved":true}).to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        assert!(cli_fixture(
+            &["resolve-cleanup", "t", file],
+            vec![(
+                "POST",
+                "/api/v1/tasks/t/cleanup-resolution",
+                Some(body),
+                None
+            )]
+        )
+        .await
+        .is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }

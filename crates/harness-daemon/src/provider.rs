@@ -339,6 +339,11 @@ async fn execute_inner(
     messages.push(json!({"role":"user", "content":objective}));
     let mut current_goal = messages.len() - 1;
     let mut tools = tools(shell_enabled);
+    let managed = runtime.map(RunControl::capability_state).transpose()?;
+    let managed_servers = managed
+        .as_ref()
+        .map_or(&[][..], |state| state.servers.as_slice());
+    tools.extend(crate::capabilities::runtime::definitions(managed_servers));
     if runtime.is_some() {
         tools.push(definition("request_user_input", "向用户提出必须回答的问题并等待；回答不是授权。", json!({"prompt":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":900}}), &["prompt"]));
     }
@@ -521,7 +526,18 @@ async fn execute_inner(
                     if !arguments.is_object() {
                         Err(anyhow!("工具参数必须为对象"))
                     } else {
-                        if name == "request_user_input" {
+                        if name.starts_with("mcp_") {
+                            let control = runtime.context("此执行方式不支持托管 MCP")?;
+                            crate::capabilities::runtime::call(
+                                control,
+                                root,
+                                managed_servers,
+                                name,
+                                &arguments,
+                                &known_secrets,
+                            )
+                            .await
+                        } else if name == "request_user_input" {
                             let control = runtime.context("此执行方式不支持待回答问题")?;
                             let prompt = redact_all(settings, argument(&arguments, "prompt")?);
                             let seconds = arguments
@@ -809,6 +825,14 @@ fn secrets(settings: &Settings) -> Vec<String> {
         }
     }
     secrets
+}
+
+/// Shared longest-match redaction before any presentation bound or JSON escaping.
+pub(crate) fn redact_known(text: &str, secrets: &[String]) -> String {
+    let mut redactor = provider_stream::Redactor::new(secrets.to_vec());
+    let mut result = redactor.push(text);
+    result.push_str(&redactor.finish());
+    result
 }
 
 fn redact_all(settings: &Settings, text: &str) -> String {

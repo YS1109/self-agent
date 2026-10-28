@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, dispatch } from "./api";
+import { api, dispatch, capabilityClient } from "./api";
+import { cleanupResolutionBody, resolveTaskCleanup } from "./cleanup-resolution";
 import { DESKTOP_SOURCE, REMOTE_SOURCE, sameSource } from "./types";
 
 const invoke = vi.fn();
@@ -125,6 +126,34 @@ describe("private daemon transport", () => {
     await expect(dispatch(DESKTOP_SOURCE,{type:"decide_request",request_id:"r",expected_revision:2,approve:true,action_digest:"a".repeat(64)})).rejects.toThrow("connection lost");
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(JSON.parse(fetcher.mock.calls[1][1].body).command).toEqual({type:"decide_request",request_id:"r",expected_revision:2,approve:true,action_digest:"a".repeat(64)});
+  });
+
+  it("能力管理只走本机专用端点并保留幂等信封，未知POST不重发", async () => {
+    vi.stubGlobal("window",{});
+    const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>({mcp_servers:[],skills:[]})});vi.stubGlobal("fetch",fetcher);
+    const observer=new AbortController();await capabilityClient.getRegistry(observer.signal);
+    expect(fetcher.mock.calls[0][0]).toBe("/api/v1/capabilities");
+    const envelope={id:"fixed-id",command:{type:"save_skill" as const,name:"fixture",content:"text"}};
+    fetcher.mockRejectedValue(new Error("lost"));await expect(capabilityClient.command(envelope,observer.signal)).rejects.toThrow("lost");
+    expect(fetcher).toHaveBeenCalledTimes(2);expect(fetcher.mock.calls[1][0]).toBe("/api/v1/capabilities/commands");expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual(envelope);
+    expect(JSON.stringify(fetcher.mock.calls)).not.toMatch(/bearer|authorization/i);
+  });
+  it("关闭桌面观察不能撤回已提交的命令，晚到结果被丢弃", async () => {
+    vi.stubGlobal("window",{__TAURI_INTERNALS__:{}});let finish!:(value:unknown)=>void;
+    invoke.mockImplementation(()=>new Promise(resolve=>{finish=resolve;}));const observer=new AbortController();
+    const pending=api("POST","/capabilities/commands",{id:"one",command:{type:"save_skill"}},observer.signal);
+    await vi.waitFor(()=>expect(invoke).toHaveBeenCalledTimes(1));observer.abort();finish({status:"completed"});await expect(pending).rejects.toThrow();
+    expect(invoke).toHaveBeenCalledTimes(1);
+    await expect(api("GET","/capabilities",undefined,observer.signal)).rejects.toThrow();expect(invoke).toHaveBeenCalledTimes(1);
+  });
+  it("解除隔离只允许确切终态未知记录与显式确认，传输不会重发", async () => {
+    const task={id:"t",session_id:"s",title:"任务",status:"failed",execution_mode:"native" as const,source:DESKTOP_SOURCE,created_at:"now",updated_at:"now",steps:[],execution_cleanup:"unknown" as const,execution_cleanup_updated_at:"stamp"};
+    expect(()=>cleanupResolutionBody(task,false)).toThrow();expect(()=>cleanupResolutionBody({...task,status:"running"},true)).toThrow();
+    expect(()=>cleanupResolutionBody({...task,execution_cleanup:"pending"},true)).toThrow();expect(()=>cleanupResolutionBody({...task,id:"../t"},true)).toThrow();
+    vi.stubGlobal("window",{});const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>({task_id:"t",resolved:true})});vi.stubGlobal("fetch",fetcher);
+    await expect(resolveTaskCleanup(task,true)).resolves.toEqual({task_id:"t",resolved:true});
+    expect(fetcher.mock.calls[0][0]).toBe("/api/v1/tasks/t/cleanup-resolution");expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({expected_updated_at:"stamp",confirm_processes_stopped:true});
+    fetcher.mockRejectedValue(new Error("lost"));await expect(resolveTaskCleanup(task,true)).rejects.toThrow("lost");expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
 });

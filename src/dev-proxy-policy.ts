@@ -5,6 +5,8 @@ const localOrigins = new Set([
 
 const routes: Record<string, string> = {
   "GET /api/v1/snapshot": "GET",
+  "GET /api/v1/capabilities": "GET",
+  "POST /api/v1/capabilities/commands": "POST",
   "GET /api/v1/settings": "GET",
   "GET /api/v1/provider/local-codex": "GET",
   "POST /api/v1/settings/check": "POST",
@@ -23,6 +25,10 @@ export function changesProxyPath(path: string): boolean {
   return /^\/api\/v1\/tasks\/[A-Za-z0-9_-]{1,128}\/changes$/.test(path);
 }
 
+export function cleanupResolutionProxyPath(path: string): boolean {
+  return /^\/api\/v1\/tasks\/[A-Za-z0-9_-]{1,128}\/cleanup-resolution$/.test(path);
+}
+
 export function allowDevelopmentProxy(
   method: string,
   path: string,
@@ -30,7 +36,7 @@ export function allowDevelopmentProxy(
   fetchSite: string | undefined,
   contentType: string | undefined,
 ): boolean {
-  if (!Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (eventProxyPath(path) || changesProxyPath(path)))) return false;
+  if (!Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (eventProxyPath(path) || changesProxyPath(path))) && !(method === "POST" && cleanupResolutionProxyPath(path))) return false;
   if (fetchSite === "cross-site") return false;
   if (origin && !localOrigins.has(origin)) return false;
   return (

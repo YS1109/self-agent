@@ -45,7 +45,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, dispatch } from "./api";
+import { api, dispatch, capabilityClient } from "./api";
 import { useDaemonSnapshot } from "./use-daemon-snapshot";
 import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
 import { TaskSupplements, ContinueTask } from "./components/task-controls";
@@ -59,6 +59,8 @@ import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/ag
 import { QuickModelSelect, useModelCatalog } from "./components/model-select";
 import { ProviderSettings } from "./components/provider-settings";
 import { ExecutionCleanupNotice, ExecutionSettings, TaskExecutionDetails } from "./components/execution-settings";
+import { CapabilitiesSettings, CapabilityScopeSummary } from "./components/capabilities-settings";
+import { EMPTY_CAPABILITIES } from "./capabilities-client";
 import { ExecutionRequests } from "./components/execution-requests";
 import { defaultExecutionControls, controlsForTask, executionControlsError, settingsExecutionError } from "./execution-controls";
 import { ModelContextSettings } from "./components/model-context-settings";
@@ -203,6 +205,7 @@ function EmptyPanel({
 
 export default function App() {
   const { snapshot, connected, checked, connectionError, eventStatus, refresh } = useDaemonSnapshot();
+  const registry = snapshot.managed_capabilities ?? EMPTY_CAPABILITIES;
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState<Modal>(null);
@@ -860,8 +863,9 @@ export default function App() {
                 <summary>下一条执行预算与权限{executionDraft ? " · 已设置额外限制" : " · 使用后台默认值"}</summary>
                 <label className="execution-checkbox"><input type="checkbox" disabled={busy} checked={!!executionDraft}
                   onChange={event => setExecutionDrafts(current => ({ ...current, [draftKey]: event.target.checked ? structuredClone(settings.execution_controls ?? defaultExecutionControls()) : undefined }))} />为下一条任务指定更严格限制</label>
-                {executionDraft && <ExecutionSettings value={executionDraft} executor={settings.main_executor ?? "native"} scope="task" disabled={busy}
+                {executionDraft && <ExecutionSettings registry={registry} value={executionDraft} executor={settings.main_executor ?? "native"} scope="task" disabled={busy}
                   onChange={value => setExecutionDrafts(current => ({ ...current, [draftKey]: value }))} />}
+                {!executionDraft && <CapabilityScopeSummary registry={registry} value={(settings.execution_controls ?? defaultExecutionControls()).capabilities} label="下一条任务继承的能力范围" />}
               </details>}
               <div
                 className={`composer ${!session ? "composer-inactive" : ""}`}
@@ -1057,7 +1061,7 @@ export default function App() {
                   <TaskUsage taskId={selectedTask.id} events={snapshot.events} />
                   <TaskContext task={selectedTask} events={snapshot.events} />
                   <TaskSupplements task={selectedTask} />
-                  <TaskExecutionDetails task={selectedTask} />
+                  <TaskExecutionDetails task={selectedTask} onCleanupResolved={() => void refresh()} disabled={busy || !connected} />
                   <ExecutionRequests requests={sessionRequests.filter(request => request.task_id === selectedTask.id)} tasks={[selectedTask]} disabled={busy || !connected} onCommand={command} />
                   {selectedTask.continued_from && <p className="help-text">继续自任务 {selectedTask.continued_from}；这是新的执行，不是原任务重放。</p>}
                   {canContinue(selectedTask) && <ContinueTask key={selectedTask.id} task={selectedTask} disabled={busy || !connected} onCommand={command} onCreated={id => { if (currentSessionId.current === selectedTask.session_id) setTaskId(id); }} />}
@@ -1281,10 +1285,10 @@ export default function App() {
           </div>
           <ProviderSettings settings={settingsForm} saved={settings} onChange={setSettingsForm} apiKey={apiKey}
             onKeyChange={setApiKey} catalog={settingsForm.main_executor === "codex" ? codexModels : nativeModels} disabled={busy || !connected} />
-          <ExecutionSettings value={settingsForm.execution_controls ?? defaultExecutionControls()} executor={settingsForm.main_executor ?? "native"} disabled={busy}
+          <ExecutionSettings registry={registry} value={settingsForm.execution_controls ?? defaultExecutionControls()} executor={settingsForm.main_executor ?? "native"} disabled={busy}
             onChange={execution_controls => setSettingsForm(current => ({ ...current, execution_controls }))} />
           <ModelContextSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy} catalogs={[nativeModels, codexModels]} />
-          <AgentSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy}
+          <AgentSettings registry={registry} settings={settingsForm} onChange={setSettingsForm} disabled={busy}
             nativeModels={nativeModels} codexModels={codexModels} codexPathChanged={settingsForm.codex_binary !== settings.codex_binary} />
           <div className="codex-check">
             <Button type="button" size="small" variant="secondary" disabled={busy || checkingCodex || !connected || settingsForm.codex_binary !== settings.codex_binary} onClick={() => void checkCodex()}>
@@ -1318,9 +1322,10 @@ export default function App() {
         open={modal === "capabilities"}
         onClose={() => setModal(null)}
         title="能力目录"
-        description="由后台报告的真实可用能力。更多执行器、MCP 工具和技能将在后续接入。"
+        description="查看后台能力并管理 MCP / Skills。配置、发现、授权和实际使用彼此独立。"
         wide
       >
+        {modal === "capabilities" && <CapabilitiesSettings registry={registry} client={capabilityClient} disabled={busy || !connected} onRegistryChange={() => void refresh()} />}
         <div className="capability-list">
           {snapshot.capabilities.length ? (
             snapshot.capabilities.map((capability) => (

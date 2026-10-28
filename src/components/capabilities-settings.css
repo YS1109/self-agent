@@ -1,0 +1,15 @@
+.capabilities-settings { display: grid; gap: 12px; min-width: 0; }
+.capability-heading, .capability-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.capability-heading > span { color: var(--secondary); font-size: 12px; }
+.capability-card, .capability-editor, .capability-selection { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--surface-2); min-width: 0; }
+.capability-card { display: grid; gap: 10px; }
+.capability-fields { display: grid; gap: 12px; padding-top: 12px; }
+.capability-fields > label { display: grid; gap: 6px; color: var(--secondary); font-size: 13px; }
+.capability-fields input:not([type="checkbox"]), .capability-fields textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); }
+.capability-fields textarea { resize: vertical; }
+.capability-fields > .execution-checkbox { display: flex; }
+.capability-code { margin: 0; padding: 10px; overflow: auto; max-height: 180px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; background: var(--surface); border-radius: 7px; }
+.capability-card code, .capability-selection code { overflow-wrap: anywhere; }
+.capability-selection-group { display: grid; gap: 8px; border: 0; padding: 10px 0; margin: 0; }
+.capability-selection-group legend { color: var(--secondary); font-size: 13px; }
+.capability-notice { padding: 10px; color: var(--accent); background: var(--accent-light); border-radius: 7px; }

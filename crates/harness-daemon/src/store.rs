@@ -11,6 +11,7 @@ use crate::{
     Settings,
 };
 
+pub(crate) mod capabilities;
 mod changes;
 mod continuation;
 mod decisions;
@@ -54,6 +55,7 @@ impl Store {
              CREATE TABLE IF NOT EXISTS execution_requests(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, body TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS execution_requests_task ON execution_requests(task_id);",
         )?;
+        capabilities::migrate(&db)?;
         // One atomic migration preserves legacy UUIDs and insertion order. An
         // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
         let has_sequence = db
@@ -123,6 +125,7 @@ impl Store {
 
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
+        capabilities::recover(&tx)?;
         decisions::recover_pending(&tx)?;
         execution::recover_execution_cleanup(&tx)?;
         changes::recover_changes(&tx)?;
@@ -225,6 +228,7 @@ impl Store {
             "sessions":sessions, "tasks":tasks, "plans":plans, "events":events,
             "event_cursor":event_cursor,
             "context_states":self.public_context_states()?,
+            "managed_capabilities":self.capabilities_registry()?,
             "execution_requests":rows(&self.db,"execution_requests")?,
             "plan_changes":rows(&self.db,"plan_changes")?,
             "deliveries":rows(&self.db,"deliveries")?, "selections":rows(&self.db,"selections")?,
@@ -236,8 +240,8 @@ impl Store {
                 {"id":"callback","name":"本地回调","kind":"tool","description":"持久化桌面和远程模拟器回调，固定投递到任务发起来源","enabled":true},
                 {"id":"codex","name":"Codex 执行器","kind":"executor","description":"通过本机 Codex CLI 执行项目任务，需安装并完成登录配置","enabled":true},
                 {"id":"roles","name":"子智能体角色","kind":"agent","description":"配置角色指令、执行器和模型；计划节点按角色快照执行","enabled":true},
-                {"id":"mcp","name":"MCP 连接","kind":"mcp","description":"计划接入能力注册表","enabled":false},
-                {"id":"skills","name":"本地技能","kind":"skill","description":"计划支持限定范围的 SKILL.md 发现","enabled":false}
+                {"id":"mcp","name":"MCP 连接","kind":"mcp","description":"显式注册的本机 stdio 工具；需权限和实际调用验证，无沙箱","enabled":true},
+                {"id":"skills","name":"本地技能","kind":"skill","description":"手动注册或显式 SKILL.md 导入，固定正文不自动加载脚本","enabled":true}
             ]
         }))
     }
@@ -589,6 +593,7 @@ impl Store {
                 task["agent"] = json!(agent);
                 task["context_config"] = json!(context);
                 let task_id = text(&task, "id")?.to_owned();
+                capabilities::snapshot_task_capabilities(&tx, &mut task)?;
                 put(&tx, "tasks", &task)?;
                 let mut session = record(&tx, "sessions", &session_id)?;
                 append_message(&mut session, "user", &content, Some(&task_id))?;
@@ -653,6 +658,7 @@ impl Store {
                 task["agent"] = json!(agent);
                 task["context_config"] = json!(context);
                 let id = text(&task, "id")?.to_string();
+                capabilities::snapshot_task_capabilities(&tx, &mut task)?;
                 put(&tx, "tasks", &task)?;
                 let mut session = record(&tx, "sessions", &session_id)?;
                 append_message(&mut session, "user", title, Some(&id))?;
@@ -2308,6 +2314,7 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                     )?);
                     task["title"] = nodes[index]["title"].clone();
                     task["acceptance_command"] = nodes[index]["acceptance_command"].clone();
+                    capabilities::snapshot_task_capabilities(tx, &mut task)?;
                     put(tx, "tasks", &task)?;
                     nodes[index]["status"] = json!("queued");
                     nodes[index]["task_id"] = task["id"].clone();

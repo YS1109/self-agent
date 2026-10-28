@@ -1,5 +1,7 @@
 //! Shared records exchanged by the daemon, desktop bridge, and channel adapters.
 
+mod capabilities;
+pub use capabilities::*;
 mod execution;
 pub use execution::*;
 
@@ -174,11 +176,17 @@ pub struct TaskRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_cleanup_updated_at: Option<String>,
     #[serde(default)]
+    pub execution_cleanup_owner_ack: Option<CleanupOwnerAcknowledgement>,
+    #[serde(default)]
     pub verification_attempts: Vec<VerificationAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_request_id: Option<String>,
     #[serde(default)]
     pub question_answers: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub managed_capabilities: TaskCapabilities,
+    #[serde(default)]
+    pub capability_calls: Vec<CapabilityCallRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -441,6 +449,8 @@ pub struct Snapshot {
     pub selections: Vec<SessionSelection>,
     #[serde(default)]
     pub execution_requests: Vec<ExecutionRequest>,
+    #[serde(default)]
+    pub managed_capabilities: ManagedCapabilities,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

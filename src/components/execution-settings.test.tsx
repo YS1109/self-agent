@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ExecutionCleanupNotice, ExecutionSettings, TaskExecutionDetails } from "./execution-settings";
+import { ExecutionCleanupNotice, ExecutionSettings, TaskExecutionDetails, TaskCapabilityDetails } from "./execution-settings";
 import { defaultExecutionControls } from "../execution-controls";
 import { DESKTOP_SOURCE, type TaskRun } from "../types";
 const task:TaskRun={id:"t",session_id:"s",title:"任务",status:"failed",execution_mode:"native",source:DESKTOP_SOURCE,created_at:"now",updated_at:"now",steps:[],controls:defaultExecutionControls(),budget_usage:{model_requests:3,retries:0,repair_attempts:1,output_bytes:50,mutation_generation:2,started_at:"2026-10-28T00:00:00Z"},stop_reason:"repair_budget_exhausted"};
@@ -35,6 +35,26 @@ describe("执行控制诚实展示",()=>{
   const settled=renderToStaticMarkup(<ExecutionCleanupNotice task={{...task,status:"cancelled",execution_cleanup:"settled"}}/>);
   expect(settled).toContain("不表示任务成功、改动已撤销或验收通过");
   expect(renderToStaticMarkup(<ExecutionCleanupNotice task={task}/>)).toBe("");
+ });
+
+ it("未知清理需所有者显式核对，确认解锁不冒充后台验证",()=>{
+  const unknown={...task,execution_cleanup:"unknown" as const,execution_cleanup_updated_at:"stamp"};
+  const html=renderToStaticMarkup(<ExecutionCleanupNotice task={unknown} onResolved={()=>{}}/>);
+  expect(html).toContain("同项目后续任务已隔离");expect(html).toContain("已在操作系统确认相关进程全部停止，并检查项目改动");
+  expect(html).toMatch(/<button[^>]*disabled[^>]*>以本机所有者身份确认解除隔离<\/button>/);
+  expect(html).not.toMatch(/type="checkbox"[^>]*checked/);
+  const owner=renderToStaticMarkup(<ExecutionCleanupNotice task={{...unknown,execution_cleanup:"settled",execution_cleanup_owner_ack:{source:"local_owner",expected_updated_at:"stamp",confirmed_at:"2026-10-28T00:00:00Z"}}}/>);
+  expect(owner).toContain("所有者确认解除隔离");expect(owner).toContain("不是后台验证成功");expect(owner).not.toContain("后台确认在途操作清理已结束");
+ });
+ it("固定能力引用不冒充调用，真实调用未知和未发送如实保留",()=>{
+  const html=renderToStaticMarkup(<TaskCapabilityDetails task={{...task,managed_capabilities:{skills:[{id:"s",name:"skill",revision:2,digest:"fixed"}],mcp_servers:[]},capability_calls:[{id:"c",task_id:"t",server_id:"m",revision:3,tool:"tool<script>",digest:"bound-digest",status:"unknown",reason:"transport_failed",created_at:"now",updated_at:"now"},{id:"d",task_id:"t",server_id:"m",revision:3,tool:"tool",digest:"bound",status:"not_sent",reason:null,created_at:"now",updated_at:"now"}]}}/>);
+  expect(html).toContain("固定技能上下文");expect(html).toContain("修订 2");expect(html).toContain("bound-digest");expect(html).toContain("调用结果未知（不会自动重放）");expect(html).toContain("未发送工具请求也不保证进程启动没有副作用");expect(html).toContain("tool&lt;script&gt;");
+ });
+
+ it("旧任务缺少新增能力字段也可重开，不推断曾有MCP调用",()=>{
+  const legacy=JSON.parse(JSON.stringify(task));delete legacy.controls.capabilities;delete legacy.controls.budget.max_external_calls;delete legacy.controls.permissions.managed_tools;
+  const html=renderToStaticMarkup(<TaskExecutionDetails task={legacy}/>);
+  expect(html).toContain("任务固化能力范围（不是调用证据）");expect(html).toContain("未选择");expect(html).toContain("托管 MCP：禁止");
  });
 
 });

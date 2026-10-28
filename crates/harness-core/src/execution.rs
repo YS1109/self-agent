@@ -29,6 +29,8 @@ pub struct TaskPermissions {
     /// Trusted local shell, NOT a filesystem or network sandbox. The daemon's
     /// HARNESS_ALLOW_COMMANDS opt-in remains a separate mandatory ceiling.
     pub run_commands: PermissionMode,
+    /// Application-managed MCP only; never a promise about external Codex tools.
+    pub managed_tools: PermissionMode,
 }
 
 impl Default for TaskPermissions {
@@ -37,6 +39,7 @@ impl Default for TaskPermissions {
             read_files: true,
             write_files: PermissionMode::Allow,
             run_commands: PermissionMode::Allow,
+            managed_tools: PermissionMode::Deny,
         }
     }
 }
@@ -51,6 +54,7 @@ pub struct ExecutionBudget {
     pub max_retries: u32,
     pub max_repair_attempts: u32,
     pub max_output_bytes: u32,
+    pub max_external_calls: u32,
 }
 
 impl Default for ExecutionBudget {
@@ -61,6 +65,7 @@ impl Default for ExecutionBudget {
             max_retries: 0,
             max_repair_attempts: 2,
             max_output_bytes: 256 * 1024,
+            max_external_calls: 32,
         }
     }
 }
@@ -73,6 +78,7 @@ pub struct TaskControls {
     /// These exact commands must have successful post-mutation evidence before
     /// a Native task can be marked completed. Empty means no declared test gate.
     pub acceptance_commands: Vec<String>,
+    pub capabilities: crate::CapabilitySelection,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -82,6 +88,7 @@ pub struct BudgetUsage {
     pub retries: u32,
     pub repair_attempts: u32,
     pub output_bytes: u64,
+    pub external_calls: u32,
     pub mutation_generation: u64,
     pub started_at: Option<String>,
 }
@@ -148,4 +155,12 @@ mod tests {
             serde_json::from_str::<TaskControls>(r#"{"budget":{"max_runtime_second":1}}"#).is_err()
         );
     }
+}
+
+/// Explicit local owner attestation; not a backend process-exit observation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CleanupOwnerAcknowledgement {
+    pub expected_updated_at: String,
+    pub confirmed_at: String,
+    pub source: String,
 }

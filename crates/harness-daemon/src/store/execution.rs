@@ -10,6 +10,7 @@ const MAX_VERIFICATIONS: usize = 256;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Charge {
     ModelRequest,
+    ExternalCall,
     Retry,
     RepairAttempt,
     OutputBytes(u64),
@@ -22,9 +23,37 @@ pub(crate) fn validate_controls(controls: &TaskControls) -> Result<()> {
         || !(1..=900).contains(&budget.max_runtime_seconds)
         || budget.max_retries > 3
         || budget.max_repair_attempts > 8
+        || budget.max_external_calls > 128
         || !(1024..=262_144).contains(&budget.max_output_bytes)
     {
         bail!("执行预算无效：模型请求 1–128 次、运行 1–900 秒、重试 0–3 次、修复 0–8 次、输出 1024–262144 字节");
+    }
+    for ids in [
+        &controls.capabilities.mcp_servers,
+        &controls.capabilities.skills,
+    ] {
+        let mut unique = HashSet::new();
+        if ids.len() > 8
+            || ids.iter().any(|id| {
+                id.len() != 36
+                    || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                    || !unique.insert(id)
+            })
+        {
+            bail!("每类任务能力最多 8 个不同的有效注册标识");
+        }
+    }
+    if controls.permissions.managed_tools != PermissionMode::Deny {
+        if !controls.permissions.read_files
+            || controls.permissions.write_files == PermissionMode::Deny
+        {
+            bail!("MCP 是可信本机进程，不是项目沙箱；禁止文件读写时也必须禁用 MCP");
+        }
+        if controls.permissions.write_files == PermissionMode::Ask
+            && controls.permissions.managed_tools == PermissionMode::Allow
+        {
+            bail!("文件写入需要授权时，MCP 也必须逐次授权或禁用");
+        }
     }
     if controls.acceptance_commands.len() > MAX_ACCEPTANCE_COMMANDS {
         bail!("验收命令最多 8 条");
@@ -75,6 +104,22 @@ fn intersect(target: &mut TaskControls, restriction: &TaskControls) -> Result<()
         .budget
         .max_output_bytes
         .min(restriction.budget.max_output_bytes);
+    target.budget.max_external_calls = target
+        .budget
+        .max_external_calls
+        .min(restriction.budget.max_external_calls);
+    target.permissions.managed_tools = target
+        .permissions
+        .managed_tools
+        .intersect(restriction.permissions.managed_tools);
+    target
+        .capabilities
+        .mcp_servers
+        .retain(|id| restriction.capabilities.mcp_servers.contains(id));
+    target
+        .capabilities
+        .skills
+        .retain(|id| restriction.capabilities.skills.contains(id));
     target.permissions.read_files &= restriction.permissions.read_files;
     target.permissions.write_files = target
         .permissions
@@ -114,7 +159,7 @@ pub(crate) fn resolve_controls(
             .map_err(|_| anyhow!("任务执行控制字段或类型无效"))?;
         let mut merged = serde_json::to_value(&effective)?;
         for (key, value) in requested.as_object().unwrap() {
-            if matches!(key.as_str(), "budget" | "permissions") {
+            if matches!(key.as_str(), "budget" | "permissions" | "capabilities") {
                 let fields = value.as_object().context("预算和权限必须为对象")?;
                 for (field, value) in fields {
                     merged[key][field] = value.clone();
@@ -133,11 +178,16 @@ pub(crate) fn resolve_controls(
             // Canonical defaults here are compatibility sentinels, NOT an
             // enforceable count of Codex's internal model/repair requests.
             // Explicit task limits for those dimensions are always refused.
+            if !effective.capabilities.mcp_servers.is_empty() {
+                bail!("应用管理的 MCP 仅可用于 Native；不能静默注入本机 Codex 配置");
+            }
             let defaults = TaskControls::default();
+            let mut builtin_permissions = effective.permissions.clone();
+            builtin_permissions.managed_tools = PermissionMode::Deny;
             if effective.budget.max_model_requests != defaults.budget.max_model_requests
                 || effective.budget.max_repair_attempts != defaults.budget.max_repair_attempts
                 || effective.budget.max_retries != defaults.budget.max_retries
-                || effective.permissions != TaskPermissions::default()
+                || builtin_permissions != TaskPermissions::default()
                 || !effective.acceptance_commands.is_empty()
                 || requested.is_some_and(|value| {
                     value["budget"].get("max_model_requests").is_some()
@@ -232,6 +282,78 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn mark_execution_cleanup_unknown(&mut self, task_id: &str) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let mut task = record(&tx, "tasks", task_id)?;
+        if task["execution_cleanup"] != "pending" {
+            bail!("没有可标记为未知的在途操作");
+        }
+        task["execution_cleanup"] = json!("unknown");
+        task["execution_cleanup_updated_at"] = json!(now());
+        save_control(
+            &tx,
+            &mut task,
+            "进程清理结果未知；同项目后续执行已隔离，等待本机所有者确认",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn workspace_cleanup_blocked(
+        &self,
+        project: &str,
+        except_task: &str,
+    ) -> Result<bool> {
+        for task in rows(&self.db, "tasks")? {
+            if task["id"] == except_task
+                || !matches!(
+                    task["execution_cleanup"].as_str(),
+                    Some("pending" | "unknown")
+                )
+            {
+                continue;
+            }
+            if self.project_path(text(&task, "session_id")?)? == project {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// A local owner attestation is not a retroactive successful operation.
+    /// Unknown effects and the original terminal outcome remain unchanged.
+    pub(crate) fn resolve_execution_cleanup(
+        &mut self,
+        task_id: &str,
+        expected_updated_at: &str,
+    ) -> Result<Value> {
+        let tx = self.db.transaction()?;
+        let mut task = record(&tx, "tasks", task_id)?;
+        if task["execution_cleanup"] == "settled"
+            && task["execution_cleanup_owner_ack"]["expected_updated_at"] == expected_updated_at
+        {
+            return Ok(json!({"task_id":task_id,"resolved":true}));
+        }
+        if !matches!(
+            task["status"].as_str(),
+            Some("completed" | "failed" | "cancelled")
+        ) || task["execution_cleanup"] != "unknown"
+            || task["execution_cleanup_updated_at"] != expected_updated_at
+        {
+            bail!("清理状态已改变或仍在执行，请刷新后重新确认");
+        }
+        task["execution_cleanup"] = json!("settled");
+        task["execution_cleanup_owner_ack"] = json!({"expected_updated_at":expected_updated_at,"confirmed_at":now(),"source":"local_owner"});
+        task["execution_cleanup_updated_at"] = json!(now());
+        save_control(
+            &tx,
+            &mut task,
+            "本机所有者已确认相关进程停止并解除项目隔离；原任务结果未改变",
+        )?;
+        tx.commit()?;
+        Ok(json!({"task_id":task_id,"resolved":true}))
+    }
+
     #[cfg(test)]
     pub(crate) fn execution_controls(&self, task_id: &str) -> Result<TaskControls> {
         task_controls(&record(&self.db, "tasks", task_id)?)
@@ -277,6 +399,14 @@ impl Store {
             {
                 Some(("model_budget_exhausted", "模型请求预算已耗尽，保留已有结果"))
             }
+            Charge::ExternalCall
+                if counters.external_calls >= controls.budget.max_external_calls =>
+            {
+                Some((
+                    "external_call_budget_exhausted",
+                    "外部工具调用预算已耗尽，未发送新调用",
+                ))
+            }
             Charge::Retry if counters.retries >= controls.budget.max_retries => {
                 Some(("retry_budget_exhausted", "安全重试预算已耗尽，未重放操作"))
             }
@@ -312,6 +442,7 @@ impl Store {
         }
         match charge {
             Charge::ModelRequest => counters.model_requests += 1,
+            Charge::ExternalCall => counters.external_calls += 1,
             Charge::Retry => counters.retries += 1,
             Charge::RepairAttempt => counters.repair_attempts += 1,
             Charge::OutputBytes(bytes) => counters.output_bytes += bytes,
@@ -497,6 +628,36 @@ mod tests {
         store
     }
 
+    #[test]
+    fn unknown_cleanup_quarantines_project_until_exact_terminal_owner_attestation() {
+        let mut store = setup(TaskControls::default());
+        put(
+            &store.db,
+            "sessions",
+            &json!({"id":"session","project_path":"/fixture"}),
+        )
+        .unwrap();
+        store.set_execution_cleanup("task", true).unwrap();
+        store.mark_execution_cleanup_unknown("task").unwrap();
+        assert!(store.workspace_cleanup_blocked("/fixture", "next").unwrap());
+        let mut task = record(&store.db, "tasks", "task").unwrap();
+        let stamp = task["execution_cleanup_updated_at"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(store.resolve_execution_cleanup("task", &stamp).is_err());
+        task["status"] = json!("failed");
+        task["result"] = json!("original outcome");
+        put(&store.db, "tasks", &task).unwrap();
+        assert!(store.resolve_execution_cleanup("task", "stale").is_err());
+        store.resolve_execution_cleanup("task", &stamp).unwrap();
+        store.resolve_execution_cleanup("task", &stamp).unwrap();
+        assert!(!store.workspace_cleanup_blocked("/fixture", "next").unwrap());
+        assert_eq!(
+            record(&store.db, "tasks", "task").unwrap()["result"],
+            "original outcome"
+        );
+    }
     #[test]
     fn cleanup_settles_cancelled_write_without_rewriting_terminal_result() {
         for status in ["cancelled", "failed"] {
