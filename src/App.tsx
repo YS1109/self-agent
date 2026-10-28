@@ -1,3 +1,5 @@
+import {QqSettings} from "./components/qq-settings";
+import {EMPTY_QQ} from "./qq-client";
 import { EMPTY_PROVIDERS, namedModelRequest } from "./providers-client";
 import { ProvidersSettings } from "./components/providers-settings";
 import {
@@ -47,7 +49,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient } from "./api";
+import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient, qqClient, qqCredentialClient } from "./api";
 import { useDaemonSnapshot } from "./use-daemon-snapshot";
 import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
 import { TaskSupplements, ContinueTask } from "./components/task-controls";
@@ -86,7 +88,7 @@ import {
 } from "./types";
 
 type Panel = "plan" | "changes" | "artifacts" | "task";
-type Modal = "new" | "settings" | "remote" | "capabilities" | "providers" | null;
+type Modal = "new" | "settings" | "remote" | "capabilities" | "providers" | "qq" | null;
 const time = (value: string) =>
   new Date(value).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -593,6 +595,7 @@ export default function App() {
               {snapshot.capabilities.filter((c) => c.enabled).length}
             </span>
           </button>
+          <button className="sidebar-link" onClick={() => setModal("qq")}><Radio size={16}/><span>QQ 官方应用</span></button>
           <button className="sidebar-link" onClick={() => setModal("remote")}>
             <Radio size={16} />
             <span>远程入口</span>
@@ -1320,6 +1323,10 @@ export default function App() {
             </Button>
           </div>
         </form>
+      </ModalFrame>
+
+      <ModalFrame error="" open={modal === "qq"} onClose={()=>setModal(null)} title="QQ 官方应用" description="独立应用凭据、精确身份授权与被动回复；不是任意远端管理代理。" wide>
+        {modal === "qq" && <QqSettings initialSnapshot={EMPTY_QQ} client={qqClient} credentialClient={qqCredentialClient} sessions={snapshot.sessions} executor={settings.main_executor==="codex"?"codex":"native"} disabled={!connected}/>}
       </ModalFrame>
 
       <ModalFrame error="" open={modal === "providers"} onClose={()=>setModal("settings")} title="命名服务与系统凭据" description="仅本机所有者管理；关闭页面不撤回已经接受的系统操作。" wide>

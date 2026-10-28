@@ -143,3 +143,9 @@ it("allows only exact MCP credential method/UUID/slot routes and same origin JSO
  expect(allowDevelopmentProxy("GET",`/api/v1/capability-credential-operations/${id}`,undefined,"same-origin",undefined)).toBe(true);
  for(const path of [base+"?secret=x",base+"/../PATH",base.replace("TOKEN","token"),base.replace(id,"../bad")])expect(allowDevelopmentProxy("POST",path,undefined,"same-origin","application/json")).toBe(false);
 });
+
+it("limits QQ methods and canonical routes without broad credential proxy",()=>{
+ const id="11111111-1111-4111-8111-111111111111";
+ for(const [method,path] of [["GET","/api/v1/qq"],["POST","/api/v1/qq/commands"],["GET",`/api/v1/qq/commands/${id}`],["GET",`/api/v1/qq/credential-operations/${id}`],["POST",`/api/v1/qq/credentials/${id}`],["DELETE",`/api/v1/qq/credentials/${id}`],["POST",`/api/v1/qq/credentials/cleanup/${id}`]]){expect(allowDevelopmentProxy(method,path,undefined,"same-origin","application/json")).toBe(true);expect(allowDevelopmentProxy(method,path+"?owner=provider",undefined,"same-origin","application/json")).toBe(false);expect(allowDevelopmentProxy(method,path,"https://evil.invalid","cross-site","application/json")).toBe(false);}
+ for(const method of ["GET","PUT","PATCH"]){expect(allowDevelopmentProxy(method,`/api/v1/qq/credentials/${id}`,undefined,"same-origin","application/json")).toBe(false);}expect(allowDevelopmentProxy("DELETE",`/api/v1/qq/credentials/${id}`,undefined,"same-origin","text/plain")).toBe(false);
+});

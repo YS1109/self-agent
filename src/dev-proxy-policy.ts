@@ -5,6 +5,8 @@ const localOrigins = new Set([
 
 const routes: Record<string, string> = {
   "GET /api/v1/snapshot": "GET",
+  "GET /api/v1/qq": "GET",
+  "POST /api/v1/qq/commands": "POST",
   "GET /api/v1/providers": "GET",
   "POST /api/v1/providers/commands": "POST",
   "GET /api/v1/capabilities": "GET",
@@ -42,6 +44,13 @@ export function mcpCredentialProxyPath(method:string,path:string):boolean {
  return method==="GET"?new RegExp(`^/api/v1/capability-credential-operations/${id}$`).test(path):method==="POST"&&(new RegExp(`^/api/v1/capabilities/mcp/${id}/credentials/[A-Z][A-Z0-9_]{0,63}(?:/delete)?$`).test(path)||new RegExp(`^/api/v1/capability-credential-operations/${id}/cleanup$`).test(path));
 }
 
+export function qqProxyPath(method:string,path:string):boolean {
+ const id="[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+ if(method==="GET")return new RegExp(`^/api/v1/qq/(?:commands|credential-operations)/${id}$`).test(path);
+ if(method==="POST"&&new RegExp(`^/api/v1/qq/credentials/cleanup/${id}$`).test(path))return true;
+ return ["POST","DELETE"].includes(method)&&new RegExp(`^/api/v1/qq/credentials/${id}$`).test(path);
+}
+
 export function allowDevelopmentProxy(
   method: string,
   path: string,
@@ -49,7 +58,7 @@ export function allowDevelopmentProxy(
   fetchSite: string | undefined,
   contentType: string | undefined,
 ): boolean {
-  if (!mcpCredentialProxyPath(method,path) && !Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
+  if (!qqProxyPath(method,path) && !mcpCredentialProxyPath(method,path) && !Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
   if (fetchSite === "cross-site") return false;
   if (origin && !localOrigins.has(origin)) return false;
   return (

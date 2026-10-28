@@ -102,6 +102,20 @@ impl VaultBinding {
         Self::build("capability", owner, purpose, config_sha256)
     }
 
+    /// Application-owned service credentials use a separate namespace from
+    /// providers and MCP capabilities. Only typed, owner-only adapters may
+    /// calculate this digest; no public API accepts an arbitrary binding.
+    pub(crate) fn service(
+        owner: &str,
+        purpose: &str,
+        config_sha256: &str,
+    ) -> Result<Self, VaultError> {
+        if !is_digest(config_sha256) {
+            return Err(VaultError::not_attempted(VaultReason::InvalidBinding));
+        }
+        Self::build("service", owner, purpose, config_sha256)
+    }
+
     fn build(kind: &str, owner: &str, purpose: &str, endpoint: &str) -> Result<Self, VaultError> {
         if !canonical_uuid(owner)
             || purpose.is_empty()

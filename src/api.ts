@@ -1,3 +1,4 @@
+import type {QqClient,QqCredentialClient} from "./qq-client";
 import {mcpSlotError,type McpCredentialClient} from "./mcp-credentials-client";
 import { providerUuid, type ProvidersClient } from "./providers-client";
 import type { Command, Receipt, SourceContext } from "./types";
@@ -63,4 +64,18 @@ export const mcpCredentialClient:McpCredentialClient={
  deleteCredential:(id,slot,body,signal)=>mcpCredentialRequest("POST",`${mcpCredentialPath(id,slot)}/delete`,body,signal),
  operation:(id,signal)=>mcpCredentialRequest("GET",mcpCredentialPath(id),undefined,signal),
  cleanupCredential:(id,body,signal)=>mcpCredentialRequest("POST",`${mcpCredentialPath(id)}/cleanup`,body,signal),
+};
+
+function qqId(id:string):string{if(!providerUuid(id))throw new Error("QQ 配置或操作标识无效");return id;}
+async function qqRequest<T>(method:string,path:string,body:unknown,signal:AbortSignal):Promise<T>{try{return await api<T>(method,path,body,signal);}catch{throw new Error("QQ 请求未确认，请检查原操作；未回显凭据或底层错误。");}}
+export const qqClient:QqClient={
+ snapshot:signal=>qqRequest("GET","/qq",undefined,signal),
+ command:(envelope,signal)=>qqRequest("POST","/qq/commands",envelope,signal),
+ receipt:(id,signal)=>qqRequest("GET",`/qq/commands/${qqId(id)}`,undefined,signal),
+};
+export const qqCredentialClient:QqCredentialClient={
+ setCredential:(id,body,signal)=>qqRequest("POST",`/qq/credentials/${qqId(id)}`,body,signal),
+ deleteCredential:(id,body,signal)=>qqRequest("DELETE",`/qq/credentials/${qqId(id)}`,body,signal),
+ cleanupCredential:(id,body,signal)=>qqRequest("POST",`/qq/credentials/cleanup/${qqId(id)}`,body,signal),
+ operation:(id,signal)=>qqRequest("GET",`/qq/credential-operations/${qqId(id)}`,undefined,signal),
 };

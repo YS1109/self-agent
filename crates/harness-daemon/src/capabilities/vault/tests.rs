@@ -737,3 +737,18 @@ async fn system_constructor_and_shutdown_do_not_open_any_os_store() {
     assert!(Vault::system(0).is_err());
     assert!(Vault::system(MAX_QUEUE + 1).is_err());
 }
+
+#[test]
+fn service_binding_has_a_distinct_scope_and_never_accepts_a_foreign_reference() {
+    let digest = "a".repeat(64);
+    let service = VaultBinding::service(OWNER, "qq_client_secret", &digest).unwrap();
+    let mcp = VaultBinding::capability(OWNER, "qq_client_secret", &digest).unwrap();
+    let (_, reference) = fresh(&service);
+    assert!(CredentialRef::parse(reference.as_str(), &service).is_ok());
+    assert!(CredentialRef::parse(reference.as_str(), &mcp).is_err());
+    assert!(CredentialRef::parse(reference.as_str(), &binding()).is_err());
+    assert!(VaultBinding::service(OWNER, "qq_client_secret", "not-a-digest").is_err());
+    assert!(VaultBinding::service("untrusted-owner", "qq_client_secret", &digest).is_err());
+    let other = VaultBinding::service(OWNER, "qq_client_secret", &"b".repeat(64)).unwrap();
+    assert!(CredentialRef::parse(reference.as_str(), &other).is_err());
+}

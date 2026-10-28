@@ -7,3 +7,5 @@
 - 计划、任务结果和回调状态以 Rust 后台的持久化记录为准。演示模式必须明确标记，不得把模拟步骤描述为真实项目操作。
 - 当前开发分支命名服务与系统凭据切片见 `docs/protocol-v9.md`，托管 MCP/Skills 切片见 `docs/protocol-v8.md`，执行控制切片见 `docs/protocol-v7.md`，持久事件、执行器续接与流式协议见 `docs/protocol-v6.md`，0.6 基线协议见 `docs/protocol-v5.md`，编排画布见 `docs/protocol-v4.md`，运行控制与验收见 `docs/protocol-v3.md`，角色与执行器见 `docs/protocol-v2.md`，基础编排协议见 `docs/protocol-v1-draft.md`，实现边界见 `docs/implementation-status.md`。新增能力同步更新说明并验证相关行为。
 - 后续分版规划见 `docs/roadmap.md`，0.7 范围与验收见 `docs/iteration-v0.7.md`，0.8 切片计划见 `docs/iteration-v0.8.md`，接手入口见 `docs/handoff-v0.7.md`。这些文档描述待开发目标，不表示能力已经实现；规划不产生部署、外部通讯或扩大权限的授权。
+
+- QQ 开发切片协议见 `docs/protocol-v10.md`，范围见 `docs/iteration-v0.9.md`，模拟门禁与真实平台延期边界见 `docs/acceptance-v0.9.md`；QQ 不是本机管理 API 代理。

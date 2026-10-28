@@ -177,3 +177,12 @@ describe("MCP scoped credential transport",()=>{
   fetcher.mockResolvedValue({ok:false,json:async()=>({error:"SECRET_CANARY"})});await expect(mcpCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
  });
 });
+
+describe("QQ owner transport",()=>{
+ it("uses actual QQ metadata and credential endpoints, with no arbitrary owner or leaked errors",async()=>{
+  const {qqClient,qqCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>null});vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
+  await qqClient.snapshot(signal);await qqClient.receipt(id,signal);await qqCredentialClient.setCredential(id,{id,expected_revision:0,secret:"fixture"},signal);await qqCredentialClient.deleteCredential(id,{id,expected_revision:0},signal);await qqCredentialClient.cleanupCredential(id,{id},signal);await qqCredentialClient.operation(id,signal);
+  expect(fetcher.mock.calls.map(call=>[call[0],call[1].method])).toEqual([["/api/v1/qq","GET"],[`/api/v1/qq/commands/${id}`,"GET"],[`/api/v1/qq/credentials/${id}`,"POST"],[`/api/v1/qq/credentials/${id}`,"DELETE"],[`/api/v1/qq/credentials/cleanup/${id}`,"POST"],[`/api/v1/qq/credential-operations/${id}`,"GET"]]);expect(()=>qqCredentialClient.operation("../providers",signal)).toThrow();expect(fetcher).toHaveBeenCalledTimes(6);
+  fetcher.mockResolvedValue({ok:false,json:async()=>({error:"SECRET_CANARY"})});await expect(qqCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
+ });
+});

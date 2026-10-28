@@ -273,7 +273,38 @@ fn mcp_credential_route(method: &str, path: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
+fn qq_route(method: &str, path: &str) -> bool {
+    if (method == "GET" && path == "/api/v1/qq")
+        || (method == "POST" && path == "/api/v1/qq/commands")
+    {
+        return true;
+    }
+    if method == "GET" {
+        return ["/api/v1/qq/commands/", "/api/v1/qq/credential-operations/"]
+            .iter()
+            .any(|prefix| path.strip_prefix(prefix).is_some_and(scoped_uuid));
+    }
+    if method == "POST"
+        && path
+            .strip_prefix("/api/v1/qq/credentials/cleanup/")
+            .is_some_and(scoped_uuid)
+    {
+        return true;
+    }
+    matches!(method, "POST" | "DELETE")
+        && path
+            .strip_prefix("/api/v1/qq/credentials/")
+            .is_some_and(scoped_uuid)
+}
+
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
+    if qq_route(method, path) {
+        return Ok(match method {
+            "GET" => Method::GET,
+            "DELETE" => Method::DELETE,
+            _ => Method::POST,
+        });
+    }
     if mcp_credential_route(method, path) {
         return Ok(if method == "GET" {
             Method::GET
@@ -488,5 +519,30 @@ mod mcp_credential_route_tests {
         ] {
             assert!(validate_route("POST", &path).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod qq_route_tests {
+    use super::*;
+    #[test]
+    fn qq_scope_routes_have_exact_methods_and_ids() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for (method, path) in [
+            ("GET", "/api/v1/qq".into()),
+            ("POST", "/api/v1/qq/commands".into()),
+            ("GET", format!("/api/v1/qq/commands/{id}")),
+            ("GET", format!("/api/v1/qq/credential-operations/{id}")),
+            ("POST", format!("/api/v1/qq/credentials/{id}")),
+            ("DELETE", format!("/api/v1/qq/credentials/{id}")),
+            ("POST", format!("/api/v1/qq/credentials/cleanup/{id}")),
+        ] {
+            assert!(validate_route(method, &path).is_ok());
+            assert!(validate_route(method, &format!("{path}?owner=provider")).is_err());
+        }
+        for method in ["GET", "PUT", "PATCH"] {
+            assert!(validate_route(method, &format!("/api/v1/qq/credentials/{id}")).is_err());
+        }
+        assert!(validate_route("POST", "/api/v1/qq/credentials/../providers").is_err());
     }
 }

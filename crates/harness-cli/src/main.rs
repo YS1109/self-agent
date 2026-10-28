@@ -27,6 +27,9 @@ const HELP: &str = r#"Self Agent 命令行客户端
   providers save <JSON文件|->       保存服务元数据（不接受密钥）
   providers enable <ID> <修订> <true|false>  显式启停命名服务
   providers delete <ID> <修订>      删除服务，遗留凭据需显式清理
+  qq [snapshot] | command <JSON文件|-> | receipt <ID> | pair <秒数>
+  qq credential-set <CONFIG> <修订> --stdin | credential-delete <CONFIG> <修订>
+  qq credential-operation <ID> | cleanup <ID>  只读查询/显式清理；不自动重发
   mcp-credential set <SERVER> <SLOT> <修订> --stdin  写入MCP专用凭据
   mcp-credential delete <SERVER> <SLOT> <修订>  解绑并删除
   mcp-credential operation <操作ID> | cleanup <操作ID>  查询/显式清理
@@ -294,7 +297,8 @@ fn command(options: &Options) -> Result<Option<Value>> {
         | "resolve-cleanup"
         | "providers"
         | "provider-credential"
-        | "mcp-credential" => return Ok(None),
+        | "mcp-credential"
+        | "qq" => return Ok(None),
         _ => bail!("未知命令，使用 --help 查看用法"),
     };
     if let Some(path) = &options.controls {
@@ -424,6 +428,35 @@ fn provider_stdin_secret(reader: impl Read) -> Result<String> {
         bail!("凭据必须为1至2048字节的可见ASCII字符，不能包含空格或内部换行；内容未回显");
     }
     String::from_utf8(bytes).context("凭据格式无效，内容未回显")
+}
+
+fn qq_revision(value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v < 9_007_199_254_740_991)
+        .context("QQ 配置修订无效")
+}
+fn qq_request(options: &Options) -> Result<Option<(String, String, Option<Value>)>> {
+    if options.command != "qq" {
+        return Ok(None);
+    }
+    if options.follow || options.wait.is_some() {
+        bail!("QQ 管理只支持一次提交或只读查询，不支持follow/wait");
+    }
+    let a = &options.args;
+    if a.is_empty() || a.as_slice() == ["snapshot"] {
+        return Ok(Some(("GET".into(), "/api/v1/qq".into(), None)));
+    }
+    provider_uuid(&options.command_id)?;
+    match a[0].as_str(){
+ "receipt"|"credential-operation" if a.len()==2=>{provider_uuid(&a[1])?;Ok(Some(("GET".into(),format!("/api/v1/qq/{}/{}",if a[0]=="receipt"{"commands"}else{"credential-operations"},a[1]),None)))},
+ "command" if a.len()==2=>{let command:Value=serde_json::from_str(&input(&a[1],true)?).map_err(|_|anyhow::anyhow!("QQ 管理指令JSON无效，内容未回显"))?;if !matches!(command["type"].as_str(),Some("configure"|"issue_pairing"|"confirm_binding"|"revoke_binding"))||command.get("secret").is_some(){bail!("QQ command仅接受配置、配对、确认或撤权元数据；凭据须从专用stdin入口输入");}Ok(Some(("POST".into(),"/api/v1/qq/commands".into(),Some(json!({"id":options.command_id,"command":command})))))},
+ "pair" if a.len()==2=>{let ttl=a[1].parse::<u32>().ok().filter(|v|(1..=600).contains(v)).context("QQ 配对期限须为1至600秒")?;Ok(Some(("POST".into(),"/api/v1/qq/commands".into(),Some(json!({"id":options.command_id,"command":{"type":"issue_pairing","ttl_seconds":ttl}})))))},
+ "credential-set"|"credential-delete" if (a.len()==3||(a[0]=="credential-set"&&a.len()==4&&a[3]=="--stdin"))=>{provider_uuid(&a[1])?;let revision=qq_revision(&a[2])?;let mut body=json!({"id":options.command_id,"expected_revision":revision});if a[0]=="credential-set"{body["secret"]=json!(provider_stdin_secret(std::io::stdin())?);}Ok(Some((if a[0]=="credential-set"{"POST"}else{"DELETE"}.into(),format!("/api/v1/qq/credentials/{}",a[1]),Some(body))))},
+ "cleanup" if a.len()==2=>{provider_uuid(&a[1])?;Ok(Some(("POST".into(),format!("/api/v1/qq/credentials/cleanup/{}",a[1]),Some(json!({"id":options.command_id})))))},
+ _=>bail!("使用qq snapshot/command FILE|-/receipt ID/pair TTL/credential-set CONFIG REV --stdin/credential-delete CONFIG REV/credential-operation ID/cleanup ID；不要在参数中填写凭据"),
+ }
 }
 
 fn mcp_stdin_secret(reader: impl Read) -> Result<String> {
@@ -964,6 +997,7 @@ async fn run(options: Options) -> Result<()> {
     let cleanup_request = cleanup_resolution_request(&options)?;
     let provider_request = provider_request(&options)?;
     let mcp_credential_request = mcp_credential_request(&options)?;
+    let qq_request = qq_request(&options)?;
     validate_follow(&options, command.as_ref())?;
     if options.command == "requests" {
         arity(&options, 0, 1)?;
@@ -975,6 +1009,21 @@ async fn run(options: Options) -> Result<()> {
         .then(|| changes_route(&options))
         .transpose()?;
     let client = Client::open(&options.directory)?;
+    if let Some((method, path, body)) = qq_request {
+        if method != "GET" {
+            eprintln!(
+                "QQ 操作 ID：{}；结果未知时只读查询原操作，不会自动重发。",
+                options.command_id
+            );
+        }
+        let response = client.request(&method, &path, body).await.map_err(|_| {
+            anyhow::anyhow!(
+                "QQ 请求未确认，请用receipt或credential-operation查询原ID；未回显凭据或底层错误"
+            )
+        })?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
     if let Some((method, path, body)) = mcp_credential_request {
         if method != "GET" {
             eprintln!(
@@ -1504,7 +1553,7 @@ mod tests {
         assert!(snapshot_cursor(&json!({})).is_err());
     }
 
-    async fn cli_fixture(
+    pub(super) async fn cli_fixture(
         args: &[&str],
         replies: Vec<(&str, &str, Option<Value>, Option<String>)>,
     ) -> Result<()> {
@@ -1555,12 +1604,16 @@ mod tests {
                         || path.ends_with("/credential")
                         || path.ends_with("/credential-delete")
                         || path.starts_with("/api/v1/credential-operations/")
+                        || path.starts_with("/api/v1/qq/credentials/")
+                        || path.starts_with("/api/v1/capabilities/mcp/")
+                        || path.starts_with("/api/v1/capability-credential-operations/")
                     {
                         assert_eq!(envelope, command);
                     } else {
                         assert_eq!(envelope["command"], command);
                         assert!(envelope[if path == "/api/v1/capabilities/commands"
                             || path == "/api/v1/providers/commands"
+                            || path == "/api/v1/qq/commands"
                         {
                             "id"
                         } else {
@@ -2243,5 +2296,133 @@ mod mcp_credential_cli_tests {
         for v in [Vec::new(), vec![b'x'; 2049], vec![0], vec![255]] {
             assert!(mcp_stdin_secret(v.as_slice()).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod qq_cli_tests {
+    use super::*;
+    fn options(args: &[&str]) -> Options {
+        parse(args.iter().map(|v| (*v).into())).unwrap().unwrap()
+    }
+    #[test]
+    fn exact_routes_and_metadata_only_commands() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for (args, method, path) in [
+            (vec!["qq"], "GET", "/api/v1/qq".to_string()),
+            (
+                vec!["qq", "receipt", id],
+                "GET",
+                format!("/api/v1/qq/commands/{id}"),
+            ),
+            (
+                vec!["qq", "credential-operation", id],
+                "GET",
+                format!("/api/v1/qq/credential-operations/{id}"),
+            ),
+            (
+                vec!["qq", "credential-delete", id, "0"],
+                "DELETE",
+                format!("/api/v1/qq/credentials/{id}"),
+            ),
+            (
+                vec!["qq", "cleanup", id],
+                "POST",
+                format!("/api/v1/qq/credentials/cleanup/{id}"),
+            ),
+        ] {
+            let o = options(&args);
+            assert!(command(&o).unwrap().is_none());
+            let actual = qq_request(&o).unwrap().unwrap();
+            assert_eq!(actual.0, method);
+            assert_eq!(actual.1, path);
+        }
+        let pair = qq_request(&options(&["qq", "pair", "600"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair.2.unwrap()["command"]["ttl_seconds"], 600);
+    }
+    #[test]
+    fn reject_secret_argv_noncanonical_routes_and_unsafe_revisions() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for args in [
+            vec!["qq", "credential-set", id, "0", "SECRET_CANARY"],
+            vec!["qq", "credential-delete", "../provider", "0"],
+            vec!["qq", "pair", "601"],
+            vec!["qq", "credential-delete", id, "9007199254740991"],
+            vec!["--follow", "qq", "snapshot"],
+        ] {
+            let error = qq_request(&options(&args)).unwrap_err().to_string();
+            assert!(!error.contains("SECRET_CANARY"));
+        }
+    }
+    #[test]
+    fn mcp_routes_do_not_use_provider_or_qq_namespace() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let o = options(&["mcp-credential", "delete", id, "TOKEN", "1"]);
+        assert!(command(&o).unwrap().is_none());
+        let request = mcp_credential_request(&o).unwrap().unwrap();
+        assert_eq!(
+            request.1,
+            format!("/api/v1/capabilities/mcp/{id}/credentials/TOKEN/delete")
+        );
+        let invalid = options(&["mcp-credential", "set", id, "TOKEN", "1", "SECRET_CANARY"]);
+        assert!(!mcp_credential_request(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("SECRET_CANARY"));
+    }
+}
+
+#[cfg(test)]
+mod qq_cli_http_tests {
+    use super::tests::cli_fixture;
+    use super::*;
+    #[tokio::test]
+    async fn real_http_qq_metadata_credentials_and_unknown_no_repost() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        cli_fixture(
+            &["qq", "snapshot"],
+            vec![("GET", "/api/v1/qq", None, Some("{}".into()))],
+        )
+        .await
+        .unwrap();
+        cli_fixture(
+            &["--command-id", id, "qq", "pair", "60"],
+            vec![(
+                "POST",
+                "/api/v1/qq/commands",
+                Some(json!({"type":"issue_pairing","ttl_seconds":60})),
+                Some(json!({"command_id":id,"status":"completed"}).to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let path = format!("/api/v1/qq/credentials/{id}");
+        cli_fixture(
+            &["--command-id", id, "qq", "credential-delete", id, "0"],
+            vec![(
+                "DELETE",
+                &path,
+                Some(json!({"id":id,"expected_revision":0})),
+                Some("{}".into()),
+            )],
+        )
+        .await
+        .unwrap();
+        let path = format!("/api/v1/qq/credentials/cleanup/{id}");
+        assert!(cli_fixture(
+            &["--command-id", id, "qq", "cleanup", id],
+            vec![("POST", &path, Some(json!({"id":id})), None)]
+        )
+        .await
+        .is_err());
+        let path = format!("/api/v1/qq/credential-operations/{id}");
+        cli_fixture(
+            &["qq", "credential-operation", id],
+            vec![("GET", &path, None, Some("null".into()))],
+        )
+        .await
+        .unwrap();
     }
 }

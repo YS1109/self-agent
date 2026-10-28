@@ -73,6 +73,19 @@ impl RunControl {
     }
 
     pub fn stopped(&self) -> bool {
+        // Remote tasks retain their immutable source authority; local tasks
+        // are a no-op here. A reply-window expiry is not an execution revoke.
+        if self
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .check_task_remote(&self.task_id)
+            .is_err()
+        {
+            self.stop("remote_permission_revoked");
+            return true;
+        }
         // Codex cannot translate an application file/tool restriction mid-turn.
         // Stop it instead of pretending the new owner policy is enforced.
         let current = self

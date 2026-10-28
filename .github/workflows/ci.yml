@@ -43,6 +43,7 @@ jobs:
       - run: python scripts/budget_smoke.py
       - run: python scripts/execution_control_smoke.py
       - run: python scripts/capabilities_smoke.py
+      - run: python scripts/qq_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}

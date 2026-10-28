@@ -11,6 +11,7 @@ mod models;
 pub mod profiles;
 mod project_files;
 pub mod provider;
+mod qq;
 mod steering;
 pub mod store;
 
@@ -195,6 +196,8 @@ pub struct AppState {
     pub workspace_gates: Mutex<HashMap<PathBuf, Arc<Semaphore>>>,
     pub capability_probe_root: PathBuf,
     pub capability_probe_gate: Arc<Semaphore>,
+    pub(crate) qq_stop: tokio::sync::watch::Sender<bool>,
+    pub(crate) qq_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -232,12 +235,25 @@ impl AppState {
             workspace_gates: Mutex::new(HashMap::new()),
             capability_probe_root,
             capability_probe_gate: Arc::new(Semaphore::new(2)),
+            qq_stop: tokio::sync::watch::channel(false).0,
+            qq_worker: Mutex::new(None),
         }))
     }
 
     /// Best-effort bounded draining; a blocked OS mutation remains uncertain
     /// and its durable intent is recovered without replay on the next startup.
     pub async fn shutdown_credentials(&self) -> bool {
+        self.qq_stop.send_replace(true);
+        let worker = { self.qq_worker.lock().unwrap().take() };
+        if let Some(mut worker) = worker {
+            if tokio::time::timeout(Duration::from_secs(2), &mut worker)
+                .await
+                .is_err()
+            {
+                worker.abort();
+                let _ = worker.await;
+            }
+        }
         self.vault
             .shutdown(std::time::Instant::now() + Duration::from_secs(2))
             .await
@@ -253,6 +269,26 @@ pub fn router(state: Arc<AppState>) -> Router {
     let private = Router::new()
         .route("/api/v1/snapshot", get(snapshot))
         .merge(capabilities::credential_api::routes())
+        .route("/api/v1/qq", get(qq::api::snapshot))
+        .route(
+            "/api/v1/qq/commands",
+            post(qq::api::command).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route("/api/v1/qq/commands/{id}", get(qq::api::receipt))
+        .route(
+            "/api/v1/qq/credentials/{id}",
+            post(qq::api::set_credential)
+                .delete(qq::api::delete_credential)
+                .layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/api/v1/qq/credentials/cleanup/{id}",
+            post(qq::api::cleanup),
+        )
+        .route(
+            "/api/v1/qq/credential-operations/{id}",
+            get(qq::api::operation),
+        )
         .route(
             "/api/v1/credential-operations/{id}",
             get(capabilities::provider_api::operation),
@@ -721,6 +757,7 @@ async fn events(
 }
 
 pub fn spawn_workers(state: Arc<AppState>) {
+    qq::daemon::spawn(state.clone());
     coordinator::spawn(state.clone());
     for _ in 0..2 {
         let state = state.clone();
