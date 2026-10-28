@@ -1,0 +1,126 @@
+# Self Agent 0.7 开发交接
+
+更新日期：2026-10-28。交接性质：规划与代码基线说明，尚未开始 0.7 功能开发。
+
+## 接手先读
+
+1. 根目录 [AGENTS.md](../AGENTS.md)：项目规则及当前协议入口。
+2. [分版路线图](roadmap.md)：0.7 至 1.0 的范围、依赖、验收与待定事项。
+3. [0.7 迭代计划](iteration-v0.7.md)：下一阶段的实现顺序及验收条件。
+4. [当前实施状态](implementation-status.md) 与 [0.6 协议](protocol-v5.md)：实际支持能力。
+5. [架构计划](architecture-plan.md)：长期边界；未实现部分须与当前协议区分。
+
+用户要求把规划和交接提交 Git，再委托另一个 Agent 开发。本次工作不包含启动 0.7 实现；接手 Agent 的执行范围以用户届时委托为准。不要将路线图当作自动部署、发通讯消息或提升权限的授权。
+
+## 不应再偏离的产品方向
+
+- 日常体验参考 Codex：主 Agent 直接读取项目、修改、验证和回复，无需先建计划草稿。
+- 子 Agent 编排与流程图主要用于显式远程编排；保留现有能力，但不作为桌面普通对话入口。
+- 桌面、纯 HTTP 和 CLI 必须共用 Rust 后台；后续通讯和移动端继续复用相同会话。
+- 全部产品文案默认简体中文。保持中性灰和蓝色，不使用绿色作为成功色、连线或图标颜色。
+- 显示缩放已实现，不再以整体增减固定字号代替用户设置。
+- 子 Agent 的模型及上下文策略可以独立覆盖；任务快照不能被之后的设置修改覆盖。
+
+## 当前功能基线
+
+仓库：`YS1109/self-agent`，公开项目，远端默认工作目标为 `main`。
+
+0.6.0 功能提交：`764588561e50caab9c7f0b7b137d29db191ae94d`。该 SHA 是功能基线，后续规划文档提交不修改运行版本。接手应获取最新 `origin/main` 并先检查工作区，保留已有用户改动；需要新分支时沿用 `codex/` 前缀。
+
+| 能力 | 0.6.0 实际状态 |
+| --- | --- |
+| 日常主任务 | `run_agent` 直接执行，`task_kind: "main"`；同会话按 `main_sequence` 排队 |
+| 历史 | 启动时读取前序对话及真实结果，不带入后续排队输入 |
+| 执行器 | Native Chat Completions 工具循环及 Codex app-server stdio |
+| 会话续接 | 应用历史续接已实现；每个 Codex 任务仍新建临时 thread |
+| 流式与事件 | Native 非流式，Codex 仅采集部分协议通知；SSE 实时广播，桌面轮询快照，无游标历史补发 |
+| 上下文 | 模型默认 128000 / 80%，角色逐项覆盖；Native 实际压缩但摘要只用于当前执行 |
+| 模型发现 | 自定义服务和同源模型列表 Endpoint，实际拉取及下拉；不跟随重定向 |
+| 显示 | 80% 至 120%，默认 95%，本机保留；灰蓝明暗主题和中文菜单 |
+| 无头 | 独立 daemon、HTTP、`self-agent-cli`；仅监听 `127.0.0.1` |
+| 远程 | 模拟入口与本地持久化回调；尚无真实通讯、远程配对或公网网关 |
+
+配置来源可复用本机 Codex 顶层自定义服务，也可手动配置。凭据不得输出、提交或复制到前端。模型列表通过、版本检测通过和配置完整，都不等于实际模型调用成功。
+
+## 已完成的验证
+
+以下是 0.6.0 的历史验收结果，不是本次文档变更重新跑出的测试：
+
+- 共 172 项测试：前端 68、core 5、daemon 95、CLI 2、desktop 2。
+- 格式、Clippy 与八组 HTTP / CLI 回归通过。
+- GitHub Actions `40646566229` 对应上述功能 SHA，三平台 Rust / 协议和桌面共六项成功。
+- 隔离项目的真实 Native 文件读取、切换 Codex 后使用同会话前序结果通过；上下文及压缩参数透传已验证。
+- macOS 应用与 DMG 打包安装完成；原生 GUI 验证缩放、下拉、上下文与角色覆盖保存及重启恢复，原会话和预设保留。
+
+尚未证明：真实 Codex 长上下文自动压缩、thread 原生恢复、远程平台实际投递及其他设备的 GUI 行为。默认 CI 使用本地 HTTP / stdio 夹具，不消耗云端额度；Codex 可执行夹具目前仅 Unix 运行，Windows 的角色 HTTP 回归使用 Native。
+
+## 源码入口
+
+| 路径 | 接手时重点 |
+| --- | --- |
+| `crates/harness-core/src/lib.rs` | 共享任务、消息、事件、指令及收据类型 |
+| `crates/harness-daemon/src/lib.rs` | HTTP 路由、SSE 广播、worker、直接主任务执行和终态 |
+| `crates/harness-daemon/src/store.rs` | SQLite、幂等指令、主任务顺序、历史、计划、回调与重启恢复 |
+| `crates/harness-daemon/src/codex.rs` | stdio 生命周期、thread / turn、通知解析、中断与进程树回收 |
+| `crates/harness-daemon/src/provider.rs` | Native 工具循环、非流式请求、实际压缩与取消 |
+| `crates/harness-daemon/src/context.rs` | token 估算、保留工具组、压缩边界和历史拼接 |
+| `crates/harness-daemon/src/coordinator.rs` | 远程规划和回顾；不要把它重新设为桌面直接主任务必经入口 |
+| `crates/harness-daemon/src/configuration.rs`、`model_config.rs`、`profiles.rs` | 模型来源、检测、上下文继承与角色快照 |
+| `crates/harness-cli/src/main.rs` | 本机鉴权、JSON 命令、轮询等待及退出码 |
+| `src/App.tsx`、`src/api.ts`、`src/types.ts` | 当前快照轮询、聊天、发送入口及前端协议 |
+| `src-tauri/src/bridge.rs` | 后台启动与版本检查、受控请求白名单；目前不提供事件流桥 |
+| `src/components/execution-evidence.tsx`、`src/styles.css` | 执行证据和现有视觉语言，可在此基础上接入过程及更改展示 |
+| `scripts/codex_fixture.py`、`scripts/headless_smoke.py` | 协议和会话历史夹具，适合扩展恢复与流式回归 |
+| `.github/workflows/ci.yml` | 三平台后台与桌面检查及八组 smoke |
+
+新增模块可以从现有大文件拆分；先明确接口边界，避免与行为修改混在一次大规模重写中。
+
+## 0.7 第一个开发切片
+
+先完成统一事件的协议与持久化设计，再打通一个 Native 直接任务的“回复增量、工具执行、终态、断线恢复、CLI 跟随”，之后接入 Codex 和桌面。并行推进会话恢复前，先确定事件 ID、顺序及执行器会话关联的共享类型，避免多人改同一文件。
+
+P0 验收后再做执行中补充和改动面板；具体要求见迭代计划。0.8 以后顺序见路线图，首个通讯平台、网关托管、独立 App 及签名账号尚待用户决定。
+
+Codex 的恢复、注入和通知协议必须依据实施时安装版本的 schema 或官方文档核实，并用夹具及隔离真实任务分别验证。不要仅因某个方法名看似合理就写死协议。
+
+## 开发与验证入口
+
+依赖要求见 README；当前 Node.js 24、Rust 1.96 或更新版本，pnpm 版本由 `package.json` 指定。
+
+```sh
+pnpm install --frozen-lockfile
+cargo fmt --all -- --check
+cargo test -p harness-core -p harness-daemon -p harness-cli
+cargo clippy -p harness-core -p harness-daemon -p harness-cli --all-targets -- -D warnings
+cargo build -p harness-daemon -p harness-cli
+pnpm test
+pnpm build:web
+```
+
+```sh
+python3 scripts/smoke.py
+python3 scripts/provider_smoke.py
+python3 scripts/configuration_smoke.py
+python3 scripts/orchestration_smoke.py
+python3 scripts/agents_smoke.py
+python3 scripts/runtime_smoke.py
+python3 scripts/plan_change_smoke.py
+python3 scripts/headless_smoke.py
+```
+
+按实际改动增加有行为价值的回归；桌面构建入口为 `pnpm desktop:build`。完整门禁与平台依赖以 CI 和 README 为准。真实模型选项单独运行，记录消耗及验证范围，不混入默认测试。
+
+## 数据、运行环境与边界
+
+- 开发、协议夹具和真实模型验证使用独立 `HARNESS_DATA_DIR`、本机临时端口和隔离项目，不能向用户原会话灌入测试任务。
+- 日常数据位于平台应用数据目录的 `self-agent` 下。元数据 `daemon.json` 含本机令牌，不能提交、输出或交给浏览器。
+- 本机 `.local/` 中有上一轮验证和恢复资料，已忽略，不属于 Git 交接内容；接手不能假设其他机器存在这些文件。
+- 0.6 后台重启会将执行中的项目任务标为失败并保留改动，不自动重放写入；0.7 的会话恢复不得破坏这一边界。
+- Codex 当前拒绝未支持的交互授权；不要为了跑通示例取消权限约束。Native 命令执行由现有显式配置启用。
+- 文档提交不需要重装应用或停止日常后台。实现升级涉及桌面与 daemon 版本一致性，届时再按具体交付处理。
+
+## 接手交付要求
+
+提交前更新实际实现状态、协议、README 和本交接记录，区分已交付与剩余目标。给出代码提交、对应 CI 和有意义的实测范围；失败或未验证的部分如实保留，不能直接复制上一版的“全部通过”。
+
+当前用户要求的是 Git 中可转交的规划。本次交接已涵盖多个未来版本；后续 Agent 不应一次实现整份路线图，应从 0.7 的首个切片推进。
