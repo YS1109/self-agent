@@ -29,11 +29,19 @@ mod unix {
         let script = option_env!("MCP_FIXTURE_PATH")
             .map(PathBuf::from)
             .unwrap_or(script);
-        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
-            .into_iter()
-            .map(PathBuf::from)
+        // Respect the explicit CI/developer Python toolchain. On macOS,
+        // /usr/bin/python3 can be an Xcode launcher with cold-start behavior;
+        // bypassing actions/setup-python makes bounded fixture startup flaky.
+        let search = std::env::var_os("PATH").unwrap_or_default();
+        let python = std::env::split_paths(&search)
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join("python3"))
+            .chain([
+                PathBuf::from("/usr/bin/python3"),
+                PathBuf::from("/usr/local/bin/python3"),
+            ])
             .find(|path| path.is_file())
-            .unwrap()
+            .expect("MCP fixture requires an installed Python 3 interpreter")
             .canonicalize()
             .unwrap();
         ServerConfig {
@@ -46,26 +54,31 @@ mod unix {
             env: BTreeMap::new(),
             mode,
             limits: Limits {
-                setup_timeout: Duration::from_secs(2),
+                setup_timeout: Duration::from_secs(10),
                 call_timeout: Duration::from_millis(250),
             },
         }
     }
     fn control() -> Control<'static> {
         Control {
-            deadline: Instant::now() + Duration::from_secs(5),
+            deadline: Instant::now() + Duration::from_secs(15),
             cancelled: &|| false,
         }
     }
     async fn ready(project: &Project, config: &ServerConfig) -> McpSession {
         let mut session = McpSession::open(config, &project.0, control())
             .await
-            .ok()
-            .unwrap();
-        let discovery = session.discover(control()).await.ok().unwrap();
+            .unwrap_or_else(|error| panic!("fixture open failed: {}", error.reason));
+        let discovery = session
+            .discover(control())
+            .await
+            .unwrap_or_else(|error| panic!("fixture discovery failed: {}", error.reason));
         assert_eq!(discovery.protocol, config.mode);
         assert!(discovery.tools && discovery.metadata.is_object());
-        let tools = session.list_tools(control()).await.ok().unwrap();
+        let tools = session
+            .list_tools(control())
+            .await
+            .unwrap_or_else(|error| panic!("fixture list failed: {}", error.reason));
         assert!(!tools.is_empty());
         assert_eq!(tools[0].description.as_deref(), Some("本地模拟工具"));
         assert!(tools[0].input_schema.is_object());
@@ -360,7 +373,7 @@ mod unix {
             })
             .ok()
             .unwrap();
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(cfg.limits.setup_timeout, async {
                 while !actual.join("mcp-pid").exists() {
                     sleep(Duration::from_millis(5)).await;
                 }

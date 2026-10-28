@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Real daemon + Native + bounded MCP subprocess; exclusively local fixtures."""
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import json
@@ -163,7 +164,9 @@ def main():
                 # This fixture edits only its isolated database while daemon is stopped.
                 original=current(identifier)
                 daemon.stop()
-                with sqlite3.connect(root/"harness.sqlite") as db:
+                # Connection context managers commit/rollback but do not close;
+                # release the fixture handle before restarting/removing on Windows.
+                with closing(sqlite3.connect(root/"harness.sqlite")) as db, db:
                     saved=json.loads(db.execute("SELECT body FROM tasks WHERE id=?",(identifier,)).fetchone()[0])
                     saved["execution_cleanup"]="pending"
                     db.execute("UPDATE tasks SET body=? WHERE id=?",(json.dumps(saved),identifier))
