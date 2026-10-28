@@ -416,7 +416,10 @@ mod tests {
 
     #[test]
     fn restart_marks_lost_baseline_unavailable_and_keeps_finished_reports() {
-        let path = std::env::temp_dir().join(format!("changes-store-{}.sqlite", new_id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("changes-store-{}.sqlite", new_id()));
         let (pending, saved);
         {
             let mut store = Store::open(&path).unwrap();

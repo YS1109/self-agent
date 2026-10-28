@@ -123,7 +123,10 @@ fn safe(text: &str) {
 }
 async fn fixture() -> (Http, MockVaultControl) {
     let (vault, control) = test_support::memory(8).unwrap();
-    let root = std::env::temp_dir().join(format!("qq-api-{}", new_id()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("qq-api-{}", new_id()));
     (Http::open(root, vault).await, control)
 }
 fn clean(root: PathBuf) {

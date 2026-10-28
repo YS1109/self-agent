@@ -2934,7 +2934,10 @@ mod tests {
     #[test]
     fn codex_completed_round_survives_restart_unknown_round_is_never_replayed() {
         use crate::codex::CodexLifecycle as L;
-        let path = std::env::temp_dir().join(format!("self-agent-context-{}.sqlite", new_id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("self-agent-context-{}.sqlite", new_id()));
         let mut store = Store::open(&path).unwrap();
         session(&mut store);
         let first = codex_main(&mut store, "FIRST");
@@ -2996,7 +2999,10 @@ mod tests {
     #[test]
     fn native_summary_survives_restart_and_does_not_cross_sessions_or_executors() {
         use crate::continuation::{fingerprint, NativeSummary};
-        let path = std::env::temp_dir().join(format!("self-agent-summary-{}.sqlite", new_id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("self-agent-summary-{}.sqlite", new_id()));
         let mut store = Store::open(&path).unwrap();
         let session_id = session(&mut store);
         let first = send(&mut store, json!({"type":"run_agent","content":"FIRST"}));
@@ -3064,7 +3070,10 @@ mod tests {
 
     #[test]
     fn legacy_events_migrate_in_order_and_cursors_survive_restart() {
-        let path = std::env::temp_dir().join(format!("self-agent-events-{}.sqlite", new_id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("self-agent-events-{}.sqlite", new_id()));
         let db = Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE events(id TEXT PRIMARY KEY, body TEXT NOT NULL);")
             .unwrap();
@@ -3526,7 +3535,7 @@ mod tests {
     }
     #[test]
     fn outbox_survives_restart_without_repeating_completed_work() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");
         {
@@ -3758,7 +3767,7 @@ mod tests {
 
     #[test]
     fn direct_codex_tasks_do_not_require_main_model_and_keep_role_after_cancel_restart() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let task_id;
@@ -3811,7 +3820,7 @@ mod tests {
 
     #[test]
     fn restart_migrates_pre_role_plans_jobs_and_tasks_without_using_new_settings() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         {
@@ -4384,7 +4393,7 @@ mod tests {
 
     #[test]
     fn restart_retries_coordinator_but_fails_running_child_and_preserves_parent() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let plan_id;
@@ -4466,7 +4475,7 @@ mod tests {
 
     #[test]
     fn restart_retries_uncommitted_review_without_failing_plan_parent() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let parent_id;
@@ -4771,7 +4780,7 @@ mod tests {
 
     #[test]
     fn acceptance_requires_exact_successful_tool_evidence_and_keeps_failure_history() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let mut store = Store::open(&path).unwrap();
@@ -4920,7 +4929,7 @@ mod tests {
 
     #[test]
     fn paused_plan_evidence_and_queued_work_survive_restart_without_replay() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let id;
@@ -5228,7 +5237,7 @@ mod tests {
 
     #[test]
     fn suggestion_restart_retries_generation_and_preserves_ready_without_autoapply() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let plan;

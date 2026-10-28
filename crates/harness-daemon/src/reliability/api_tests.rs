@@ -13,7 +13,10 @@ struct Fixture {
 }
 impl Fixture {
     async fn open() -> Self {
-        let root = std::env::temp_dir().join(format!("sa-maint-{}", new_id()));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("sa-maint-{}", new_id()));
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let lease = DataLease::acquire(&root.join("data")).unwrap();
@@ -210,7 +213,10 @@ async fn backup_routes_require_owner_and_capacity_failure_creates_no_intent() {
 }
 #[test]
 fn actual_store_migrates_legacy_events_and_rejects_newer_database_before_writes() {
-    let root = std::env::temp_dir().join(format!("sa-schema-{}", new_id()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("sa-schema-{}", new_id()));
     std::fs::create_dir(&root).unwrap();
     let path = root.join("harness.sqlite");
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -269,7 +275,10 @@ fn offline_inspection_rejects_relative_bundle_paths() {
 #[cfg(unix)]
 #[tokio::test]
 async fn managed_open_rejects_replaced_directory_before_any_database_or_probe_writes() {
-    let root = std::env::temp_dir().join(format!("sa-lease-{}", new_id()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("sa-lease-{}", new_id()));
     std::fs::create_dir(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let selected = root.join("selected");
@@ -311,7 +320,10 @@ async fn managed_open_rejects_replaced_directory_before_any_database_or_probe_wr
 
 #[tokio::test]
 async fn managed_open_rejects_replaced_main_file_after_lease_acquisition() {
-    let root = std::env::temp_dir().join(format!("sa-lease-file-{}", new_id()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("sa-lease-file-{}", new_id()));
     std::fs::create_dir(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let main = root.join("harness.sqlite");
@@ -336,7 +348,10 @@ async fn managed_open_rejects_replaced_main_file_after_lease_acquisition() {
 #[tokio::test]
 async fn online_backup_never_switches_from_open_store_to_replaced_main_file() {
     for preexisting in [false, true] {
-        let root = std::env::temp_dir().join(format!("sa-online-file-{}", new_id()));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("sa-online-file-{}", new_id()));
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let data = root.join("data");

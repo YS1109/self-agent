@@ -1020,7 +1020,10 @@ mod tests {
     }
     #[test]
     fn command_dedup_and_revision_conflict_are_durable() {
-        let dir = std::env::temp_dir().join(format!("capability-{}.db", new_id()));
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("capability-{}.db", new_id()));
         let request =
             envelope(json!({"type":"save_skill","name":"技能","content":"private first body"}));
         let first;
@@ -1049,6 +1052,8 @@ mod tests {
     fn imports_are_private_pinned_snapshots_not_repeat_reads() {
         let mut store = store();
         let source = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
             .join("SKILL.md")
             .to_string_lossy()
             .into_owned();
@@ -1199,7 +1204,10 @@ mod tests {
     }
     #[test]
     fn unknown_writes_and_pending_probes_are_not_replayed_on_restart() {
-        let dir = std::env::temp_dir().join(format!("capability-recovery-{}.db", new_id()));
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("capability-recovery-{}.db", new_id()));
         let task_id;
         let call_id;
         let pending;
@@ -1445,6 +1453,8 @@ mod tests {
                 )
                 .is_err());
             let source = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
                 .join("SKILL.md")
                 .to_string_lossy()
                 .into_owned();

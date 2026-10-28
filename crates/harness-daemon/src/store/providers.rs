@@ -1336,7 +1336,10 @@ mod tests {
     }
     #[test]
     fn delete_detaches_before_os_and_restart_never_replays_intents() {
-        let path = std::env::temp_dir().join(format!("provider-store-{}.db", new_id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("provider-store-{}.db", new_id()));
         let id;
         let op;
         let pending_set;

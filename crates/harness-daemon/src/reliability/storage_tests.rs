@@ -740,7 +740,12 @@ fn inconsistent_existing_commit_marker_preserves_every_material() {
                     let entry = entry.unwrap();
                     (
                         entry.file_name(),
-                        if entry.file_type().unwrap().is_file() {
+                        if entry.file_type().unwrap().is_file()
+                            && entry.file_name() != "daemon.lock"
+                        {
+                            // The lease intentionally byte-locks daemon.lock
+                            // on Windows. Compare every recovery material, not
+                            // the unrelated lock's unreadable contents.
                             Some(std::fs::read(entry.path()).unwrap())
                         } else {
                             None
@@ -998,4 +1003,47 @@ fn create_and_acquire_rejects_existing_symlink_without_changing_target() {
     assert!(!target.join("missing").exists());
     assert!(!target.join("daemon.lock").exists());
     assert_eq!(std::fs::metadata(&target).unwrap().permissions(), before);
+}
+
+#[test]
+fn directory_identity_uses_open_handle_and_empty_root_preflight_succeeds() {
+    let root = Root::new();
+    let dir = open_directory(&root.0).unwrap();
+    let cloned = cap_std::fs::File::from_std(dir.try_clone().unwrap().into_std_file());
+    assert_eq!(
+        directory_identity(&dir).unwrap(),
+        file_identity(&cloned).unwrap()
+    );
+    let guard = StorageGuard::acquire(&root.0).unwrap();
+    assert_eq!(guard.preflight_startup().unwrap(), None);
+    drop(original(&root));
+    assert_eq!(guard.preflight_startup().unwrap(), Some(SCHEMA_VERSION));
+}
+
+#[test]
+fn restore_reaches_commit_hook_with_directory_identity_checks_enabled() {
+    let root = Root::new();
+    let (path, manifest) = bundle(&root, "replacement");
+    drop(original(&root));
+    let guard = StorageGuard::acquire(&root.0).unwrap();
+    let reached = std::cell::Cell::new(false);
+    let result = guard.restore_with_hook(
+        &path,
+        &manifest.sha256,
+        |db| migrate(db, schema),
+        |_| Ok(()),
+        |point| {
+            if point == RestorePoint::Committed {
+                reached.set(true);
+                bail!("fixture interrupt after commit");
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert!(
+        reached.get(),
+        "restore failed before the intended interruption hook: {result:?}"
+    );
+    assert_eq!(guard.recover_pending().unwrap(), RecoveryOutcome::Completed);
 }

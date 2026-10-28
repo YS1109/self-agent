@@ -394,7 +394,10 @@ mod tests {
     }
     #[test]
     fn restart_records_unknown_delivery_without_retrying_supplements() {
-        let path = std::env::temp_dir().join(format!("self-agent-steering-{}.sqlite", new_id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("self-agent-steering-{}.sqlite", new_id()));
         let mut store = Store::open(&path).unwrap();
         let session = send(
             &mut store,

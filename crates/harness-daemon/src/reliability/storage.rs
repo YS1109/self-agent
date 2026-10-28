@@ -386,9 +386,11 @@ fn file_identity(file: &cap_std::fs::File) -> Result<(u64, u64)> {
     }
 }
 fn directory_identity(dir: &Dir) -> Result<(u64, u64)> {
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    file_identity(&dir.open_with(".", &options)?)
+    // Preserve the already-open directory capability. A normal read open of
+    // "." is not a directory open on Windows (needs BACKUP_SEMANTICS) and can
+    // fail with AccessDenied; cloning needs no additional pathname lookup.
+    let file = cap_std::fs::File::from_std(dir.try_clone()?.into_std_file());
+    file_identity(&file)
 }
 fn read_file(dir: &Dir, name: &str, limit: usize) -> Result<Vec<u8>> {
     let mut options = OpenOptions::new();

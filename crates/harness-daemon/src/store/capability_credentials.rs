@@ -1319,7 +1319,10 @@ mod tests {
     }
     #[test]
     fn restart_and_deleted_server_replay_do_not_reissue_os_intents() {
-        let path = std::env::temp_dir().join(format!("mcp-credential-{}.db", new_id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mcp-credential-{}.db", new_id()));
         let id;
         let op;
         let before;
