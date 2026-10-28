@@ -1,6 +1,7 @@
 mod codex;
 mod configuration;
 mod context;
+mod continuation;
 mod coordinator;
 mod model_config;
 mod models;
@@ -722,29 +723,108 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         };
         match agent.executor.as_str() {
             "native" => {
-                provider::execute_with_context_events(
-                    &settings,
-                    &root,
-                    input,
-                    progress,
-                    is_cancelled,
-                    evidence,
-                    execution_event,
-                )
+                async {
+                    // Pin the resolved service once for this execution. A local
+                    // Codex config edit cannot change the summary identity between
+                    // cache validation and the actual provider call.
+                    let settings = configuration::resolve(&settings)?;
+                    let config = continuation::native_identity(&settings, &root, &agent, &context)?;
+                    let memory = if task["task_kind"] == "main" {
+                        state
+                            .store
+                            .lock()
+                            .unwrap()
+                            .prepare_native_summary(&task_id, &config)?
+                    } else {
+                        None
+                    };
+                    let state_for_summary = state.clone();
+                    let task_for_summary = task_id.clone();
+                    let main = task["task_kind"] == "main";
+                    provider::execute_with_memory(
+                        &settings,
+                        &root,
+                        input,
+                        progress,
+                        is_cancelled,
+                        evidence,
+                        execution_event,
+                        memory.as_ref(),
+                        move |summary| {
+                            if main {
+                                state_for_summary
+                                    .store
+                                    .lock()
+                                    .unwrap()
+                                    .save_native_summary(&task_for_summary, &config, summary)?;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await
+                }
                 .await
             }
-            "codex" => codex::execute_with_context(
-                &settings.codex_binary,
-                &agent.model,
-                &root,
-                input,
-                progress,
-                is_cancelled,
-                evidence,
-            )
-            .await
-            .map(|text| redact_secret(&text, &settings.api_key))
-            .map_err(|error| anyhow::anyhow!(redact_secret(&error.to_string(), &settings.api_key))),
+            "codex" => {
+                async {
+                    let main = task["task_kind"] == "main";
+                    let continuation = if main {
+                        let (config, expected_config) = continuation::codex_identity(
+                            &settings.codex_binary,
+                            &root,
+                            &agent,
+                            &context,
+                        )
+                        .await?;
+                        let prior = state
+                            .store
+                            .lock()
+                            .unwrap()
+                            .prepare_codex_continuation(&task_id, &config)?;
+                        let (thread_id, expected_turn_id) = prior
+                            .map(|(thread, turn)| (Some(thread), Some(turn)))
+                            .unwrap_or_default();
+                        Some(codex::CodexContinuation {
+                            thread_id,
+                            expected_turn_id,
+                            expected_config: Some(expected_config),
+                        })
+                    } else {
+                        None
+                    };
+                    let state_for_lifecycle = state.clone();
+                    let task_for_lifecycle = task_id.clone();
+                    let known_secrets = continuation::known_secrets(&settings);
+                    codex::execute_with_continuation(
+                        &settings.codex_binary,
+                        &agent.model,
+                        &root,
+                        input,
+                        progress,
+                        is_cancelled,
+                        evidence,
+                        continuation,
+                        &known_secrets,
+                        execution_event,
+                        move |update| {
+                            if main {
+                                state_for_lifecycle
+                                    .store
+                                    .lock()
+                                    .unwrap()
+                                    .codex_lifecycle(&task_for_lifecycle, update)?;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .map(|text| redact_secret(&text, &settings.api_key))
+                    .map_err(|error| {
+                        anyhow::anyhow!(redact_secret(&error.to_string(), &settings.api_key))
+                    })
+                }
+                .await
+            }
             _ => Err(anyhow::anyhow!("任务角色使用了不支持的执行器")),
         }
     };

@@ -2,9 +2,10 @@ import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { readFile } from "node:fs/promises";
+import { once } from "node:events";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
-import { allowDevelopmentProxy } from "./src/dev-proxy-policy";
+import { allowDevelopmentProxy, eventProxyPath } from "./src/dev-proxy-policy";
 
 function dataDirectory() {
   if (process.env.HARNESS_DATA_DIR) return process.env.HARNESS_DATA_DIR;
@@ -44,6 +45,12 @@ function daemonProxy(): Plugin {
           );
           return;
         }
+        const streaming = eventProxyPath(req.url);
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        res.once("close", abort);
+        req.once("aborted", abort);
+        const timeout = setTimeout(abort, req.url === "/api/v1/settings/check" ? 35_000 : 15_000);
         try {
           const info = JSON.parse(
             await readFile(join(dataDirectory(), "daemon.json"), "utf8"),
@@ -73,14 +80,35 @@ function daemonProxy(): Plugin {
               "Content-Type": "application/json",
             },
             body: chunks.length ? Buffer.concat(chunks) : undefined,
-            signal: AbortSignal.timeout(req.url === "/api/v1/settings/check" ? 35_000 : 15_000),
+            signal: controller.signal,
             redirect: "error",
           });
           res.statusCode = upstream.status;
-          res.setHeader("Content-Type", "application/json");
           res.setHeader("Cache-Control", "no-store");
-          res.end(await upstream.text());
+          if (streaming && upstream.ok && upstream.body) {
+            if (upstream.headers.get("content-type")?.split(";")[0].trim() !== "text/event-stream") throw new Error("Invalid event stream");
+            clearTimeout(timeout); // SSE stays open until the browser disconnects.
+            res.setHeader("Content-Type", "text/event-stream");
+            res.setHeader("X-Accel-Buffering", "no");
+            res.flushHeaders();
+            const reader = upstream.body.getReader();
+            try {
+              while (!controller.signal.aborted) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!res.write(value)) await once(res, "drain", { signal: controller.signal });
+              }
+            } finally {
+              await reader.cancel().catch(() => {});
+              reader.releaseLock();
+            }
+            res.end();
+          } else {
+            res.setHeader("Content-Type", "application/json");
+            res.end(await upstream.text());
+          }
         } catch {
+          if (res.headersSent || res.destroyed) { res.destroy(); return; }
           res.statusCode = 503;
           res.setHeader("Content-Type", "application/json");
           res.end(
@@ -88,6 +116,11 @@ function daemonProxy(): Plugin {
               error: "后台尚未连接。请先启动 harness-daemon，再重试。",
             }),
           );
+        } finally {
+          clearTimeout(timeout);
+          controller.abort();
+          res.removeListener("close", abort);
+          req.removeListener("aborted", abort);
         }
       });
     },

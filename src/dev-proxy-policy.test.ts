@@ -84,4 +84,13 @@ describe("development proxy boundary", () => {
       ),
     ).toBe(false);
   });
+  it("仅允许带单一安全整数游标的同源事件订阅", () => {
+    for (const path of ["/api/v1/events?after=0", "/api/v1/events?after=42"])
+      expect(allowDevelopmentProxy("GET",path,undefined,"same-origin",undefined)).toBe(true);
+    for (const path of ["/api/v1/events?after=-1", "/api/v1/events?after=1&target=http://example.com", "/api/v1/events?after=1&after=2", "/api/v1/events?after=9007199254740993", "/api/v1/events?after=1%0a", "/api/v1/events?after=01"])
+      expect(allowDevelopmentProxy("GET",path,undefined,"same-origin",undefined)).toBe(false);
+    expect(allowDevelopmentProxy("GET","/api/v1/events?after=0","https://example.com","cross-site",undefined)).toBe(false);
+    expect(allowDevelopmentProxy("POST","/api/v1/events?after=0",undefined,"same-origin","application/json")).toBe(false);
+  });
+
 });

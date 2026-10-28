@@ -314,6 +314,8 @@ pub enum ExecutionEvent {
     Usage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        #[serde(default)]
+        scope: String,
     },
     ContextCompaction {
         state: String,
@@ -351,6 +353,8 @@ pub struct SessionSelection {
 pub struct Snapshot {
     #[serde(default)]
     pub event_cursor: u64,
+    #[serde(default)]
+    pub context_states: Vec<ContextState>,
     pub sessions: Vec<Session>,
     pub tasks: Vec<TaskRun>,
     #[serde(default)]
@@ -361,6 +365,20 @@ pub struct Snapshot {
     pub events: Vec<RunEvent>,
     pub capabilities: Vec<Capability>,
     pub selections: Vec<SessionSelection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextState {
+    pub session_id: String,
+    pub executor: String,
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub covered_messages: Option<usize>,
+    #[serde(default)]
+    pub source_task_id: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

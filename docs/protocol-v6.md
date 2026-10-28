@@ -1,8 +1,8 @@
-# 第七阶段协议：持久事件与 Native 流式首切片
+# 第七阶段协议：持久事件与会话续接
 
-日期：2026-10-28。状态：0.7 开发分支首切片，尚未发布完整 0.7；应用版本号暂仍为 0.6.0。本文描述本分支已实现接口，未列能力继续沿用 [0.6 协议](protocol-v5.md)。
+日期：2026-10-28。状态：0.7 开发分支第二切片，尚未发布完整 0.7；应用版本号暂仍为 0.6.0。本文描述本分支已实现接口，未列能力继续沿用 [0.6 协议](protocol-v5.md)。
 
-本切片贯通共享 Rust 后台、Native 直接任务、HTTP 事件恢复和 CLI 跟随。Codex 通知映射、桌面事件桥、Codex thread 续接及 Native 跨任务摘要复用尚未实现；不能据本文宣称 0.7 P0 已全部完成。
+本分支贯通共享 Rust 后台、Native/Codex 执行事件、桌面和浏览器消费、HTTP 恢复及 CLI 跟随，并新增 Codex 主会话续接和 Native 跨任务摘要。执行中补充、改动面板和上下文估算展示仍待后续切片；没有人工审批界面，也不扩大工具权限。
 
 ## 事件与事实来源
 
@@ -26,8 +26,8 @@ data: {"id":"event-uuid","sequence":42,"session_id":"session-id","task_id":"task
 | `assistant_delta` | `text` | 执行器实际提供的回复增量，不是隐藏推理 |
 | `tool_started` | `call_id`, `name` | 完整工具参数已验证，准备执行 |
 | `tool_finished` | `call_id`, `name`, `success`, `output` | 实际工具结果，输出有界并脱敏 |
-| `usage` | `input_tokens`, `output_tokens` | 上游明确提供的用量，可为 null；不伪装成估算 |
-| `context_compaction` | `state` | 本轮实际压缩状态；不表示摘要已支持跨任务复用 |
+| `usage` | `input_tokens`, `output_tokens`, `scope` | 上游明确提供的用量，可为 null；Native 为 `request`，Codex 为 `thread_total`，累计值不能反复相加 |
+| `context_compaction` | `state` | 实际压缩状态，包括 `reused` 表示已使用校验过的 Native 历史摘要 |
 
 本切片的命令输出随 `tool_finished.output` 和已有命令证据交付，不提供逐字节命令 stdout/stderr 流。工具开始事件不代表工具已成功；失败或取消时，仍应以任务终态与实际证据为准。
 
@@ -73,8 +73,37 @@ self-agent-cli --wait 600 follow TASK_ID
 
 `reset:true` 表示附加或恢复时的权威快照，消费方应替换状态；`reset:false` 为已观察终态后的最终快照。只输出目标任务事件，但记住其他任务的全局游标。daemon 重启时重新读取私有元数据中的本机地址和令牌。成功退出 0，失败、取消、输出失败或超时非零；不输出凭据。
 
+## Codex 事件与主会话续接
+
+协议依据本机 `codex-cli 0.166.0-alpha.1` 生成的 stable app-server JSON schema 核实；不使用标注实验性的 `history` 或不稳定的 `path` 恢复参数。执行器的实际回复、工具始末、累计用量及压缩通知映射到上述事件；按 thread/turn 标识过滤、重复通知去重。工具输出随完成事件提交，不伪造逐字节命令输出或隐藏推理。
+
+- 主任务使用持久 thread，独立子任务继续 `ephemeral:true`。应用会话、角色、规范项目路径、有效模型/服务配置、上下文策略、CLI 路径/版本和本应用权限策略指纹决定复用；指纹只私有保存，不能视为授权。
+- 主任务先只读 `config/read` 与 `account/read(refreshToken:false)` 确认身份，执行进程在任何 thread 操作前再次比较有效配置指纹；指纹包含显式 provider 环境凭据和 `OPENAI_API_KEY` 的内存摘要。不一致直接失败，不向变化后的服务默默发送历史。Codex 自身配置中的静态/环境请求头和令牌同样参与执行输出脱敏，原值不持久化。
+- 首次 `thread/start` 引导应用历史一次；随后 `thread/resume` 只带当前目标。只有上一回合明确成功，应用历史恰好为前次输入加已完成回合，且 thread 处于 idle、权限与项目匹配、`thread/turns/list` 最新完成回合恰好等于保存的 turn ID，才恢复。其他 CLI/应用加入的远端回合会使恢复失败，不默默导入外部未知写入。稳定 `turn/start` 没有 expected-last-turn 原子前置条件，因此同一持久 thread 不得由其他客户端并发写入；此检查不是跨客户端排他锁。额外讨论、角色/模型/执行器或策略变化会使关联失效，保留原历史新建。
+- `thread/resume` 明确返回错误且尚未发送本回合时，允许一次新 thread 引导；进程断线、未知状态、活动回合、ID/权限不符等不按“恢复失败”自动重试。
+- thread ready、发送回合前的 inflight、真实 turn ID 和已完成状态持久化。daemon 重启将未完成关联失效，任务按原规则失败并保留实际文件；不重放可能已写入的回合。
+- 当前稳定 schema 不提供可可靠绑定的 ChatGPT workspace/account ID；email 不当作身份凭据。登录态或未知身份不能确认时，明确降级为新 thread + 完整应用历史，不恢复旧 thread。动态 `auth.command` 或 `gateway_oauth` 身份也不复用。持久恢复仅用于可确认身份的独立自定义服务，属于有意保守的兼容边界，不宣称所有登录模式均原生续接。
+- 成功恢复不保证模型质量；本切片只用本地协议夹具。继承的 MCP/Skills 仍不是本应用可管理权限，不能用 workspace-write 声称约束远端工具。
+
+## Native 摘要持久化
+
+只给直接主任务保存可复用摘要，子任务继续隔离。`session_contexts` 私有记录摘要、原始历史覆盖条数及前缀 SHA-256、生成任务/时间、有效配置和上下文策略指纹。实际凭据只在内存中参与指纹和脱敏，不存入摘要元数据；摘要正文在保存前脱敏，不返回给浏览器。
+
+- 仅当前任务第一次工具执行前、覆盖完整已知历史的有效压缩结果可持久保存；当前任务的中间工具循环压缩不成为下一任务的缓存。原始消息、结果及命令证据不删除。
+- 后续请求为“已验证摘要 + 覆盖边界外的全部原始消息 + 当前目标”。包括取消/失败任务与额外讨论形成的后缀，不能只保留成功回复或漏掉最近消息。
+- 覆盖指纹不符、模型/服务/项目/角色/权限或上下文策略变化、切换执行器时失效，回退完整历史重新处理；保存失败或取消不冒充已更新缓存。有效摘要可以随数据库重启恢复。
+- 快照新增 `context_states`，公开 `{session_id,executor,state,reason,covered_messages,source_task_id,updated_at}`。Native 状态包括 empty/available/invalidated，Codex 包括 ready/inflight/idle/invalidated；不公开 thread ID、摘要正文、配置指纹或凭据。`source_task_id` 在摘要复用时仍指向真实生成任务。当前压缩进度/失败同时保留在任务事件和终态中，旧摘要可用不等于最近任务成功。
+
+## 桌面与浏览器事件消费
+
+Tauri 使用 Rust 私有桥 `start_event_stream({subscriptionId,after,channel})`、`ack_event_stream({subscriptionId,deliveryId})` 与 `stop_event_stream({subscriptionId})`。Channel 交付 event、snapshot(reset) 或 status 消息，每条有进程内递增 delivery_id；每窗口/订阅维护生命周期，旧 ACK 不释放新订阅额度。单帧最多 512 KiB、权威快照最多 16 MiB，最多 64 条未确认消息及 32 MiB 队列，超过边界停止连接并恢复，不阻塞 daemon；关闭窗口/组件时中止网络读取。
+
+桥只读取本机私有元数据、禁止重定向、重启重读地址/令牌。令牌不交给 JS。浏览器开发预览走原有 Vite 受控同源代理，只允许严格的 `/events?after=<安全整数>`，断开时关闭上游，错误保留 409 恢复语义。
+
+前端以序号去重并有界保留快照请求期间的新事件，避免旧轮询快照覆盖新输出；恢复快照替换而非拼接。慢消费者/缓存超过边界重新取权威快照。1.5 秒快照轮询保留为状态刷新兜底，回复和工具过程由真实事件实时驱动；工具面板最多最近 30 条，明确开始不代表成功，服务用量与估算不混淆。
+
 ## 验证与剩余切片
 
-默认验证只使用本地 HTTP / stdio 夹具，不调用真实模型。新增 `scripts/streaming_smoke.py` 并加入三平台 CI；覆盖中文、分片工具、实时增量、游标回放、取消、错误无副作用、凭据脱敏、CLI、重启和既有文件保留。单元测试覆盖迁移、事务回滚、保留窗口和重复终态。
+默认只使用本地 HTTP/stdio 夹具，不调用真实模型。`streaming_smoke.py` 覆盖字节分片、完整工具、恢复、取消、凭据脱敏及 CLI；`continuation_smoke.py` 覆盖至少三轮、重启续接、摘要后缀、配置失效、隔离与未知写入不重放；`web_stream_smoke.py` 覆盖真实代理流式与鉴权边界。Codex 可执行夹具在 Unix 运行，Windows 明确跳过该部分但继续 Native 场景。
 
-后续依次完成：Codex/桌面统一事件消费 → 执行器会话关联及恢复语义 → Codex thread 续接与 Native 摘要复用 → 0.7 P1。真实模型、桌面原生 GUI、跨平台结果必须分别记录，不能用本机夹具结果替代。
+后续补齐上下文占用/阈值估算展示、执行中补充、停止后继续与改动面板，并进行完整 0.7 验收。真实模型、原生 GUI 和跨平台结果分别记录；schema 探测不等于真实模型执行验证，单机无头结果不代替视觉验收。

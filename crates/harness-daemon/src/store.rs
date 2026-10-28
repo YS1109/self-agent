@@ -11,6 +11,8 @@ use crate::{
     Settings,
 };
 
+mod continuation;
+
 const MAX_NODES: usize = 12;
 const MAX_ROUNDS: u64 = 3;
 const MAX_ACTIVE_TASKS: usize = 32;
@@ -41,6 +43,9 @@ impl Store {
              CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, task_id TEXT UNIQUE NOT NULL, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS settings(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
+        )?;
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_contexts(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
         )?;
         // One atomic migration preserves legacy UUIDs and insertion order. An
         // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
@@ -111,6 +116,16 @@ impl Store {
 
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
+        for mut state in rows(&tx, "session_contexts")? {
+            if state["executor"] == "codex"
+                && matches!(state["state"].as_str(), Some("inflight" | "ready"))
+            {
+                state["state"] = json!("invalidated");
+                state["reason"] = json!("后台重启时回合结果未知；保留历史，未自动重放写入");
+                state["updated_at"] = json!(now());
+                put(&tx, "session_contexts", &state)?;
+            }
+        }
         // Existing databases predate roles; migrate them to the original native role.
         for mut plan in rows(&tx, "plans")? {
             if plan.get("agents").is_none() {
@@ -191,6 +206,7 @@ impl Store {
         Ok(json!({
             "sessions":sessions, "tasks":tasks, "plans":plans, "events":events,
             "event_cursor":event_cursor,
+            "context_states":self.public_context_states()?,
             "plan_changes":rows(&self.db,"plan_changes")?,
             "deliveries":rows(&self.db,"deliveries")?, "selections":rows(&self.db,"selections")?,
             "capabilities":[
@@ -1530,6 +1546,7 @@ fn terminal_steps(task: &mut Value, success: bool) {
 fn complete_transaction(tx: &Transaction<'_>, task: &mut Value) -> Result<RunEvent> {
     task["updated_at"] = json!(now());
     put(tx, "tasks", task)?;
+    continuation::complete_context_transaction(tx, task)?;
     sync_task_node(tx, task)?;
     let task_id = text(task, "id")?;
     let session_id = text(task, "session_id")?;
@@ -2442,6 +2459,310 @@ fn apply_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_summaries_reuse_verified_prefix_and_preserve_later_results() {
+        use crate::continuation::{fingerprint, NativeSummary};
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let first = send(&mut store, json!({"type":"run_agent","content":"FIRST"}));
+        store.claim_task().unwrap();
+        store
+            .finish(
+                first["task_id"].as_str().unwrap(),
+                Ok("FIRST_RESULT".into()),
+            )
+            .unwrap();
+        let second = send(&mut store, json!({"type":"run_agent","content":"SECOND"}));
+        let second_id = second["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        assert!(store
+            .prepare_native_summary(second_id, "config-a")
+            .unwrap()
+            .is_none());
+        let history = store.execution_history(second_id).unwrap();
+        store
+            .save_native_summary(
+                second_id,
+                "config-a",
+                NativeSummary {
+                    summary: "FIRST 的真实结果已保存".into(),
+                    covered_messages: history.len(),
+                    prefix_fingerprint: fingerprint(&json!(history)),
+                },
+            )
+            .unwrap();
+        store.finish(second_id, Ok("SECOND_RESULT".into())).unwrap();
+        let third = send(&mut store, json!({"type":"run_agent","content":"THIRD"}));
+        let third_id = third["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        let summary = store
+            .prepare_native_summary(third_id, "config-a")
+            .unwrap()
+            .unwrap();
+        let history = store.execution_history(third_id).unwrap();
+        assert_eq!(summary.covered_messages, 2);
+        let snapshot = store.snapshot().unwrap();
+        let context = snapshot["context_states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["executor"] == "native")
+            .unwrap();
+        assert_eq!(context["source_task_id"], second_id);
+        assert_ne!(context["source_task_id"], third_id);
+        assert_eq!(history[2]["content"], "SECOND");
+        assert_eq!(history[3]["content"], "SECOND_RESULT");
+        assert!(store
+            .prepare_native_summary(third_id, "different-model")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .save_native_summary(third_id, "config-a", summary.clone())
+            .is_err());
+        send(&mut store, json!({"type":"cancel_task","task_id":third_id}));
+        assert!(store
+            .save_native_summary(
+                third_id,
+                "different-model",
+                NativeSummary {
+                    summary: "迟到摘要".into(),
+                    covered_messages: history.len(),
+                    prefix_fingerprint: fingerprint(&json!(history)),
+                }
+            )
+            .is_err());
+        let fourth = send(
+            &mut store,
+            json!({"type":"run_agent","content":"AFTER_CANCEL"}),
+        );
+        let history = store
+            .execution_history(fourth["task_id"].as_str().unwrap())
+            .unwrap();
+        assert!(history.iter().any(|message| message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("用户已取消"))));
+    }
+
+    fn codex_main(store: &mut Store, goal: &str) -> String {
+        let mut settings = config();
+        settings.main_executor = "codex".into();
+        let receipt = send_with(store, json!({"type":"run_agent","content":goal}), &settings);
+        store.claim_task().unwrap().unwrap();
+        receipt["task_id"].as_str().unwrap().into()
+    }
+
+    fn complete_codex_round(store: &mut Store, task: &str, thread: &str, turn: &str, result: &str) {
+        use crate::codex::CodexLifecycle as L;
+        store
+            .codex_lifecycle(
+                task,
+                L::ThreadReady {
+                    thread_id: thread.into(),
+                },
+            )
+            .unwrap();
+        store
+            .codex_lifecycle(
+                task,
+                L::TurnStarting {
+                    thread_id: thread.into(),
+                },
+            )
+            .unwrap();
+        store
+            .codex_lifecycle(
+                task,
+                L::TurnStarted {
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                },
+            )
+            .unwrap();
+        store
+            .codex_lifecycle(
+                task,
+                L::TurnCompleted {
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                },
+            )
+            .unwrap();
+        store.finish(task, Ok(result.into())).unwrap();
+    }
+
+    #[test]
+    fn codex_association_resumes_three_rounds_but_invalidates_policy_or_foreign_history() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        for n in 1..=3 {
+            let task = codex_main(&mut store, &format!("ROUND{n}"));
+            let prior = store
+                .prepare_codex_continuation(&task, "same-config")
+                .unwrap();
+            assert_eq!(
+                prior,
+                (n > 1).then(|| ("thread-one".into(), format!("turn-{}", n - 1)))
+            );
+            complete_codex_round(
+                &mut store,
+                &task,
+                "thread-one",
+                &format!("turn-{n}"),
+                &format!("RESULT{n}"),
+            );
+        }
+        send(
+            &mut store,
+            json!({"type":"send_message","content":"外部讨论的新要求"}),
+        );
+        let task = codex_main(&mut store, "ROUND4");
+        assert!(store
+            .prepare_codex_continuation(&task, "same-config")
+            .unwrap()
+            .is_none());
+        complete_codex_round(&mut store, &task, "thread-two", "turn-four", "RESULT4");
+        let task = codex_main(&mut store, "ROUND5");
+        assert!(store
+            .prepare_codex_continuation(&task, "new-provider")
+            .unwrap()
+            .is_none());
+        let public = store.snapshot().unwrap()["context_states"].to_string();
+        assert!(!public.contains("new-provider"));
+        assert!(!public.contains("thread-one"));
+        assert!(!public.contains("history_fingerprint"));
+    }
+
+    #[test]
+    fn codex_completed_round_survives_restart_unknown_round_is_never_replayed() {
+        use crate::codex::CodexLifecycle as L;
+        let path = std::env::temp_dir().join(format!("self-agent-context-{}.sqlite", new_id()));
+        let mut store = Store::open(&path).unwrap();
+        session(&mut store);
+        let first = codex_main(&mut store, "FIRST");
+        store.prepare_codex_continuation(&first, "config").unwrap();
+        complete_codex_round(
+            &mut store,
+            &first,
+            "persistent-thread",
+            "turn1",
+            "FIRST_RESULT",
+        );
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        let second = codex_main(&mut store, "SECOND");
+        assert_eq!(
+            store.prepare_codex_continuation(&second, "config").unwrap(),
+            Some(("persistent-thread".into(), "turn1".into()))
+        );
+        store
+            .codex_lifecycle(
+                &second,
+                L::ThreadReady {
+                    thread_id: "persistent-thread".into(),
+                },
+            )
+            .unwrap();
+        store
+            .codex_lifecycle(
+                &second,
+                L::TurnStarting {
+                    thread_id: "persistent-thread".into(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(
+            record(&store.db, "tasks", &second).unwrap()["status"],
+            "failed"
+        );
+        let third = codex_main(&mut store, "THIRD");
+        assert!(store
+            .prepare_codex_continuation(&third, "config")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .codex_lifecycle(
+                &second,
+                L::TurnCompleted {
+                    thread_id: "persistent-thread".into(),
+                    turn_id: "late".into()
+                }
+            )
+            .is_err());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_summary_survives_restart_and_does_not_cross_sessions_or_executors() {
+        use crate::continuation::{fingerprint, NativeSummary};
+        let path = std::env::temp_dir().join(format!("self-agent-summary-{}.sqlite", new_id()));
+        let mut store = Store::open(&path).unwrap();
+        let session_id = session(&mut store);
+        let first = send(&mut store, json!({"type":"run_agent","content":"FIRST"}));
+        store.claim_task().unwrap();
+        store
+            .finish(first["task_id"].as_str().unwrap(), Ok("REAL_RESULT".into()))
+            .unwrap();
+        let second = send(&mut store, json!({"type":"run_agent","content":"SECOND"}));
+        let id = second["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        store.prepare_native_summary(id, "native-config").unwrap();
+        let history = store.execution_history(id).unwrap();
+        store
+            .save_native_summary(
+                id,
+                "native-config",
+                NativeSummary {
+                    summary: "摘要 REAL_RESULT".into(),
+                    covered_messages: history.len(),
+                    prefix_fingerprint: fingerprint(&json!(history)),
+                },
+            )
+            .unwrap();
+        store.finish(id, Ok("SECOND_RESULT".into())).unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        let third = send(
+            &mut store,
+            json!({"type":"run_agent","session_id":session_id,"content":"THIRD"}),
+        );
+        let id = third["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        assert!(store
+            .prepare_native_summary(id, "native-config")
+            .unwrap()
+            .is_some());
+        store.finish(id, Ok("THIRD_RESULT".into())).unwrap();
+        let codex = codex_main(&mut store, "SWITCH_CODEX");
+        store
+            .prepare_codex_continuation(&codex, "codex-config")
+            .unwrap();
+        complete_codex_round(&mut store, &codex, "new-thread", "turn", "CODEX_RESULT");
+        let fourth = send(
+            &mut store,
+            json!({"type":"run_agent","content":"BACK_NATIVE"}),
+        );
+        let id = fourth["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        assert!(store
+            .prepare_native_summary(id, "native-config")
+            .unwrap()
+            .is_none());
+        store.finish(id, Ok("FOURTH_RESULT".into())).unwrap();
+        session(&mut store);
+        let other = send(&mut store, json!({"type":"run_agent","content":"ISOLATED"}));
+        let id = other["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        assert!(store
+            .prepare_native_summary(id, "native-config")
+            .unwrap()
+            .is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn legacy_events_migrate_in_order_and_cursors_survive_restart() {

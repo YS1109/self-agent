@@ -1,6 +1,6 @@
 # Self Agent 0.7 开发交接
 
-更新日期：2026-10-28。交接性质：0.6 基线与 0.7 分切片开发记录；Native/HTTP/CLI 首切片已实现，未发布完整 0.7。
+更新日期：2026-10-28。交接性质：0.6 基线与 0.7 分切片开发记录；事件消费与执行器续接切片已实现，未发布完整 0.7。
 
 ## 接手先读
 
@@ -62,16 +62,16 @@
 | `crates/harness-daemon/src/lib.rs` | HTTP 路由、SSE 广播、worker、直接主任务执行和终态 |
 | `crates/harness-daemon/src/store.rs` | SQLite、幂等指令、主任务顺序、历史、计划、回调与重启恢复 |
 | `crates/harness-daemon/src/codex.rs` | stdio 生命周期、thread / turn、通知解析、中断与进程树回收 |
-| `crates/harness-daemon/src/provider.rs` | Native 工具循环、非流式请求、实际压缩与取消 |
+| `crates/harness-daemon/src/provider.rs` | Native 流式工具循环、持久摘要边界与取消 |
 | `crates/harness-daemon/src/context.rs` | token 估算、保留工具组、压缩边界和历史拼接 |
 | `crates/harness-daemon/src/coordinator.rs` | 远程规划和回顾；不要把它重新设为桌面直接主任务必经入口 |
 | `crates/harness-daemon/src/configuration.rs`、`model_config.rs`、`profiles.rs` | 模型来源、检测、上下文继承与角色快照 |
 | `crates/harness-cli/src/main.rs` | 本机鉴权、JSON 命令、轮询等待及退出码 |
-| `src/App.tsx`、`src/api.ts`、`src/types.ts` | 当前快照轮询、聊天、发送入口及前端协议 |
-| `src-tauri/src/bridge.rs` | 后台启动与版本检查、受控请求白名单；目前不提供事件流桥 |
+| `src/App.tsx`、`src/api.ts`、`src/types.ts` | 快照与事件消费、聊天、发送入口及前端协议 |
+| `src-tauri/src/bridge.rs` | 后台启动与版本检查、受控请求；event_stream.rs 提供私有 SSE/Channel 桥 |
 | `src/components/execution-evidence.tsx`、`src/styles.css` | 执行证据和现有视觉语言，可在此基础上接入过程及更改展示 |
 | `scripts/codex_fixture.py`、`scripts/headless_smoke.py` | 协议和会话历史夹具，适合扩展恢复与流式回归 |
-| `.github/workflows/ci.yml` | 三平台后台与桌面检查及八组 smoke |
+| `.github/workflows/ci.yml` | 三平台后台、桌面、原八组与新增流式/续接/代理 smoke |
 
 新增模块可以从现有大文件拆分；先明确接口边界，避免与行为修改混在一次大规模重写中。
 
@@ -80,14 +80,17 @@
 - 分支：`codex/v0.7-native-events`，从干净的 `5b1e541798d99a4c731b6892b6a30bf9dc9f121b` 起步，未覆盖其他设备的用户修改。
 - 已完成 Native 直接任务的回复增量、工具始末、用量/压缩事件、持久日志、SSE 断线回放与 CLI 跟随；新协议为 `protocol-v6.md`。
 - 旧事件迁移、终态事务、迟到输出、保留窗口、跨分片脱敏和工具禁止重放都有回归；新增 `scripts/streaming_smoke.py`。
-- 后续先接 Codex/桌面事件，再完成 Codex thread 恢复与 Native 摘要复用；本分支当前不能称 0.7 P0 全部完成。
+- 第二切片新增 Codex 事件/主 thread 持久续接、Native 跨任务摘要及桌面/浏览器流消费；配置指纹、历史边界、未知写入和有界 ACK 均有回归。上下文估算展示、P1 和完整 GUI 验收仍待完成。
+- 首切片发布 SHA `bb0b7e08fa2d94f498c9b428206f8aebcab05273`，草稿 PR #1；push CI `40721056695` / PR CI `40721141000` 均六项成功。后续 SHA 不沿用该结果。
 - 本切片本机验证：core 5、daemon 113、CLI 15、前端 68 项测试通过；原八组 smoke、新增八组流式场景、格式、Clippy、后台/CLI 与 Web 构建通过。用户限定模拟模型；真实模型、桌面 GUI 未测，三平台 CI 按远端提交另记，不复制旧版记录。
+
+第二切片本机冻结验证：core 5、daemon 148、CLI 15、前端 87、Rust 事件桥 7 项通过；原八组回归、流式八组、续接八组和 HTTP 代理三组场景通过；格式、全目标 Clippy、后台/CLI/Web 构建通过。仅模拟模型；本机 Tauri 系统库缺失、Chromium socket 沙箱阻止 GUI 验收，未绕过限制。ChatGPT 身份不能可靠绑定时目前明确新 thread 导入历史，原生 thread 续接限已验证身份的自定义服务；仍属于待完善的 P0 兼容边界，不能称完整 0.7 已完成。提交后按远端 SHA 追踪三平台 CI。
 
 ## 0.7 第一个开发切片
 
 先完成统一事件的协议与持久化设计，再打通一个 Native 直接任务的“回复增量、工具执行、终态、断线恢复、CLI 跟随”，之后接入 Codex 和桌面。并行推进会话恢复前，先确定事件 ID、顺序及执行器会话关联的共享类型，避免多人改同一文件。
 
-P0 验收后再做执行中补充和改动面板；具体要求见迭代计划。0.8 以后顺序见路线图，首个通讯平台、网关托管、独立 App 及签名账号尚待用户决定。
+下一切片补上下文估算、执行中补充和改动面板；具体要求见迭代计划。0.8 以后顺序见路线图，QQ/H5/用户自部署已确认；签名与公开发布仍未授权。
 
 Codex 的恢复、注入和通知协议必须依据实施时安装版本的 schema 或官方文档核实，并用夹具及隔离真实任务分别验证。不要仅因某个方法名看似合理就写死协议。
 
@@ -115,6 +118,8 @@ python3 scripts/runtime_smoke.py
 python3 scripts/plan_change_smoke.py
 python3 scripts/headless_smoke.py
 python3 scripts/streaming_smoke.py
+python3 scripts/continuation_smoke.py
+python3 scripts/web_stream_smoke.py
 ```
 
 按实际改动增加有行为价值的回归；桌面构建入口为 `pnpm desktop:build`。完整门禁与平台依赖以 CI 和 README 为准。真实模型选项单独运行，记录消耗及验证范围，不混入默认测试。

@@ -1,17 +1,20 @@
+use crate::event_stream::{self, Sink, Subscriptions};
 use harness_core::{data_dir, DaemonInfo};
 use reqwest::{Client, Method, Url};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     time::Duration,
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{ipc::Channel, AppHandle, Manager, State, WebviewWindow};
 use tokio::sync::Mutex;
 
 pub struct Bridge {
     client: Client,
     startup: Mutex<()>,
+    subscriptions: Arc<Subscriptions>,
 }
 
 impl Bridge {
@@ -25,6 +28,7 @@ impl Bridge {
                 .build()
                 .expect("无法创建本机服务客户端"),
             startup: Mutex::new(()),
+            subscriptions: Arc::new(Subscriptions::default()),
         }
     }
 
@@ -77,6 +81,75 @@ impl Bridge {
         }
         Ok(health["status"] == "ok")
     }
+}
+
+impl Bridge {
+    pub fn stop_window(&self, label: &str) {
+        self.subscriptions.stop_window(label);
+    }
+}
+
+#[tauri::command]
+pub async fn start_event_stream(
+    app: AppHandle,
+    window: WebviewWindow,
+    bridge: State<'_, Bridge>,
+    subscription_id: String,
+    after: Option<u64>,
+    channel: Channel<Value>,
+) -> Result<(), String> {
+    if after.is_some_and(|cursor| cursor > i64::MAX as u64) {
+        return Err("事件游标超出范围".into());
+    }
+    let label = window.label().to_owned();
+    let mut subscription = bridge.subscriptions.start(&label, &subscription_id)?;
+    let generation = subscription.generation;
+    let registry = bridge.subscriptions.clone();
+    tauri::async_runtime::spawn(async move {
+        let send_registry = registry.clone();
+        let send_label = label.clone();
+        let send_id = subscription_id.clone();
+        let mut sink = Sink::new(subscription.credits, move |value| {
+            send_registry.send(&send_label, &send_id, generation, || {
+                channel.send(value).is_ok()
+            })
+        });
+        tokio::select! {
+            biased;
+            _ = subscription.cancel.changed() => {},
+            _ = async {
+                // Keep the existing daemon version check; do not silently stream
+                // from a known incompatible daemon after ensure_daemon rejects it.
+                match app.state::<Bridge>().ensure_daemon(&app).await {
+                    Ok(_) => event_stream::run(&data_dir().join("daemon.json"), after, sink).await,
+                    Err(message) => { sink.status("error", &message); }
+                }
+            } => {},
+        }
+        registry.finish(&label, &subscription_id, generation);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn stop_event_stream(
+    window: WebviewWindow,
+    bridge: State<'_, Bridge>,
+    subscription_id: String,
+) {
+    bridge.subscriptions.stop(window.label(), &subscription_id);
+}
+
+#[tauri::command]
+pub fn ack_event_stream(
+    window: WebviewWindow,
+    bridge: State<'_, Bridge>,
+    subscription_id: String,
+    delivery_id: u64,
+) {
+    bridge
+        .subscriptions
+        .acknowledge(window.label(), &subscription_id, delivery_id);
 }
 
 #[tauri::command]
@@ -135,19 +208,7 @@ async fn read_daemon_info() -> Result<DaemonInfo, String> {
 }
 
 fn validate_base_url(base_url: &str) -> Result<Url, String> {
-    let url = Url::parse(base_url).map_err(|_| "本机服务地址无效".to_string())?;
-    if url.scheme() != "http"
-        || url.host_str() != Some("127.0.0.1")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.port_or_known_default() == Some(0)
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("本机服务必须使用 HTTP 回环地址".into());
-    }
-    Ok(url)
+    event_stream::validate_base_url(base_url)
 }
 
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {

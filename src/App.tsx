@@ -46,6 +46,8 @@ import {
   Zap,
 } from "lucide-react";
 import { api, dispatch } from "./api";
+import { useDaemonSnapshot } from "./use-daemon-snapshot";
+import { LiveTaskMessage, ToolActivity, TaskUsage } from "./components/task-stream";
 import { PlanPanel } from "./components/plan-panel";
 import { PlanChanges } from "./components/plan-changes";
 import { ExecutionEvidence } from "./components/execution-evidence";
@@ -64,12 +66,10 @@ import { discardCleanPlanDraft, hasUnsavedPlanDraft, selectedSessionPlan, update
 import {
   activeTask,
   DESKTOP_SOURCE,
-  EMPTY_SNAPSHOT,
   REMOTE_SOURCE,
   sameSource,
   type Command,
   type Settings,
-  type Snapshot,
   type SourceContext,
   type TaskRun,
 } from "./types";
@@ -194,10 +194,7 @@ function EmptyPanel({
 }
 
 export default function App() {
-  const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
-  const [connected, setConnected] = useState(false);
-  const [checked, setChecked] = useState(false);
-  const [connectionError, setConnectionError] = useState("");
+  const { snapshot, connected, checked, connectionError, eventStatus, refresh } = useDaemonSnapshot();
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState<Modal>(null);
@@ -244,6 +241,7 @@ export default function App() {
     useState<SourceContext>(REMOTE_SOURCE);
   const [remoteReceipt, setRemoteReceipt] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const followScroll = useRef(true);
   const sessionId = snapshot.selections.find((s) =>
     sameSource(s.source, DESKTOP_SOURCE),
   )?.session_id;
@@ -274,33 +272,6 @@ export default function App() {
   const currentRemoteText = remoteDrafts[remoteKey] ?? "";
   const changeable = (status?: string) => !!status && ["draft", "running", "paused", "reviewing", "waiting_input"].includes(status);
 
-  async function refresh() {
-    try {
-      const value = await api<Snapshot>("GET", "/snapshot");
-      setSnapshot({ ...value, plans: value.plans ?? [], plan_changes: value.plan_changes ?? [] });
-      setConnected(true);
-      setConnectionError("");
-    } catch (error) {
-      setConnected(false);
-      setConnectionError(errorMessage(error));
-    } finally {
-      setChecked(true);
-    }
-  }
-  useEffect(() => {
-    let alive = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      if (!alive) return;
-      await refresh();
-      if (alive) timer = setTimeout(poll, 1500);
-    };
-    void poll();
-    return () => {
-      alive = false;
-      clearTimeout(timer);
-    };
-  }, []);
   useEffect(() => {
     if (connected)
       api<Settings>("GET", "/settings")
@@ -344,6 +315,10 @@ export default function App() {
         behavior: "smooth",
       });
   }, [sessionId, session?.messages.length, tasks.length]);
+  const liveTextLength = tasks.filter(task => activeTask(task.status)).reduce((length, task) => length + (task.stream_output?.length ?? 0), 0);
+  useEffect(() => {
+    if (followScroll.current && scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [liveTextLength]);
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key === "n") {
@@ -667,7 +642,10 @@ export default function App() {
         )}
         <div className="main-content">
           <div className="conversation">
-            <div className="conversation-scroll" ref={scrollRef}>
+            <div className="conversation-scroll" ref={scrollRef} onScroll={() => {
+              const area = scrollRef.current;
+              if (area) followScroll.current = area.scrollHeight - area.scrollTop - area.clientHeight < 100;
+            }}>
               {!session ? (
                 <section className="welcome">
                   <div className="welcome-emblem">
@@ -771,9 +749,13 @@ export default function App() {
                           )}
                         </div>
                         <div className="message-text">{message.role === "user" ? message.content : localizeSystemText(message.content)}</div>
+                        {message.role === "assistant" && message.task_id && <ToolActivity task={tasks.find(task => task.id === message.task_id)} events={snapshot.events} />}
                       </div>
                     </article>
                   ))}
+                  {tasks.filter(task => task.task_kind === "main" && (task.stream_output || task.status === "running")
+                    && !session.messages.some(message => message.role === "assistant" && message.task_id === task.id))
+                    .slice().reverse().map(task => <LiveTaskMessage key={`stream-${task.id}`} task={task} events={snapshot.events} />)}
                   {plans.length > 0 && (
                     <section className="tasks-section">
                       <div className="section-label"><Network size={13} />编排计划<span>{plans.length}</span></div>
@@ -822,6 +804,7 @@ export default function App() {
                     : "准备就绪，随时开始"}
                 </span>
                 {running.length > 0 && <span>主智能体 仍可接收指令</span>}
+                {connected && <span className={`event-connection event-connection-${eventStatus}`} title={eventStatus === "connected" ? "通过持久事件实时更新；断线后自动补发。" : "实时事件暂未连接，仍定期读取权威快照。"}>{eventStatus === "connected" ? "实时更新" : eventStatus === "error" ? "快照更新 · 事件桥暂不可用" : "快照更新 · 正在连接事件"}</span>}
               </div>
               <div
                 className={`composer ${!session ? "composer-inactive" : ""}`}
@@ -965,6 +948,13 @@ export default function App() {
                     <code>{selectedTask.id.slice(0, 8)}</code>
                   </div>
                   {selectedTask.agent && <p className="task-model-preset">模型预设：{agentModelLabel(selectedTask.agent)}</p>}
+                  {(snapshot.context_states ?? []).filter(item => item.session_id === selectedTask.session_id).map(item => (
+                    <div className="context-state" key={item.executor}>
+                      <strong>{item.executor === "native" ? "Native 摘要" : "Codex 会话"} · {({empty:"尚无摘要",available:"可复用",invalidated:"已失效",ready:"已关联",inflight:"回合执行中",idle:"可续接"} as Record<string,string>)[item.state] ?? "状态待确认"}</strong>
+                      {item.reason && <p>{item.reason}</p>}
+                      {item.executor === "native" && item.covered_messages != null && <p>覆盖 {item.covered_messages} 条历史消息；这不是精确 token 计数。</p>}
+                    </div>
+                  ))}
                   <div className="detail-divider" />
                   <div className="section-label">执行步骤</div>
                   <div className="step-list">
@@ -1001,6 +991,15 @@ export default function App() {
                       </pre>
                     </div>
                   )}
+                  {selectedTask.stream_output && (
+                    <details className="task-stream-detail" open={activeTask(selectedTask.status)}>
+                      <summary>{activeTask(selectedTask.status) ? "实时回复" : "执行过程回复"}</summary>
+                      <pre>{selectedTask.stream_output}</pre>
+                      {selectedTask.stream_output_truncated && <p className="help-text">过程回复已达到保留上限；最终结果与真实命令记录仍可查看。</p>}
+                    </details>
+                  )}
+                  <ToolActivity task={selectedTask} events={snapshot.events} />
+                  <TaskUsage taskId={selectedTask.id} events={snapshot.events} />
                   <ExecutionEvidence evidence={selectedTask.evidence} />
                   <div className="detail-divider" />
                   <div className="section-label">指令来源 / 回传位置</div>

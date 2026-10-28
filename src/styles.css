@@ -3001,3 +3001,24 @@ textarea {
   .instruction-scope { gap: 7px; }
   .instruction-scope .select-trigger { max-width: 170px; }
 }
+
+/* 持久化事件：实际回复与工具记录，不展示推测的思考过程。 */
+.event-connection { color: var(--secondary); font-size: 12px; margin-left: auto; }
+.event-connection-connected { color: var(--accent); }
+.message-stream .message-text { border-color: var(--accent-light); }
+.tool-activity { font-size: 13px; color: var(--secondary); margin-top: 12px; min-width: 0; }
+.tool-activity > summary { cursor: pointer; color: var(--ink); display: flex; align-items: center; gap: 7px; }
+.tool-activity > p { margin: 9px 0; line-height: 1.7; }
+.tool-activity-item { border: 1px solid var(--line); border-radius: 6px; padding: 9px 11px; margin: 7px 0; }
+.tool-activity-item > summary { cursor: pointer; display: flex; justify-content: space-between; gap: 12px; overflow-wrap: anywhere; }
+.tool-activity-item > summary > span:last-child { color: var(--accent); flex-shrink: 0; }
+.tool-failed > summary > span:last-child { color: var(--danger); }
+.tool-interrupted > summary > span:last-child { color: var(--secondary); }
+.tool-activity-item pre, .task-stream-detail pre { max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75; font-size: 13px; margin-top: 9px; }
+.task-stream-detail { margin-top: 15px; font-size: 14px; }
+.task-stream-detail summary { cursor: pointer; color: var(--ink); }
+@media (max-width: 760px) { .composer-context { flex-wrap: wrap; } .event-connection { margin-left: 0; } }
+.context-state { border-left: 2px solid var(--accent); padding: 8px 10px; margin-top: 13px; font-size: 13px; line-height: 1.7; color: var(--secondary); }
+.context-state strong { color: var(--ink); font-weight: 500; }
+.context-state p { margin-top: 4px; overflow-wrap: anywhere; }
+.task-usage { margin-top: 9px; color: var(--secondary); font-size: 12px; line-height: 1.7; }

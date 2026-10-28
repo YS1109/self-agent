@@ -16,6 +16,12 @@ export const STATUS: Record<string, string> = {
   sent: "已送达",
 };
 const EVENT_LABELS: Record<string, string> = {
+  assistant_delta: "回复增量",
+  tool_started: "工具开始",
+  tool_finished: "工具结果",
+  command_output: "命令输出",
+  usage: "服务用量",
+  context_compaction: "上下文压缩",
   session_created: "会话已创建",
   session_selected: "会话已切换",
   message_received: "指令已接收",

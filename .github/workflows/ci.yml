@@ -37,6 +37,7 @@ jobs:
       - run: python scripts/plan_change_smoke.py
       - run: python scripts/headless_smoke.py
       - run: python scripts/streaming_smoke.py
+      - run: python scripts/continuation_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}
@@ -64,5 +65,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: pnpm build:web
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/web_stream_smoke.py
       - run: node scripts/prepare-sidecar.mjs
       - run: cargo check -p self-agent-desktop
+      - run: cargo test -p self-agent-desktop --lib

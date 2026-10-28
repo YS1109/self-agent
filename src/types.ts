@@ -131,7 +131,7 @@ export type ExecutionEvent =
   | { kind: "assistant_delta"; text: string }
   | { kind: "tool_started"; call_id: string; name: string }
   | { kind: "tool_finished"; call_id: string; name: string; success: boolean; output: string }
-  | { kind: "usage"; input_tokens: number | null; output_tokens: number | null }
+  | { kind: "usage"; input_tokens: number | null; output_tokens: number | null; scope?: string }
   | { kind: "context_compaction"; state: string };
 export interface RunEvent {
   id: string;
@@ -150,7 +150,17 @@ export interface Capability {
   description: string;
   enabled: boolean;
 }
+export interface ContextState {
+  session_id: string;
+  executor: "native" | "codex";
+  state: string;
+  reason: string;
+  covered_messages: number | null;
+  source_task_id: string;
+  updated_at: string;
+}
 export interface Snapshot {
+  context_states?: ContextState[];
   event_cursor?: number;
   sessions: Session[];
   tasks: TaskRun[];

@@ -14,6 +14,11 @@ const routes: Record<string, string> = {
   "PUT /api/v1/settings": "PUT",
 };
 
+export function eventProxyPath(path: string): boolean {
+  const match = /^\/api\/v1\/events\?after=(0|[1-9]\d*)$/.exec(path);
+  return !!match && Number.isSafeInteger(Number(match[1]));
+}
+
 export function allowDevelopmentProxy(
   method: string,
   path: string,
@@ -21,7 +26,7 @@ export function allowDevelopmentProxy(
   fetchSite: string | undefined,
   contentType: string | undefined,
 ): boolean {
-  if (!Object.hasOwn(routes, `${method} ${path}`)) return false;
+  if (!Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && eventProxyPath(path))) return false;
   if (fetchSite === "cross-site") return false;
   if (origin && !localOrigins.has(origin)) return false;
   return (
