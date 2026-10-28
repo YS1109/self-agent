@@ -81,4 +81,18 @@ describe("private daemon transport", () => {
       }),
     ).toBe(false);
   });
+
+  it("桌面主智能体指令保持独立会话，远程编排协议继续可用", async () => {
+    vi.stubGlobal("window", {});
+    const fetcher = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ status: "accepted", task_id: "main-task" }) });
+    vi.stubGlobal("fetch", fetcher);
+    await dispatch(DESKTOP_SOURCE, { type: "run_agent", session_id: "session-a", content: "继续修复并测试" });
+    await dispatch(REMOTE_SOURCE, { type: "send_message", session_id: "session-b", content: "规划远程任务" });
+    const first = JSON.parse(fetcher.mock.calls[0][1].body);
+    const second = JSON.parse(fetcher.mock.calls[1][1].body);
+    expect(first.source).toEqual(DESKTOP_SOURCE);
+    expect(first.command).toEqual({ type: "run_agent", session_id: "session-a", content: "继续修复并测试" });
+    expect(second.source).toEqual(REMOTE_SOURCE);
+    expect(second.command.type).toBe("send_message");
+  });
 });

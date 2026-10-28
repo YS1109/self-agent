@@ -1,5 +1,6 @@
 import { Bot, Plus, Trash2, Users } from "lucide-react";
 import { agentModelLabel } from "../agent-model";
+import { agentModelContext } from "../model-context";
 import type { AgentProfile, Settings } from "../types";
 import { Button } from "./ui/button";
 import { ModelSelect, type ModelCatalog } from "./model-select";
@@ -19,6 +20,9 @@ export function normalizeSettings(settings: Settings): Settings {
     agents: settings.agents?.length ? settings.agents : [{ ...DEFAULT_AGENT }],
     default_agent_id: settings.default_agent_id || "coder",
     codex_binary: settings.codex_binary || "codex",
+    main_executor: settings.main_executor || "native",
+    models_endpoint: settings.models_endpoint || "",
+    model_contexts: settings.model_contexts || {},
   };
 }
 
@@ -48,9 +52,9 @@ export function AgentSettings({
         <div><Users size={18} /><h3>子智能体模型预设</h3></div>
         <span>{agents.length} 个角色</span>
       </div>
-      <p className="help-text">为每个角色预设模型、执行器和职责。固定模型后，切换主智能体模型不会改变该角色的预设。新计划与直接任务会保存角色预设，已有计划保留原配置。</p>
-      <label>默认执行角色
-        <Select aria-label="默认执行角色" disabled={disabled} value={settings.default_agent_id}
+      <p className="help-text">用于远程派发与编排，为每个角色预设模型、执行器和职责。桌面对话由主智能体直接处理。固定模型后，切换主智能体模型不会改变该角色的预设。新派发保存角色预设，已有计划保留原配置。</p>
+      <label>远程派发默认角色
+        <Select aria-label="远程派发默认角色" disabled={disabled} value={settings.default_agent_id}
           onValueChange={(value) => onChange({ ...settings, default_agent_id: value })}
           options={agents.map((agent) => ({ value: agent.id, label: `${agent.name || "未命名角色"} · ${agentModelLabel(agent)}` }))} />
       </label>
@@ -74,6 +78,20 @@ export function AgentSettings({
                 onValueChange={(value) => update(agent.id, { executor: value as AgentProfile["executor"], model: value === "native" ? settings.model : "" })}
                 options={[{ value: "native", label: "原生工具循环" }, { value: "codex", label: "Codex 本机 CLI" }]} />
             </label>
+            <div className="context-fields">
+              <label>上下文窗口覆盖（tokens）
+                <input aria-label={`角色 ${index + 1} · 上下文窗口覆盖`} type="number" min={1024} max={2_000_000} step={1}
+                  placeholder={`继承：${agentModelContext(settings, agent).context_window}`}
+                  value={agent.context_window ?? ""} onChange={(event) => update(agent.id, { context_window: event.target.value === "" ? null : Number(event.target.value) })} />
+              </label>
+              <label>压缩阈值覆盖（%）
+                <input aria-label={`角色 ${index + 1} · 压缩阈值覆盖`} type="number" min={10} max={95} step={1}
+                  placeholder={`继承：${agentModelContext(settings, agent).compression_threshold}%`}
+                  value={agent.compression_threshold ?? ""} onChange={(event) => update(agent.id, { compression_threshold: event.target.value === "" ? null : Number(event.target.value) })} />
+              </label>
+            </div>
+            <p className="help-text">留空分别继承所用模型的统一配置。只覆盖其中一项，另一项继续继承。</p>
+            {agent.executor === "codex" && !agent.model && <p className="help-text">Codex 模型未固定时使用应用默认上下文策略；选择具体模型后可继承该模型的统一配置。</p>}
             <label>角色指令<textarea value={agent.instructions} rows={3} placeholder="描述角色职责、执行约束和结果要求" onChange={(event) => update(agent.id, { instructions: event.target.value })} /></label>
           </fieldset>
         ))}

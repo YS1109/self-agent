@@ -3,8 +3,11 @@
 
 use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
 
+use crate::context::ExecutionInput;
 use anyhow::{bail, Context, Result};
 use harness_core::CommandEvidence;
+#[cfg(all(test, unix))]
+use harness_core::ModelContextConfig;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -110,6 +113,7 @@ async fn execute(
     execute_with_evidence(binary, model, root, objective, progress, cancelled, |_| {}).await
 }
 
+#[cfg(all(test, unix))]
 pub async fn execute_with_evidence(
     binary: &str,
     model: &str,
@@ -119,11 +123,43 @@ pub async fn execute_with_evidence(
     cancelled: impl Fn() -> bool,
     evidence: impl Fn(CommandEvidence),
 ) -> Result<String> {
+    execute_with_context(
+        binary,
+        model,
+        root,
+        ExecutionInput {
+            objective,
+            history: &[],
+            config: &ModelContextConfig::default(),
+        },
+        progress,
+        cancelled,
+        evidence,
+    )
+    .await
+}
+
+pub(crate) async fn execute_with_context(
+    binary: &str,
+    model: &str,
+    root: &Path,
+    input: ExecutionInput<'_>,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+    evidence: impl Fn(CommandEvidence),
+) -> Result<String> {
     if cancelled() {
         bail!("Codex 任务已取消");
     }
-    if objective.len() > MAX_RESULT || model.len() > 256 {
+    let context = input.config;
+    let objective = crate::context::history_prompt(input.history, input.objective)?;
+    if objective.len() > 2 * 1024 * 1024 || model.len() > 256 {
         bail!("Codex 任务输入超过大小限制");
+    }
+    if !(1024..=2_000_000).contains(&context.context_window)
+        || !(10..=95).contains(&context.compression_threshold)
+    {
+        bail!("Codex 任务上下文配置无效");
     }
     let root = root
         .canonicalize()
@@ -169,7 +205,11 @@ pub async fn execute_with_evidence(
     let started = Instant::now();
     let result = tokio::select! {
         result = timeout(TURN_TIMEOUT, protocol(
-            &mut stdin, stdout, model, &root, objective, (&progress, &evidence), &mut ids,
+            &mut stdin, stdout, model, &root, ExecutionInput {
+                objective: &objective,
+                history: &[],
+                config: context,
+            }, (&progress, &evidence), &mut ids,
         )) => match result {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("Codex 任务已超过 15 分钟时限")),
@@ -231,10 +271,15 @@ async fn protocol(
     stdout: ChildStdout,
     model: &str,
     root: &Path,
-    objective: &str,
+    input: ExecutionInput<'_>,
     callbacks: (&impl Fn(String), &impl Fn(CommandEvidence)),
     ids: &mut RunIds,
 ) -> Result<String> {
+    let ExecutionInput {
+        objective,
+        config: context,
+        ..
+    } = input;
     let (progress, evidence) = callbacks;
     progress("正在连接 Codex 执行器".into());
     send(
@@ -352,6 +397,8 @@ async fn protocol(
                     "cwd":root,"approvalPolicy":"never","sandbox":"workspace-write",
                     "ephemeral":true,
                     "config":{
+                        "model_context_window":context.context_window,
+                        "model_auto_compact_token_limit":crate::context::compression_limit(context),
                         "sandbox_workspace_write":{
                             "writable_roots":[],"network_access":false,
                             "exclude_tmpdir_env_var":true,"exclude_slash_tmp":true
@@ -641,6 +688,53 @@ mod tests {
         assert_eq!(models[0]["id"], "fixture-coder");
         assert_eq!(models[1]["id"], "fixture-reviewer");
         assert!(models.iter().all(|model| model["id"] != "internal-id"));
+    }
+
+    #[tokio::test]
+    async fn model_context_and_prior_conversation_reach_codex_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = Project::new();
+        let history = vec![
+            json!({"role":"user","content":"前一轮目标"}),
+            json!({"role":"assistant","content":"前一轮真实结果"}),
+        ];
+        let expected = crate::context::history_prompt(&history, "本地测试目标").unwrap();
+        let fixture_source = std::fs::read_to_string(fixture()).unwrap();
+        let source = fixture_source
+            .replace(
+                "params = thread[\"params\"]",
+                "params = thread[\"params\"]\nassert params[\"config\"][\"model_context_window\"] == 64000\nassert params[\"config\"][\"model_auto_compact_token_limit\"] == 44800",
+            )
+            .replace(
+                "assert turn[\"params\"][\"input\"][0][\"text\"] == \"本地测试目标\"",
+                &format!(
+                    "assert turn[\"params\"][\"input\"][0][\"text\"] == {}",
+                    serde_json::to_string(&expected).unwrap()
+                ),
+            );
+        let binary = project.0.join("context-fixture.py");
+        std::fs::write(&binary, source).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = execute_with_context(
+            binary.to_str().unwrap(),
+            "success",
+            &project.0,
+            ExecutionInput {
+                objective: "本地测试目标",
+                history: &history,
+                config: &ModelContextConfig {
+                    context_window: 64_000,
+                    compression_threshold: 70,
+                },
+            },
+            |_| {},
+            || false,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_empty());
+        assert!(project.0.join("fixture-started").exists());
     }
 
     async fn run(mode: &str, root: &Path) -> Result<String> {

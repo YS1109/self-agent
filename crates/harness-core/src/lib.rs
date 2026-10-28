@@ -55,6 +55,22 @@ pub struct Message {
     pub task_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelContextConfig {
+    pub context_window: u32,
+    pub compression_threshold: u8,
+}
+
+impl Default for ModelContextConfig {
+    fn default() -> Self {
+        Self {
+            context_window: 128_000,
+            compression_threshold: 80,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentProfile {
@@ -63,6 +79,10 @@ pub struct AgentProfile {
     pub instructions: String,
     pub executor: String,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_threshold: Option<u8>,
 }
 
 impl Default for AgentProfile {
@@ -73,6 +93,8 @@ impl Default for AgentProfile {
             instructions: "根据任务目标检查项目、实施修改并验证结果；如实说明证据和限制。".into(),
             executor: "native".into(),
             model: String::new(),
+            context_window: None,
+            compression_threshold: None,
         }
     }
 }
@@ -95,6 +117,10 @@ pub struct TaskRun {
     pub execution_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_config: Option<ModelContextConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +335,11 @@ pub enum Command {
         session_id: Option<String>,
         content: String,
     },
+    RunAgent {
+        #[serde(default)]
+        session_id: Option<String>,
+        content: String,
+    },
     StartTask {
         #[serde(default)]
         session_id: Option<String>,
@@ -407,6 +438,30 @@ mod tests {
         ));
         let encoded = serde_json::to_value(envelope).unwrap();
         assert_eq!(encoded["command"]["type"], "start_task");
+    }
+
+    #[test]
+    fn direct_agent_commands_and_previous_profiles_are_compatible() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "type":"run_agent", "content":"检查项目"
+        }))
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::RunAgent {
+                session_id: None,
+                ..
+            }
+        ));
+        let agent: AgentProfile = serde_json::from_value(serde_json::json!({
+            "id":"existing", "model":"fixture-model"
+        }))
+        .unwrap();
+        assert!(agent.context_window.is_none());
+        assert!(agent.compression_threshold.is_none());
+        let policy: ModelContextConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(policy.context_window, 128_000);
+        assert_eq!(policy.compression_threshold, 80);
     }
 
     #[test]

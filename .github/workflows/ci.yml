@@ -22,9 +22,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p harness-core -p harness-daemon --all-targets -- -D warnings
-      - run: cargo test -p harness-core -p harness-daemon
-      - run: cargo build -p harness-daemon
+      - run: cargo clippy -p harness-core -p harness-daemon -p harness-cli --all-targets -- -D warnings
+      - run: cargo test -p harness-core -p harness-daemon -p harness-cli
+      - run: cargo build -p harness-daemon -p harness-cli
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -35,6 +35,7 @@ jobs:
       - run: python scripts/agents_smoke.py
       - run: python scripts/runtime_smoke.py
       - run: python scripts/plan_change_smoke.py
+      - run: python scripts/headless_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}

@@ -37,6 +37,7 @@ pub fn validate_agents(agents: &[AgentProfile], default_id: &str) -> Result<()> 
             bail!("角色指令不能超过 32000 字节，模型名不能超过 200 字节");
         }
         crate::configuration::validate_model(&agent.model)?;
+        crate::model_config::validate_overrides(agent)?;
         if !matches!(agent.executor.as_str(), "native" | "codex") {
             bail!("角色执行器仅支持 native 或 codex");
         }

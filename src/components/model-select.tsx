@@ -22,7 +22,7 @@ export function modelOptions(models: ModelOption[], current: string): ModelOptio
     : models;
 }
 
-export function useModelCatalog(body: { base_url?: string; api_key?: string; executor?: string; provider_source?: string }, enabled: boolean): ModelCatalog {
+export function useModelCatalog(body: { base_url?: string; models_endpoint?: string; api_key?: string; executor?: string; provider_source?: string }, enabled: boolean): ModelCatalog {
   const key = JSON.stringify(body);
   const [reload, setReload] = useState(0);
   const [result, setResult] = useState<{ key: string; models: ModelOption[]; loading: boolean; error: string }>({
@@ -80,15 +80,16 @@ export function ModelSelect({ label, value, onChange, catalog, disabled = false,
   );
 }
 
-export function QuickModelSelect({ value, catalog, disabled, onChange, onSettings }: {
+export function QuickModelSelect({ value, catalog, disabled, onChange, onSettings, emptyLabel = "请选择模型" }: {
   value: string; catalog: ModelCatalog; disabled: boolean;
   onChange: (value: string) => void; onSettings: () => void;
+  emptyLabel?: string;
 }) {
   return (
     <Select className="model-picker" aria-label="当前主智能体模型" value={value} disabled={disabled} title={catalog.error || "选择主智能体模型；新设置用于后续请求"}
       onValueChange={(next) => next === CUSTOM ? onSettings() : onChange(next)}
       options={[
-        { value: "", disabled: true, label: catalog.loading ? "正在获取模型…" : "请选择模型" },
+        { value: "", disabled: true, label: catalog.loading ? "正在获取模型…" : emptyLabel },
         ...modelOptions(catalog.models, value).map((model) => ({ value: model.id, label: modelLabel(model.name) })),
         { value: CUSTOM, label: "模型设置／刷新列表…" },
       ]} />

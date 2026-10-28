@@ -1,7 +1,7 @@
 use std::{collections::HashSet, path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use harness_core::{new_id, now, CommandEvidence, RunEvent};
+use harness_core::{new_id, now, CommandEvidence, ModelContextConfig, RunEvent};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
@@ -174,7 +174,7 @@ impl Store {
             "plan_changes":rows(&self.db,"plan_changes")?,
             "deliveries":rows(&self.db,"deliveries")?, "selections":rows(&self.db,"selections")?,
             "capabilities":[
-                {"id":"main","name":"主智能体","kind":"agent","description":"异步理解目标、生成计划并回顾子任务结果，执行过程中仍可管理会话","enabled":true},
+                {"id":"main","name":"主智能体","kind":"agent","description":"在当前项目中直接处理目标并使用工具；远程入口可另行编排子任务，执行过程中仍可管理会话","enabled":true},
                 {"id":"native","name":"原生编程智能体","kind":"executor","description":"配置兼容模型后，通过有限轮次的 Chat Completions 工具循环执行任务","enabled":true},
                 {"id":"workspace","name":"项目文件","kind":"tool","description":"在项目根目录内读取、列出、搜索和写入文件","enabled":true},
                 {"id":"shell","name":"项目命令","kind":"tool","description":"可信本机命令执行；通过 HARNESS_ALLOW_COMMANDS=1 开启，尚无系统级沙箱","enabled":shell_enabled},
@@ -216,11 +216,13 @@ impl Store {
         for field in ["channel_id", "actor_id", "conversation_id"] {
             bounded_text(source, field, 200)?;
         }
-        if text(source, "actor_id")? != "owner" {
+        let channel = text(source, "channel_id")?;
+        let actor = text(source, "actor_id")?;
+        if actor != "owner" && !(channel == "cli" && actor == "local") {
             bail!("当前版本仅支持本机所有者身份");
         }
-        if !matches!(text(source, "channel_id")?, "desktop" | "simulator") {
-            bail!("此通讯渠道尚未配置，请使用桌面或远程模拟器");
+        if !matches!(channel, "desktop" | "simulator" | "cli") {
+            bail!("此通讯渠道尚未配置，请使用桌面、命令行或远程模拟器");
         }
         let command = envelope.get("command").context("缺少 command 指令")?;
         let kind = text(command, "type")?;
@@ -265,8 +267,9 @@ impl Store {
                 let job_id = new_id();
                 let needs_configuration =
                     settings.execution_mode == "native" && !settings.configured();
+                let agents = snapshot_agents(settings)?;
                 let job = json!({"id":job_id,"kind":"message","session_id":id,"source":source,"content":content,
-                    "agents":settings.agents,"default_agent_id":settings.default_agent_id,
+                    "agents":agents,"default_agent_id":settings.default_agent_id,
                     "execution_mode":settings.execution_mode,"status":if needs_configuration {"failed"} else {"pending"},
                     "created_at":now(),"updated_at":now(),"error":if needs_configuration {Some(CONFIGURATION_HINT)} else {None}});
                 put(&tx, "coordinator_jobs", &job)?;
@@ -291,12 +294,71 @@ impl Store {
                     },
                 ));
             }
+            "run_agent" => {
+                let session_id = resolve_session(&tx, source, command)?;
+                let content = bounded_text(command, "content", 100_000)?;
+                if !matches!(settings.main_executor.as_str(), "native" | "codex") {
+                    bail!("主智能体执行器仅支持 native 或 codex");
+                }
+                if settings.execution_mode == "native"
+                    && settings.main_executor == "native"
+                    && !settings.configured()
+                {
+                    bail!(CONFIGURATION_HINT);
+                }
+                if active_task_count(&tx)? >= MAX_ACTIVE_TASKS {
+                    bail!("后台任务已达到 32 个，请先完成或取消部分任务");
+                }
+                let main = AgentProfile {
+                    id: "main".into(),
+                    name: "主智能体".into(),
+                    instructions: String::new(),
+                    executor: settings.main_executor.clone(),
+                    model: String::new(),
+                    ..AgentProfile::default()
+                };
+                let (agent, context) = snapshot_agent(settings, main)?;
+                let sequence = rows(&tx, "tasks")?
+                    .iter()
+                    .filter(|task| task["session_id"] == session_id && task["task_kind"] == "main")
+                    .filter_map(|task| task["main_sequence"].as_u64())
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let mut task = worker_task(
+                    &session_id,
+                    content,
+                    &settings.execution_mode,
+                    source,
+                    None,
+                    None,
+                    None,
+                );
+                task["task_kind"] = json!("main");
+                task["main_sequence"] = json!(sequence);
+                task["agent"] = json!(agent);
+                task["context_config"] = json!(context);
+                let task_id = text(&task, "id")?.to_owned();
+                put(&tx, "tasks", &task)?;
+                let mut session = record(&tx, "sessions", &session_id)?;
+                append_message(&mut session, "user", content, Some(&task_id))?;
+                put(&tx, "sessions", &session)?;
+                receipt["session_id"] = json!(session_id);
+                receipt["task_id"] = json!(task_id);
+                produced = Some(event(
+                    Some(session_id),
+                    Some(task_id),
+                    "main_queued",
+                    "主智能体已收到目标，正在当前会话中直接处理",
+                ));
+            }
             "start_task" => {
                 let session_id = resolve_session(&tx, source, command)?;
                 let title = bounded_text(command, "title", 100_000)?;
                 validate_agents(&settings.agents, &settings.default_agent_id)?;
                 let requested = requested_agent(command)?;
                 let agent = resolve_agent(&settings.agents, &settings.default_agent_id, requested)?;
+                let (agent, context) = snapshot_agent(settings, agent)?;
                 if settings.execution_mode == "native"
                     && agent.executor == "native"
                     && !(Settings {
@@ -324,6 +386,7 @@ impl Store {
                     None,
                 );
                 task["agent"] = json!(agent);
+                task["context_config"] = json!(context);
                 let id = text(&task, "id")?.to_string();
                 put(&tx, "tasks", &task)?;
                 let mut session = record(&tx, "sessions", &session_id)?;
@@ -706,6 +769,50 @@ impl Store {
         Ok(Some(task))
     }
 
+    pub fn execution_history(&self, task_id: &str) -> Result<Vec<Value>> {
+        let task = record(&self.db, "tasks", task_id)?;
+        if task["task_kind"] != "main" {
+            return Ok(Vec::new());
+        }
+        let session_id = text(&task, "session_id")?;
+        let session = record(&self.db, "sessions", session_id)?;
+        let sequence = task["main_sequence"].as_u64().unwrap_or(0);
+        let tasks = rows(&self.db, "tasks")?;
+        let main_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|other| other["session_id"] == session_id && other["task_kind"] == "main")
+            .collect();
+        let mut history = Vec::new();
+        let mut reached_current = false;
+        for message in session["messages"].as_array().context("会话消息数据无效")? {
+            let related = message["task_id"]
+                .as_str()
+                .and_then(|id| main_tasks.iter().find(|other| other["id"] == id));
+            if let Some(other) = related {
+                if other["id"] == task_id {
+                    reached_current = true;
+                }
+                if other["main_sequence"].as_u64().unwrap_or(0) >= sequence
+                    || message["role"] != "user"
+                {
+                    continue;
+                }
+                history.push(json!({"role":"user","content":message["content"]}));
+                // A queued user message may precede the previous task's result in
+                // storage. Rebuild completed pairs to preserve conversational order.
+                if let Some(result) = other["result"].as_str().or_else(|| other["error"].as_str()) {
+                    history.push(json!({"role":"assistant","content":result}));
+                }
+            } else if !reached_current
+                && matches!(message["role"].as_str(), Some("user" | "assistant"))
+                && message["content"] != "任务已交给后台智能体，当前会话可以继续使用。"
+            {
+                history.push(json!({"role":message["role"],"content":message["content"]}));
+            }
+        }
+        Ok(history)
+    }
+
     pub fn is_cancelled(&self, task_id: &str) -> Result<bool> {
         Ok(record(&self.db, "tasks", task_id)?["status"] == "cancelled")
     }
@@ -1023,7 +1130,7 @@ impl Store {
         // Built-in sinks are durable local records, committed with their receipt.
         if matches!(
             delivery["target"]["channel_id"].as_str(),
-            Some("desktop" | "simulator")
+            Some("desktop" | "simulator" | "cli")
         ) {
             delivery["status"] = json!("sent");
             delivery["error"] = Value::Null;
@@ -1151,6 +1258,17 @@ fn task_active(task: &Value) -> bool {
     )
 }
 fn task_plan_dispatchable(db: &Connection, task: &Value) -> Result<bool> {
+    if task["task_kind"] == "main" {
+        let sequence = task["main_sequence"].as_u64().unwrap_or(0);
+        if rows(db, "tasks")?.iter().any(|other| {
+            other["task_kind"] == "main"
+                && other["session_id"] == task["session_id"]
+                && other["main_sequence"].as_u64().unwrap_or(0) < sequence
+                && task_active(other)
+        }) {
+            return Ok(false);
+        }
+    }
     let Some(id) = task["plan_id"].as_str() else {
         return Ok(true);
     };
@@ -1159,6 +1277,33 @@ fn task_plan_dispatchable(db: &Connection, task: &Value) -> Result<bool> {
         && plan["nodes"]
             .as_array()
             .is_some_and(|nodes| nodes.iter().any(|node| node["task_id"] == task["id"])))
+}
+
+fn snapshot_agent(
+    settings: &Settings,
+    mut agent: AgentProfile,
+) -> Result<(AgentProfile, ModelContextConfig)> {
+    if agent.model.trim().is_empty() && agent.executor == "native" {
+        agent.model = crate::configuration::resolve(settings)
+            .map(|resolved| resolved.model)
+            .unwrap_or_else(|_| settings.model.clone());
+    } else if agent.model.trim().is_empty() && agent.id == "main" {
+        agent.model = settings.model.clone();
+    }
+    let context =
+        crate::model_config::resolve(&settings.model_contexts, &agent.model, Some(&agent))?;
+    agent.context_window = Some(context.context_window);
+    agent.compression_threshold = Some(context.compression_threshold);
+    Ok((agent, context))
+}
+
+fn snapshot_agents(settings: &Settings) -> Result<Vec<AgentProfile>> {
+    settings
+        .agents
+        .iter()
+        .cloned()
+        .map(|agent| snapshot_agent(settings, agent).map(|(agent, _)| agent))
+        .collect()
 }
 
 fn invalidate_reviews(tx: &Transaction<'_>, plan_id: &str) -> Result<()> {
@@ -1802,6 +1947,12 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                         &default_id,
                         requested_agent(&nodes[index])?,
                     )?);
+                    let agent: AgentProfile = serde_json::from_value(task["agent"].clone())?;
+                    task["context_config"] = json!(crate::model_config::resolve(
+                        &std::collections::BTreeMap::new(),
+                        &agent.model,
+                        Some(&agent),
+                    )?);
                     task["title"] = nodes[index]["title"].clone();
                     task["acceptance_command"] = nodes[index]["acceptance_command"].clone();
                     put(tx, "tasks", &task)?;
@@ -2177,6 +2328,7 @@ mod tests {
                 instructions: "仅依据实际文件和执行结果审查。".into(),
                 executor: "codex".into(),
                 model: "review-model".into(),
+                ..AgentProfile::default()
             }],
             default_agent_id: "reviewer".into(),
             ..config()
@@ -2229,6 +2381,208 @@ mod tests {
         let mut conflict = command;
         conflict["command"]["title"] = json!("other");
         assert!(store.command(conflict, &config()).is_err());
+    }
+
+    #[test]
+    fn main_runs_directly_with_policy_snapshot_and_serial_session_history() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let first_session = session(&mut store);
+        let mut settings = role_config();
+        settings.model = "main-model".into();
+        settings.main_executor = "native".into();
+        settings.model_contexts.insert(
+            "main-model".into(),
+            ModelContextConfig {
+                context_window: 32_000,
+                compression_threshold: 65,
+            },
+        );
+        let first = send_with(
+            &mut store,
+            json!({"type":"run_agent","content":"FIRST"}),
+            &settings,
+        );
+        let second = send_with(
+            &mut store,
+            json!({"type":"run_agent","content":"SECOND"}),
+            &settings,
+        );
+        let third = send_with(
+            &mut store,
+            json!({"type":"run_agent","content":"FUTURE"}),
+            &settings,
+        );
+        let claimed = store.claim_task().unwrap().unwrap();
+        assert_eq!(claimed["id"], first["task_id"]);
+        assert_eq!(claimed["task_kind"], "main");
+        assert_eq!(claimed["agent"]["id"], "main");
+        assert_eq!(claimed["agent"]["executor"], "native");
+        assert_eq!(claimed["agent"]["instructions"], "");
+        assert_eq!(claimed["agent"]["model"], "main-model");
+        assert_eq!(claimed["context_config"]["context_window"], 32_000);
+        assert_eq!(claimed["context_config"]["compression_threshold"], 65);
+        assert!(store
+            .execution_history(first["task_id"].as_str().unwrap())
+            .unwrap()
+            .is_empty());
+        assert!(store.claim_task().unwrap().is_none());
+        // Management and another session remain available while FIRST is running.
+        let other_session = session(&mut store);
+        assert_ne!(first_session, other_session);
+        let other = send_with(
+            &mut store,
+            json!({"type":"run_agent","content":"OTHER"}),
+            &settings,
+        );
+        assert_eq!(store.claim_task().unwrap().unwrap()["id"], other["task_id"]);
+        settings
+            .model_contexts
+            .get_mut("main-model")
+            .unwrap()
+            .context_window = 96_000;
+        store
+            .finish(
+                first["task_id"].as_str().unwrap(),
+                Ok("FIRST_RESULT".into()),
+            )
+            .unwrap();
+        let second_task = store.claim_task().unwrap().unwrap();
+        assert_eq!(second_task["id"], second["task_id"]);
+        assert_eq!(second_task["context_config"]["context_window"], 32_000);
+        let history = store
+            .execution_history(second["task_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            history,
+            vec![
+                json!({"role":"user","content":"FIRST"}),
+                json!({"role":"assistant","content":"FIRST_RESULT"}),
+            ]
+        );
+        store
+            .finish(
+                second["task_id"].as_str().unwrap(),
+                Ok("SECOND_RESULT".into()),
+            )
+            .unwrap();
+        let history = store
+            .execution_history(third["task_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            history,
+            vec![
+                json!({"role":"user","content":"FIRST"}),
+                json!({"role":"assistant","content":"FIRST_RESULT"}),
+                json!({"role":"user","content":"SECOND"}),
+                json!({"role":"assistant","content":"SECOND_RESULT"}),
+            ]
+        );
+        assert!(rows(&store.db, "plans").unwrap().is_empty());
+        assert!(rows(&store.db, "coordinator_jobs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_role_policy_inherits_model_defaults_and_snapshots_overrides() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let mut settings = config();
+        settings.model = "shared-model".into();
+        settings.model_contexts.insert(
+            "shared-model".into(),
+            ModelContextConfig {
+                context_window: 64_000,
+                compression_threshold: 70,
+            },
+        );
+        settings.agents[0].compression_threshold = Some(55);
+        let task = send_with(
+            &mut store,
+            json!({"type":"start_task","title":"child"}),
+            &settings,
+        );
+        let task = record(&store.db, "tasks", task["task_id"].as_str().unwrap()).unwrap();
+        assert_eq!(task["agent"]["model"], "shared-model");
+        assert_eq!(task["context_config"]["context_window"], 64_000);
+        assert_eq!(task["context_config"]["compression_threshold"], 55);
+        send_with(
+            &mut store,
+            json!({"type":"send_message","content":"remote plan"}),
+            &settings,
+        );
+        let job = store.claim_coordinator_job().unwrap().unwrap();
+        assert_eq!(job["agents"][0]["model"], "shared-model");
+        assert_eq!(job["agents"][0]["context_window"], 64_000);
+        assert_eq!(job["agents"][0]["compression_threshold"], 55);
+    }
+
+    #[test]
+    fn unspecified_codex_role_keeps_local_default_instead_of_main_model_policy() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let mut settings = role_config();
+        settings.model = "main-model".into();
+        settings.main_executor = "codex".into();
+        settings.agents[0].model.clear();
+        settings.agents[0].compression_threshold = Some(60);
+        settings.model_contexts.insert(
+            "main-model".into(),
+            ModelContextConfig {
+                context_window: 64_000,
+                compression_threshold: 70,
+            },
+        );
+        let child = send_with(
+            &mut store,
+            json!({"type":"start_task","title":"Codex默认模型"}),
+            &settings,
+        );
+        let child = record(&store.db, "tasks", child["task_id"].as_str().unwrap()).unwrap();
+        assert_eq!(child["agent"]["model"], "");
+        assert_eq!(child["context_config"]["context_window"], 128_000);
+        assert_eq!(child["context_config"]["compression_threshold"], 60);
+        let main = send_with(
+            &mut store,
+            json!({"type":"run_agent","content":"主模型"}),
+            &settings,
+        );
+        let main = record(&store.db, "tasks", main["task_id"].as_str().unwrap()).unwrap();
+        assert_eq!(main["agent"]["model"], "main-model");
+        assert_eq!(main["context_config"]["context_window"], 64_000);
+        assert_eq!(main["context_config"]["compression_threshold"], 70);
+    }
+
+    #[test]
+    fn cancelled_main_unblocks_next_and_cli_receives_its_own_callback() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let session_id = session(&mut store);
+        let cli_source =
+            json!({"channel_id":"cli","actor_id":"local","conversation_id":"cli-fixture"});
+        let command = |content: &str| {
+            json!({
+                "command_id":new_id(),"source":cli_source,
+                "command":{"type":"run_agent","session_id":session_id,"content":content}
+            })
+        };
+        let first = store.command(command("first"), &config()).unwrap().0;
+        let second = store.command(command("second"), &config()).unwrap().0;
+        store.claim_task().unwrap().unwrap();
+        send(
+            &mut store,
+            json!({"type":"cancel_task","task_id":first["task_id"]}),
+        );
+        assert_eq!(
+            store.claim_task().unwrap().unwrap()["id"],
+            second["task_id"]
+        );
+        store
+            .finish(second["task_id"].as_str().unwrap(), Ok("done".into()))
+            .unwrap();
+        while store.deliver_one().unwrap().is_some() {}
+        let deliveries = rows(&store.db, "deliveries").unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries
+            .iter()
+            .all(|delivery| delivery["status"] == "sent" && delivery["target"] == cli_source));
     }
     #[test]
     fn callback_target_sticks_to_dispatch_and_terminal_transition_is_atomic() {
@@ -2390,7 +2744,15 @@ mod tests {
     fn plan_roles_are_snapshotted_before_model_reply_and_keep_delayed_and_extended_tasks_stable() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         session(&mut store);
-        let original = role_config();
+        let mut original = role_config();
+        original.model_contexts.insert(
+            "review-model".into(),
+            ModelContextConfig {
+                context_window: 64_000,
+                compression_threshold: 70,
+            },
+        );
+        original.agents[0].compression_threshold = Some(55);
         send_with(
             &mut store,
             json!({"type":"send_message","content":"请规划审查"}),
@@ -2424,12 +2786,17 @@ mod tests {
         plan = store.snapshot().unwrap()["plans"][0].clone();
         start(&mut store, &plan);
         let first = store.claim_task().unwrap().unwrap();
-        assert_eq!(first["agent"], json!(original.agents[0]));
+        let mut expected_agent = original.agents[0].clone();
+        expected_agent.context_window = Some(64_000);
+        assert_eq!(first["agent"], json!(expected_agent));
+        assert_eq!(first["context_config"]["context_window"], 64_000);
+        assert_eq!(first["context_config"]["compression_threshold"], 55);
         store
             .finish(first["id"].as_str().unwrap(), Ok("检查完成".into()))
             .unwrap();
         let second = store.claim_task().unwrap().unwrap();
         assert_eq!(second["agent"], first["agent"]);
+        assert_eq!(second["context_config"], first["context_config"]);
         store
             .finish(second["id"].as_str().unwrap(), Ok("审查完成".into()))
             .unwrap();
@@ -2443,6 +2810,7 @@ mod tests {
             .unwrap();
         let extension = store.claim_task().unwrap().unwrap();
         assert_eq!(extension["agent"], first["agent"]);
+        assert_eq!(extension["context_config"], first["context_config"]);
     }
 
     #[test]

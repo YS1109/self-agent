@@ -1338,8 +1338,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-cli"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "harness-core",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "harness-core"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -1350,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "harness-daemon"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3058,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "self-agent-desktop"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "harness-core",
  "libc",

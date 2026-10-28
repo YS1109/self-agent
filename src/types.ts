@@ -43,8 +43,10 @@ export interface TaskRun {
   steps: TaskStep[];
   plan_id?: string | null;
   node_id?: string | null;
-  task_kind?: "worker" | "plan";
+  task_kind?: "worker" | "plan" | "main";
   agent?: AgentProfile | null;
+  context_config?: ModelContextConfig | null;
+  main_sequence?: number | null;
   evidence?: ExecutionEvidence[];
 }
 export interface AgentProfile {
@@ -53,6 +55,8 @@ export interface AgentProfile {
   instructions: string;
   executor: "native" | "codex";
   model: string;
+  context_window?: number | null;
+  compression_threshold?: number | null;
 }
 export interface PlanNode {
   id: string;
@@ -146,6 +150,10 @@ export interface Snapshot {
   plans: Plan[];
   plan_changes: PlanChange[];
 }
+export interface ModelContextConfig {
+  context_window: number;
+  compression_threshold: number;
+}
 export interface Settings {
   api_key_configured?: boolean;
   provider_source?: "manual" | "local_codex";
@@ -157,11 +165,15 @@ export interface Settings {
   agents: AgentProfile[];
   default_agent_id: string;
   codex_binary: string;
+  main_executor?: "native" | "codex";
+  models_endpoint?: string;
+  model_contexts?: Record<string, ModelContextConfig>;
 }
 export type Command =
   | { type: "create_session"; title: string; project_path: string }
   | { type: "select_session"; session_id: string }
   | { type: "send_message"; session_id?: string; content: string }
+  | { type: "run_agent"; session_id?: string; content: string }
   | { type: "start_task"; session_id?: string; title: string }
   | { type: "cancel_task"; task_id: string }
   | { type: "update_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }

@@ -1,13 +1,15 @@
 mod codex;
 mod configuration;
+mod context;
 mod coordinator;
+mod model_config;
 mod models;
 pub mod profiles;
 pub mod provider;
 pub mod store;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
@@ -22,7 +24,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use harness_core::{new_id, now, RunEvent};
+use harness_core::{new_id, now, ModelContextConfig, RunEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Notify, Semaphore};
@@ -48,6 +50,12 @@ impl From<anyhow::Error> for ApiError {
 pub struct Settings {
     pub base_url: String,
     pub model: String,
+    #[serde(default = "default_main_executor")]
+    pub main_executor: String,
+    #[serde(default)]
+    pub models_endpoint: String,
+    #[serde(default)]
+    pub model_contexts: BTreeMap<String, ModelContextConfig>,
     pub execution_mode: String,
     #[serde(default = "configuration::default_source")]
     pub provider_source: String,
@@ -69,6 +77,9 @@ impl Default for Settings {
             base_url: std::env::var("HARNESS_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
             model: std::env::var("HARNESS_MODEL").unwrap_or_default(),
+            main_executor: default_main_executor(),
+            models_endpoint: String::new(),
+            model_contexts: BTreeMap::new(),
             execution_mode: "native".into(),
             provider_source: configuration::default_source(),
             agents: profiles::default_agents(),
@@ -78,6 +89,10 @@ impl Default for Settings {
             provider_headers: reqwest::header::HeaderMap::new(),
         }
     }
+}
+
+fn default_main_executor() -> String {
+    "native".into()
 }
 
 fn default_codex_binary() -> String {
@@ -131,8 +146,13 @@ impl Settings {
     fn public(&self) -> Value {
         let result = configuration::resolve(self);
         let effective = result.as_ref().unwrap_or(self);
-        let model = if configuration::validate_model(&effective.model).is_ok() {
-            effective.model.as_str()
+        let selected_model = if self.main_executor == "codex" {
+            &self.model
+        } else {
+            &effective.model
+        };
+        let model = if configuration::validate_model(selected_model).is_ok() {
+            selected_model.as_str()
         } else {
             ""
         };
@@ -144,6 +164,9 @@ impl Settings {
         }
         json!({
             "base_url": effective.base_url, "model": model,
+            "main_executor": self.main_executor,
+            "models_endpoint": self.models_endpoint,
+            "model_contexts": self.model_contexts,
             "provider_source": self.provider_source,
             "configuration_error": result.as_ref().err().map(ToString::to_string),
             "execution_mode": self.execution_mode, "configured": result.is_ok(),
@@ -309,6 +332,8 @@ fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings
     for (field, target) in [
         ("base_url", &mut updated.base_url),
         ("model", &mut updated.model),
+        ("main_executor", &mut updated.main_executor),
+        ("models_endpoint", &mut updated.models_endpoint),
         ("execution_mode", &mut updated.execution_mode),
         ("api_key", &mut updated.api_key),
         ("default_agent_id", &mut updated.default_agent_id),
@@ -327,7 +352,15 @@ fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings
         updated.agents = serde_json::from_value(agents.clone())
             .map_err(|_| anyhow::anyhow!("子智能体角色配置格式无效"))?;
     }
+    if let Some(configs) = patch.get("model_contexts") {
+        updated.model_contexts = serde_json::from_value(configs.clone())
+            .map_err(|_| anyhow::anyhow!("模型上下文配置格式无效"))?;
+    }
+    model_config::validate_registry(&updated.model_contexts)?;
     profiles::validate_agents(&updated.agents, &updated.default_agent_id)?;
+    if !matches!(updated.main_executor.as_str(), "native" | "codex") {
+        anyhow::bail!("主智能体执行器无效");
+    }
     if updated.codex_binary.trim().is_empty()
         || updated.codex_binary.len() > 4096
         || updated.codex_binary.contains(['\0', '\n', '\r'])
@@ -340,7 +373,7 @@ fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings
     configuration::validate_model(&updated.model)?;
     match updated.provider_source.as_str() {
         "manual" => {
-            models::service_url(&updated.base_url)?;
+            models::models_url(&updated.base_url, &updated.models_endpoint)?;
             // Retaining an old credential while changing hosts would send it to a new service.
             if (updated.base_url.trim_end_matches('/') != settings.base_url.trim_end_matches('/')
                 || settings.provider_source != "manual")
@@ -430,7 +463,7 @@ pub fn spawn_workers(state: Arc<AppState>) {
                         }
                     }
                     Err(error) => {
-                        tracing::error!(%error, "无法领取子任务");
+                        tracing::error!(%error, "无法领取任务");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
@@ -524,6 +557,38 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         if !agent.model.trim().is_empty() {
             settings.model = agent.model.clone();
         }
+        let settings = match configuration::resolve(&settings) {
+            Ok(settings) => settings,
+            Err(_) if agent.executor == "codex" => settings,
+            Err(error) => {
+                finish(&state, &task_id, Err(error));
+                return;
+            }
+        };
+        let context = match task.get("context_config").filter(|value| !value.is_null()) {
+            Some(value) => serde_json::from_value::<ModelContextConfig>(value.clone())
+                .map_err(anyhow::Error::from),
+            None => model_config::resolve(&settings.model_contexts, &settings.model, Some(&agent)),
+        };
+        let context = match context {
+            Ok(context) => context,
+            Err(error) => {
+                finish(&state, &task_id, Err(error));
+                return;
+            }
+        };
+        let history = if task["task_kind"] == "main" {
+            let result = state.store.lock().unwrap().execution_history(&task_id);
+            match result {
+                Ok(history) => history,
+                Err(error) => {
+                    finish(&state, &task_id, Err(error));
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let objective = task["objective"]
             .as_str()
             .or_else(|| task["title"].as_str())
@@ -542,6 +607,11 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 "角色职责：\n{}\n\n任务目标：\n{objective}",
                 agent.instructions
             )
+        };
+        let input = context::ExecutionInput {
+            objective: &objective,
+            history: &history,
+            config: &context,
         };
         let state_for_log = state.clone();
         let task_for_log = task_id.clone();
@@ -575,21 +645,21 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         };
         match agent.executor.as_str() {
             "native" => {
-                provider::execute_with_evidence(
+                provider::execute_with_context(
                     &settings,
                     &root,
-                    &objective,
+                    input,
                     progress,
                     is_cancelled,
                     evidence,
                 )
                 .await
             }
-            "codex" => codex::execute_with_evidence(
+            "codex" => codex::execute_with_context(
                 &settings.codex_binary,
                 &agent.model,
                 &root,
-                &objective,
+                input,
                 progress,
                 is_cancelled,
                 evidence,
@@ -616,7 +686,7 @@ fn finish(state: &AppState, task_id: &str, result: anyhow::Result<String>) {
     match state.store.lock().unwrap().finish(task_id, result) {
         Ok(Some(event)) => state.publish(event),
         Ok(None) => {}
-        Err(error) => tracing::error!(%error, %task_id, "无法保存子任务结果"),
+        Err(error) => tracing::error!(%error, %task_id, "无法保存任务结果"),
     }
     state.wake.notify_waiters();
 }
@@ -638,7 +708,7 @@ async fn demo(state: &AppState, task_id: &str) -> anyhow::Result<String> {
         .clamp(100, 60_000);
     for detail in [
         "演示：模拟整理任务目标",
-        "演示：模拟执行子任务",
+        "演示：模拟执行任务",
         "演示：模拟验证与结果汇总",
     ] {
         if cancelled(state, task_id) {
@@ -794,8 +864,11 @@ mod tests {
             State(state.clone()),
             Json(json!({
                 "agents":[{"id":"implementer","name":"编码","instructions":"先阅读项目规则",
-                    "executor":"codex","model":""}],
+                    "executor":"codex","model":"","compression_threshold":60}],
                 "default_agent_id":"implementer",
+                "main_executor":"codex",
+                "models_endpoint":"/catalog?api-version=1",
+                "model_contexts":{"fixture-model":{"context_window":64000,"compression_threshold":70}},
                 "codex_binary":"codex",
                 "api_key":"secret-api-key",
             })),
@@ -804,10 +877,21 @@ mod tests {
         .unwrap();
         assert_eq!(public["agents"][0]["executor"], "codex");
         assert_eq!(public["default_agent_id"], "implementer");
+        assert_eq!(public["main_executor"], "codex");
+        assert_eq!(public["models_endpoint"], "/catalog?api-version=1");
+        assert_eq!(
+            public["model_contexts"]["fixture-model"]["context_window"],
+            64000
+        );
         assert!(public.get("api_key").is_none());
         let saved = state.store.lock().unwrap().load_settings().unwrap();
         assert_eq!(saved.agents[0].instructions, "先阅读项目规则");
         assert_eq!(saved.codex_binary, "codex");
+        assert_eq!(saved.agents[0].compression_threshold, Some(60));
+        assert_eq!(
+            saved.model_contexts["fixture-model"].compression_threshold,
+            70
+        );
         assert!(!serde_json::to_string(&saved)
             .unwrap()
             .contains("secret-api-key"));
@@ -818,6 +902,33 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn invalid_context_or_endpoint_patch_is_rejected_atomically() {
+        let original = Settings::default();
+        for patch in [
+            json!({"model_contexts":{"fixture":{"context_window":100,"compression_threshold":80}}}),
+            json!({"model_contexts":{"fixture":{"context_window":128000,"compression_threshold":99}}}),
+            json!({"main_executor":"other"}),
+            json!({"models_endpoint":"https://another-service.invalid/models"}),
+        ] {
+            assert!(patch_settings(&original, &patch).is_err());
+        }
+        assert!(original.model_contexts.is_empty());
+        assert!(original.models_endpoint.is_empty());
+        assert_eq!(original.main_executor, "native");
+    }
+
+    #[test]
+    fn public_codex_model_preserves_an_explicit_default_selection() {
+        let settings = Settings {
+            main_executor: "codex".into(),
+            model: String::new(),
+            ..Settings::default()
+        };
+        assert_eq!(settings.public()["model"], "");
+        assert_eq!(settings.public()["main_executor"], "codex");
     }
 
     #[tokio::test]

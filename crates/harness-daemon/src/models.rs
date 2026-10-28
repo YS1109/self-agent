@@ -10,6 +10,7 @@ use crate::{ApiResult, AppState};
 #[derive(Default, Deserialize)]
 pub(crate) struct ModelRequest {
     base_url: Option<String>,
+    models_endpoint: Option<String>,
     api_key: Option<String>,
     executor: Option<String>,
     provider_source: Option<String>,
@@ -25,6 +26,33 @@ pub(crate) fn service_url(value: &str) -> Result<Url> {
         || url.fragment().is_some()
     {
         bail!("模型服务地址必须使用 HTTP 或 HTTPS，不能包含凭证、查询参数或片段");
+    }
+    Ok(url)
+}
+
+pub(crate) fn models_url(base_url: &str, endpoint: &str) -> Result<Url> {
+    let base = service_url(base_url)?;
+    let endpoint = endpoint.trim();
+    if endpoint.len() > 2048 || endpoint.chars().any(char::is_control) {
+        bail!("模型列表端点不能超过 2048 字节或包含控制字符");
+    }
+    let directory = Url::parse(&format!("{}/", base.as_str().trim_end_matches('/')))
+        .context("模型服务地址无效")?;
+    let url = if endpoint.is_empty() {
+        directory.join("models")
+    } else {
+        directory.join(endpoint)
+    }
+    .context("模型列表端点无效")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("模型列表端点必须使用 HTTP 或 HTTPS，不能包含凭证或片段");
+    }
+    if url.origin() != base.origin() {
+        bail!("模型列表端点必须与模型服务同源，请使用相同协议、主机和端口");
     }
     Ok(url)
 }
@@ -68,11 +96,21 @@ pub(crate) async fn discover(
                 .as_deref()
                 .unwrap_or(&settings.provider_source);
             let provider = match source {
-                "local_codex" => crate::configuration::resolve(&crate::Settings {
-                    provider_source: source.into(),
-                    model: String::new(),
-                    ..settings.clone()
-                })?,
+                "local_codex" => {
+                    let models_endpoint = request.models_endpoint.unwrap_or_else(|| {
+                        if settings.provider_source == source {
+                            settings.models_endpoint.clone()
+                        } else {
+                            String::new()
+                        }
+                    });
+                    crate::configuration::resolve(&crate::Settings {
+                        provider_source: source.into(),
+                        model: String::new(),
+                        models_endpoint,
+                        ..settings.clone()
+                    })?
+                }
                 "manual" => {
                     let url =
                         service_url(request.base_url.as_deref().unwrap_or(&settings.base_url))?;
@@ -84,6 +122,13 @@ pub(crate) async fn discover(
                     crate::Settings {
                         provider_source: "manual".into(),
                         base_url: url.to_string(),
+                        models_endpoint: request.models_endpoint.unwrap_or_else(|| {
+                            if same_service {
+                                settings.models_endpoint.clone()
+                            } else {
+                                String::new()
+                            }
+                        }),
                         api_key: request.api_key.unwrap_or_else(|| {
                             if same_service {
                                 settings.api_key.clone()
@@ -115,7 +160,7 @@ async fn fetch_models(base: Url, key: &str) -> Result<Vec<Value>> {
 }
 
 async fn fetch_models_with_provider(provider: &crate::Settings) -> Result<Vec<Value>> {
-    let endpoint = format!("{}/models", provider.base_url.trim_end_matches('/'));
+    let endpoint = models_url(&provider.base_url, &provider.models_endpoint)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(4))
@@ -128,7 +173,7 @@ async fn fetch_models_with_provider(provider: &crate::Settings) -> Result<Vec<Va
     })?;
     if !response.status().is_success() {
         bail!(
-            "模型列表服务返回 HTTP {}，请检查地址和密钥；服务需支持 GET /models，也可手动填写模型 ID",
+            "模型列表服务返回 HTTP {}，请检查模型列表端点和密钥，也可手动填写模型 ID",
             response.status().as_u16()
         );
     }
@@ -153,6 +198,35 @@ async fn fetch_models_with_provider(provider: &crate::Settings) -> Result<Vec<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_endpoints_resolve_against_the_service_directory_and_reject_other_origins() {
+        let base = "https://models.example/v1";
+        for (endpoint, expected) in [
+            ("", "https://models.example/v1/models"),
+            ("catalog", "https://models.example/v1/catalog"),
+            ("/catalog", "https://models.example/catalog"),
+            (
+                "https://models.example/custom?api-version=1",
+                "https://models.example/custom?api-version=1",
+            ),
+        ] {
+            assert_eq!(models_url(base, endpoint).unwrap().as_str(), expected);
+        }
+        for endpoint in [
+            "https://other.example/catalog",
+            "//other.example/catalog",
+            "http://models.example/catalog",
+            "https://models.example:1234/catalog",
+            "https://actor:private-fixture-secret@models.example/catalog",
+            "/catalog#private-fixture-secret",
+            "file:///catalog",
+            "catalog\nprivate-fixture-secret",
+        ] {
+            let error = models_url(base, endpoint).unwrap_err().to_string();
+            assert!(!error.contains("private-fixture-secret"));
+        }
+    }
 
     #[test]
     fn catalog_uses_real_model_ids_and_ignores_hidden_codex_entries() {
@@ -204,6 +278,93 @@ mod tests {
         assert_eq!(result["models"][0]["id"], "fixture-model");
         assert_eq!(state.settings.read().unwrap().public(), old);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_requests_the_custom_endpoint_and_uses_only_matching_service_credentials() {
+        use axum::{extract::OriginalUri, http::HeaderMap, routing::get, Router};
+        let state = AppState::open(std::path::Path::new(":memory:"), "test".into()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route(
+                "/v1/catalog",
+                get(
+                    |headers: HeaderMap, OriginalUri(uri): OriginalUri| async move {
+                        assert_eq!(headers["authorization"], "Bearer saved-fixture-secret");
+                        assert_eq!(uri.query(), Some("api-version=2026"));
+                        Json(json!({"data":[{"id":"custom-model"}]}))
+                    },
+                ),
+            )
+            .route(
+                "/different/catalog",
+                get(|headers: HeaderMap| async move {
+                    assert!(headers.get("authorization").is_none());
+                    Json(json!({"data":[{"id":"new-service-model"}]}))
+                }),
+            )
+            .route(
+                "/different/auth-catalog",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(headers["authorization"], "Bearer fresh-fixture-secret");
+                    Json(json!({"data":[{"id":"fresh-credential-model"}]}))
+                }),
+            );
+        let server = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+        {
+            let mut settings = state.settings.write().unwrap();
+            settings.base_url = base.clone();
+            settings.provider_source = "manual".into();
+            settings.models_endpoint = "catalog?api-version=2026".into();
+            settings.api_key = "saved-fixture-secret".into();
+        }
+        let old = state.settings.read().unwrap().public();
+        let Json(result) = discover(State(state.clone()), Json(ModelRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(result["models"][0]["id"], "custom-model");
+        let Json(result) = discover(
+            State(state.clone()),
+            Json(ModelRequest {
+                base_url: Some(base.replace("/v1", "/different")),
+                models_endpoint: Some("catalog".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["models"][0]["id"], "new-service-model");
+        let Json(result) = discover(
+            State(state.clone()),
+            Json(ModelRequest {
+                base_url: Some(base.replace("/v1", "/different")),
+                models_endpoint: Some("/different/auth-catalog".into()),
+                api_key: Some("fresh-fixture-secret".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["models"][0]["id"], "fresh-credential-model");
+        assert_eq!(state.settings.read().unwrap().public(), old);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_endpoint_rejects_cross_origin_before_sending_credentials() {
+        let provider = crate::Settings {
+            base_url: "https://models.example/v1".into(),
+            models_endpoint: "https://other.example/catalog".into(),
+            api_key: "private-fixture-secret".into(),
+            ..Default::default()
+        };
+        let error = fetch_models_with_provider(&provider)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("同源"));
+        assert!(!error.contains("private-fixture-secret"));
     }
 
     #[tokio::test]

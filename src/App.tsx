@@ -53,6 +53,8 @@ import { Status } from "./components/status";
 import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/agent-settings";
 import { QuickModelSelect, useModelCatalog } from "./components/model-select";
 import { ProviderSettings } from "./components/provider-settings";
+import { ModelContextSettings } from "./components/model-context-settings";
+import { applyUiScale, DEFAULT_UI_SCALE, readUiScale, saveUiScale, UI_SCALE_OPTIONS } from "./ui-preferences";
 import { syncNativeTheme, type AppTheme } from "./theme";
 import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./labels";
 import { Button } from "./components/ui/button";
@@ -148,7 +150,7 @@ function TaskCard({
       </div>
       <div className="task-card-content">
         <div className="task-card-top">
-          <span>{task.task_kind === "plan" ? "计划执行" : task.plan_id ? "计划子任务" : "直接执行"}</span>
+          <span>{task.task_kind === "main" ? "主智能体执行" : task.task_kind === "plan" ? "计划执行" : task.plan_id ? "计划子任务" : "远程派发"}</span>
           <Status status={task.status} />
         </div>
         <strong>{task.title}</strong>
@@ -215,20 +217,26 @@ export default function App() {
     agents: [{ ...DEFAULT_AGENT }],
     default_agent_id: DEFAULT_AGENT.id,
     codex_binary: "codex",
+    main_executor: "native",
+    models_endpoint: "",
+    model_contexts: {},
   });
   const [settingsForm, setSettingsForm] = useState<Settings>(settings);
   const [theme, setTheme] = useState<AppTheme>(
     () => localStorage.getItem("harness-theme") === "dark" ? "dark" : "light",
   );
+  const [uiScale, setUiScale] = useState(readUiScale);
   const [createTitle, setCreateTitle] = useState("");
   const [createPath, setCreatePath] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [codexStatus, setCodexStatus] = useState("");
   const [checkingCodex, setCheckingCodex] = useState(false);
-  const quickModels = useModelCatalog({ provider_source: settings.provider_source ?? "manual", base_url: settings.base_url }, connected && (!!settings.base_url || settings.provider_source === "local_codex"));
-  const nativeModels = useModelCatalog({ provider_source: settingsForm.provider_source ?? "manual", base_url: settingsForm.base_url, ...(apiKey ? { api_key: apiKey } : {}) }, connected && modal === "settings" && (!!settingsForm.base_url || settingsForm.provider_source === "local_codex"));
+  const quickModels = useModelCatalog(settings.main_executor === "codex" ? { executor: "codex" } : {
+    provider_source: settings.provider_source ?? "manual", base_url: settings.base_url, models_endpoint: settings.models_endpoint ?? "",
+  }, connected && (settings.main_executor === "codex" || !!settings.base_url || settings.provider_source === "local_codex"));
+  const nativeModels = useModelCatalog({ provider_source: settingsForm.provider_source ?? "manual", base_url: settingsForm.base_url, models_endpoint: settingsForm.models_endpoint ?? "", ...(apiKey ? { api_key: apiKey } : {}) }, connected && modal === "settings" && (!!settingsForm.base_url || settingsForm.provider_source === "local_codex"));
   const codexModels = useModelCatalog({ executor: "codex" }, connected && modal === "settings"
-    && settingsForm.codex_binary === settings.codex_binary && settingsForm.agents.some((agent) => agent.executor === "codex"));
+    && settingsForm.codex_binary === settings.codex_binary && (settingsForm.main_executor === "codex" || settingsForm.agents.some((agent) => agent.executor === "codex")));
   const [inputModes, setInputModes] = useState<Record<string, "goal" | "change">>({});
   const [remotePlanIds, setRemotePlanIds] = useState<Record<string, string>>({});
   const [remoteDrafts, setRemoteDrafts] = useState<Record<string, string>>({});
@@ -247,8 +255,6 @@ export default function App() {
   const selectPlan = (id: string) => {
     if (sessionId) setPlanIds((current) => ({ ...current, [sessionId]: id }));
   };
-  const inputModeKey = `desktop:${sessionId ?? ""}`;
-  const inputMode = inputModes[inputModeKey] ?? "goal";
   const selectedTask = tasks.find((t) => t.id === taskId) ?? tasks[0];
   const running = snapshot.tasks.filter(
     (t) => t.task_kind !== "plan" && ["queued", "running"].includes(t.status),
@@ -316,6 +322,16 @@ export default function App() {
     });
   }, [theme]);
   useEffect(() => {
+    try {
+      saveUiScale(uiScale);
+    } catch {
+      setNotice("界面缩放已调整，但本机偏好保存失败，重启后可能恢复默认值。");
+    }
+    void applyUiScale(uiScale).catch(() => {
+      setNotice("界面缩放未能应用，请重新打开应用后重试。");
+    });
+  }, [uiScale]);
+  useEffect(() => {
     const desktop = window.matchMedia("(min-width: 761px)");
     const update = (event: MediaQueryListEvent) => setSidebar(event.matches);
     desktop.addEventListener("change", update);
@@ -380,33 +396,13 @@ export default function App() {
       setCreatePath("");
     }
   }
-  async function send(run: boolean) {
+  async function send() {
     if (!session || !draft.trim()) return;
-    if (!run && inputMode === "change" && (!selectedPlan || !changeable(selectedPlan.status))) return;
     const key = draftKey;
-    const receipt = await command(
-      run
-        ? { type: "start_task", session_id: session.id, title: draft.trim() }
-        : inputMode === "change" && selectedPlan ? {
-            type: "request_plan_change", plan_id: selectedPlan.id, expected_revision: selectedPlan.revision, content: draft.trim(),
-          } : {
-            type: "send_message",
-            session_id: session.id,
-            content: draft.trim(),
-          },
-    );
+    const receipt = await command({ type: "run_agent", session_id: session.id, content: draft.trim() });
     if (receipt) {
       setDrafts((old) => old[key] === draft ? { ...old, [key]: "" } : old);
       if (receipt.task_id) setTaskId(receipt.task_id);
-      if (!run) {
-        setPanel("plan");
-        const targetPlanId = receipt.plan_id ?? selectedPlan?.id;
-        if (targetPlanId) setPlanIds((current) => ({ ...current, [session.id]: targetPlanId }));
-        setNotice(inputMode === "change" ? "补充要求已接收，主智能体会异步生成调整建议。结构化管理指令仍可使用，请审阅后应用。"
-          : settings.execution_mode !== "demo" && !settings.configured
-          ? "请先在设置中配置模型服务。指令已保存，主智能体会提示配置要求。"
-          : "目标已接收，主智能体正在后台处理；生成计划后可在右侧审阅。" );
-      }
     }
   }
   async function saveSettings(event: FormEvent) {
@@ -422,6 +418,9 @@ export default function App() {
         agents: settingsForm.agents,
         default_agent_id: settingsForm.default_agent_id,
         codex_binary: settingsForm.codex_binary,
+        main_executor: settingsForm.main_executor ?? "native",
+        models_endpoint: settingsForm.models_endpoint ?? "",
+        model_contexts: settingsForm.model_contexts ?? {},
         ...(apiKey ? { api_key: apiKey } : {}),
       });
       setSettings(normalizeSettings(value));
@@ -588,7 +587,7 @@ export default function App() {
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-              <small>本地优先 · v0.5.3</small>
+                <small>本地优先 · v0.6.0</small>
               </span>
               <Settings2 size={15} />
             </button>
@@ -699,15 +698,15 @@ export default function App() {
                       <div className="feature-icon">
                         <GitBranch size={19} />
                       </div>
-                      <strong>自主编排</strong>
-                      <span>把目标拆成可追踪的步骤</span>
+                      <strong>直接工作</strong>
+                      <span>对话中完成编码和验证</span>
                     </div>
                     <div>
                       <div className="feature-icon">
                         <Layers3 size={19} />
                       </div>
-                      <strong>并行执行</strong>
-                      <span>任务继续，你也继续</span>
+                      <strong>持续推进</strong>
+                      <span>后台执行，会话随时可用</span>
                     </div>
                     <div>
                       <div className="feature-icon">
@@ -743,7 +742,7 @@ export default function App() {
                       <Sparkles size={20} />
                       <p>准备好了，告诉我你的目标。</p>
                       <span>
-                        发送目标生成可编辑计划，或选择「直接执行」运行单个任务。
+                        主智能体会直接阅读项目、修改文件并验证结果。远程入口可按需编排子任务。
                       </span>
                     </div>
                   )}
@@ -813,15 +812,6 @@ export default function App() {
               )}
             </div>
             <div className="composer-area">
-              {session && <div className="instruction-scope">
-                <label>指令用途<Select aria-label="桌面指令用途" value={inputMode} onValueChange={(value) => setInputModes((current) => ({ ...current, [inputModeKey]: value as "goal" | "change" }))}
-                  options={[{ value: "goal", label: "新目标" }, { value: "change", label: "补充当前计划" }]}
-                /></label>
-                {inputMode === "change" && <label>目标计划<Select aria-label="桌面目标计划" value={selectedPlan?.id ?? ""} onValueChange={selectPlan}
-                  options={plans.length ? plans.map((item) => ({ value: item.id, label: `${item.title} · v${item.revision}${changeable(item.status) ? "" : " · 已结束"}` })) : [{ value: "", label: "暂无计划" }]}
-                /></label>}
-                <span className="instruction-target" title={session.title}>会话：{session.title}</span>
-              </div>}
               <div className="composer-context">
                 <span>
                   <span
@@ -840,8 +830,8 @@ export default function App() {
                   aria-label="向主智能体 发送指令"
                   placeholder={
                     session
-                      ? inputMode === "change" ? "例如：先补回归测试，再继续修改界面。生成建议后审阅应用…" : "告诉主智能体你的新目标…"
-                      : "先创建一个会话，开始编排你的工作…"
+                      ? "告诉主智能体你想做什么，或继续补充当前工作…"
+                      : "先创建一个会话，开始你的工作…"
                   }
                   value={draft}
                   onChange={(e) =>
@@ -852,13 +842,14 @@ export default function App() {
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                       e.preventDefault();
-                      void send(false);
+                      void send();
                     }
                   }}
                 />
                 <div className="composer-toolbar">
                   <div className="composer-options">
                     <QuickModelSelect value={settings.model} catalog={quickModels} disabled={busy || !connected}
+                      emptyLabel={settings.main_executor === "codex" ? "Codex 本机默认模型" : "请选择模型"}
                       onChange={(model) => void selectModel(model)} onSettings={() => setModal("settings")} />
                     <span
                       className={`mode-pill ${settings.execution_mode === "demo" ? "mode-demo" : ""}`}
@@ -869,28 +860,18 @@ export default function App() {
                   <div className="composer-submit">
                     <Button
                       size="small"
-                      disabled={!connected || !session || !draft.trim() || busy || (inputMode === "change" && !changeable(selectedPlan?.status))}
-                      onClick={() => void send(false)}
-                      title="发送目标给主智能体（⌘/Ctrl + Enter）"
-                    >
-                      <MessageSquare size={13} />
-                      <span>{inputMode === "change" ? "生成调整建议" : "发送目标"}</span>
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="small"
-                      disabled={!connected || !session || !draft.trim() || busy || inputMode === "change"}
-                      onClick={() => void send(true)}
-                      title={`由默认角色「${settings.agents.find((agent) => agent.id === settings.default_agent_id)?.name ?? "编码助手"}」直接执行`}
+                      disabled={!connected || !session || !draft.trim() || busy}
+                      onClick={() => void send()}
+                      title="主智能体直接处理（⌘/Ctrl + Enter）"
                     >
                       <ArrowUp size={14} />
-                      <span>直接执行</span>
+                      <span>发送</span>
                     </Button>
                   </div>
                 </div>
               </div>
               <div className="composer-footnote">
-                <span>{inputMode === "change" ? "补充要求 → 审阅差异 → 应用到后续任务" : "发送目标 → 审阅计划 → 启动执行"}</span>
+                <span>{settings.main_executor === "codex" ? "Codex CLI" : "原生工具循环"} · 主智能体直接工作</span>
                 <span>⌘ ↵ 发送</span>
               </div>
             </div>
@@ -1190,11 +1171,20 @@ export default function App() {
         error={notice}
         open={modal === "settings"}
         onClose={() => setModal(null)}
-        title="模型与执行"
-        description="配置主智能体的模型网关，以及执行子任务的角色和执行器。"
+        title="偏好与模型"
+        description="调整本机界面、主智能体和远程子任务的执行配置。"
         wide
       >
         <form onSubmit={saveSettings} className="form-body">
+          <section className="appearance-settings" aria-label="本机界面设置">
+            <div className="settings-section-heading"><Settings2 size={18} /><h3>界面缩放</h3><span>仅此设备</span></div>
+            <div className="ui-scale-controls">
+              <label>缩放比例<Select aria-label="界面缩放比例" value={String(uiScale)} onValueChange={(value) => setUiScale(Number(value))}
+                options={UI_SCALE_OPTIONS.map((value) => ({ value: String(value), label: `${value}%${value === DEFAULT_UI_SCALE ? " · 默认" : ""}` }))} /></label>
+              <Button type="button" size="small" variant="secondary" onClick={() => setUiScale(DEFAULT_UI_SCALE)}>恢复默认</Button>
+            </div>
+            <p className="help-text">立即生效并自动保存在本机，重启后保持；不随模型配置同步。</p>
+          </section>
           <div className="mode-selector">
             <button
               type="button"
@@ -1207,7 +1197,7 @@ export default function App() {
             >
               <Code2 size={19} />
               <strong>真实执行</strong>
-              <span>按角色选择执行器</span>
+              <span>主智能体直接工作</span>
               {settingsForm.execution_mode === "native" && (
                 <CheckCircle2 size={15} />
               )}
@@ -1230,7 +1220,8 @@ export default function App() {
             </button>
           </div>
           <ProviderSettings settings={settingsForm} saved={settings} onChange={setSettingsForm} apiKey={apiKey}
-            onKeyChange={setApiKey} catalog={nativeModels} disabled={busy || !connected} />
+            onKeyChange={setApiKey} catalog={settingsForm.main_executor === "codex" ? codexModels : nativeModels} disabled={busy || !connected} />
+          <ModelContextSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy} catalogs={[nativeModels, codexModels]} />
           <AgentSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy}
             nativeModels={nativeModels} codexModels={codexModels} codexPathChanged={settingsForm.codex_binary !== settings.codex_binary} />
           <div className="codex-check">

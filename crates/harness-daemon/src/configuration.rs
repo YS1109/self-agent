@@ -66,7 +66,8 @@ pub(crate) fn resolve(settings: &Settings) -> Result<Settings> {
         }
         _ => bail!("模型配置来源无效"),
     };
-    crate::models::service_url(&resolved.base_url)?;
+    crate::models::models_url(&resolved.base_url, &resolved.models_endpoint)?;
+    crate::model_config::validate_registry(&resolved.model_contexts)?;
     validate_model(&resolved.model)?;
     if resolved.model.trim().is_empty() {
         bail!("尚未选择主智能体模型");
@@ -255,6 +256,7 @@ experimental_bearer_token = "unused-fixture-secret"
         let settings = Settings {
             model: String::new(),
             provider_source: "local_codex".into(),
+            models_endpoint: "/catalog?api-version=2026".into(),
             ..Settings::default()
         };
         let resolved = with_config(config, &settings, |name| {
@@ -262,6 +264,7 @@ experimental_bearer_token = "unused-fixture-secret"
         })
         .unwrap();
         assert_eq!(resolved.model, "local/model");
+        assert_eq!(resolved.models_endpoint, "/catalog?api-version=2026");
         assert_eq!(resolved.provider_headers["x-actor"], "fixture-actor-secret");
         let request = resolved
             .authorize(reqwest::Client::new().get("http://localhost"))

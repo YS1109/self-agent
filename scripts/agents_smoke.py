@@ -104,7 +104,14 @@ def main():
                  "executor": "codex" if codex else "native",
                  "model": "success" if codex else "fixture-role"},
                 {"id": "verifier", "name": "验证", "instructions": "角色快照验证",
-                 "executor": "native", "model": "fixture-role"},
+                 "executor": "native", "model": "fixture-role", "compression_threshold": 55},
+            ]
+            contexts = {"fixture-role": {"context_window": 64000, "compression_threshold": 70}}
+            expected_agents = [
+                {**agent, **contexts.get(agent["model"], {
+                    "context_window": 128000, "compression_threshold": 80,
+                }), **({"compression_threshold": 55} if agent["id"] == "verifier" else {})}
+                for agent in agents
             ]
             daemon.request("PUT", "/api/v1/settings", {
                 "base_url": f"http://127.0.0.1:{server.server_port}/v1",
@@ -112,6 +119,7 @@ def main():
                 "default_agent_id": "implementer", "execution_mode": "native",
                 "codex_binary": str(ROOT / "scripts" / "codex_fixture.py") if codex else "codex",
                 "api_key": "fixture-secret-not-for-storage",
+                "model_contexts": contexts,
             })
             session_id = daemon.command({
                 "type": "create_session", "title": "角色协议验证", "project_path": str(project),
@@ -126,6 +134,7 @@ def main():
                 "agents": [{"id": "changed", "name": "新角色", "instructions": "不得进入旧计划",
                             "executor": "native", "model": "wrong-model"}],
                 "default_agent_id": "changed",
+                "model_contexts": {"fixture-role": {"context_window": 32000, "compression_threshold": 90}},
             })
             # A desktop start must preserve the original remote origin.
             daemon.command({"type": "start_plan", "plan_id": plan["id"],
@@ -135,12 +144,17 @@ def main():
                               if p["id"] == plan["id"] and p["status"] == "completed"), None),
                 description="mixed executor plan completion",
             )
-            assert final["agents"] == agents
+            assert final["agents"] == expected_agents
             assert (project / "fixture-result.txt").read_text(encoding="utf-8") == "真实本地夹具写入"
             snapshot = daemon.snapshot()
             children = [t for t in snapshot["tasks"] if t.get("parent_task_id") == final["task_id"]]
             assert {t["agent"]["id"] for t in children} == {"implementer", "verifier"}
             assert all(t["status"] == "completed" for t in children)
+            for child in children:
+                expected = next(a for a in expected_agents if a["id"] == child["agent"]["id"])
+                assert child["context_config"] == {
+                    key: expected[key] for key in ("context_window", "compression_threshold")
+                }
             expected_ids = {t["id"] for t in children} | {final["task_id"]}
 
             def delivered():
@@ -159,7 +173,7 @@ def main():
             daemon.start()
             saved = daemon.request("GET", "/api/v1/settings")
             assert saved["default_agent_id"] == "changed"
-            assert next(p for p in daemon.snapshot()["plans"] if p["id"] == plan["id"])["agents"] == agents
+            assert next(p for p in daemon.snapshot()["plans"] if p["id"] == plan["id"])["agents"] == expected_agents
             assert not saved["api_key_configured"]
             print("PASS role persistence, historical plan snapshots and credential exclusion")
         finally:
