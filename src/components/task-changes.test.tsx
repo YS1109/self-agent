@@ -26,4 +26,9 @@ describe("只读改动报告",()=>{
   expect(html).toContain("重命名");expect(html).not.toContain("索引列表示已暂存状态");
  });
 
+ it("有界 Git 元数据明确区分暂存状态与原始文件字节，不猜测过滤及忽略语义",()=>{
+  const partial={state:"partial" as const,head_comparison:"unknown" as const,worktree_comparison:"raw_bytes_only" as const,entries:[{path:"new.txt",index:"?",worktree:"?",untracked:false,raw_worktree:"not_in_index_ignore_unknown" as const},{path:"tracked.txt",index:"M",worktree:"?",untracked:false,raw_worktree:"different_bytes" as const}]};
+  const html=renderToStaticMarkup(<ChangesReportView report={{...report,baseline_git:partial}}/>);
+  for(const label of ["仅索引列比较 HEAD 与暂存区", "字节不同", "忽略状态未知", "HEAD 不可完整读取", "字节相同也不能认定 Git 干净"]) expect(html).toContain(label);
+ });
 });

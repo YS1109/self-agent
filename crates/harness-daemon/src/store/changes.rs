@@ -241,14 +241,42 @@ fn validate_report(report: &Value) -> Result<()> {
         let git = &report[name];
         validate_keys(
             git,
-            &["state", "entries", "omitted_count", "reason", "scope"],
+            &[
+                "state",
+                "entries",
+                "omitted_count",
+                "reason",
+                "scope",
+                "head_comparison",
+                "worktree_comparison",
+                "reasons",
+                "notice",
+                "limits",
+            ],
         )?;
+        if let Some(limits) = git.get("limits") {
+            validate_keys(
+                limits,
+                &["metadata_bytes", "entries", "object_bytes", "delta_depth"],
+            )?;
+            if limits
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|value| value.as_u64().is_none())
+            {
+                bail!("Git 元数据预算必须为非负整数");
+            }
+        }
         if let Some(entries) = git["entries"].as_array() {
             if entries.len() > 200 {
                 bail!("Git 状态条目超过限制");
             }
             for entry in entries {
-                validate_keys(entry, &["path", "index", "worktree", "untracked"])?;
+                validate_keys(
+                    entry,
+                    &["path", "index", "worktree", "untracked", "raw_worktree"],
+                )?;
             }
         }
     }

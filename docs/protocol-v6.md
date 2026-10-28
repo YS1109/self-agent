@@ -1,8 +1,8 @@
 # 第七阶段协议：持久事件与会话续接
 
-日期：2026-10-28。状态：0.7 开发分支第三切片，尚未发布完整 0.7；应用版本号暂仍为 0.6.0。本文描述本分支已实现接口，未列能力继续沿用 [0.6 协议](protocol-v5.md)。
+日期：2026-10-28。状态：0.7 开发分支第四切片，尚未发布完整 0.7；应用版本号暂仍为 0.6.0。本文描述本分支已实现接口，未列能力继续沿用 [0.6 协议](protocol-v5.md)。
 
-本分支贯通共享 Rust 后台、Native/Codex 执行事件、桌面和浏览器消费、HTTP 恢复及 CLI 跟随，并新增 Codex 主会话续接和 Native 跨任务摘要。已增加执行中补充、明确继续、上下文估算及有界只读区间改动面板；没有人工审批界面，也不扩大工具权限。普通托管登录的原生 thread 复用和完整 Git 状态概览仍有下述明确限制，不能称完整 0.7 验收已经结束。
+本分支贯通共享 Rust 后台、Native/Codex 执行事件、桌面和浏览器消费、HTTP 恢复及 CLI 跟随，并新增 Codex 主会话续接和 Native 跨任务摘要。已增加执行中补充、明确继续、上下文估算及有界只读区间改动面板；没有人工审批界面，也不扩大工具权限。普通托管登录的原生 thread 复用和Git 状态概览仍有下述部分读取限制，不能称完整 0.7 验收已经结束。
 
 ## 事件与事实来源
 
@@ -132,9 +132,14 @@ Native 估算 source=`native_local`，phase=`before_compaction` / `request`，�
 
 任务取得项目写锁、首个执行器写入前，在内存中采集基线；排队期间外部变化不会归入此任务新增。结束、失败或取消后，在释放项目锁前采集尾状态。报告仅称「执行期间观察到的变化」，不保证与外部编辑独占归因。演示任务不伪造改动。
 
+- 改动区间固定使用同一目录能力：保存的绝对根路径逐组件 no-follow 打开，不重新 canonicalize；基线、结束文件扫描和 Git 读取共用固定句柄。排队期间根或祖先变为符号链接时拒绝读取；执行中根路径被替换时不跟随新目标。
 - 使用 cap-std / cap-fs-ext 的目录能力与逐级 no-follow 文件访问；隐藏/敏感/依赖目录、符号链接、包含已知凭据的文件排除。执行中才获知的 Codex 凭据会回溯过滤 before/after；原始基线不序列化、不写数据库。
 - 文件、字节、目录深度与差异均有界；支持中文路径、增删、相同内容重命名、只读/权限变化。二进制、大文件和超预算内容明确说明，不假造文本 diff。报告自身列出 limits/exclusions/partial。
-- 不修改 Git index/config，不执行 stage/reset/revert/commit。**生产采集不启动任何 Git 或其他子进程**：git status 会触发仓库 clean/process filters，不能在授权与沙箱之外执行。因此 baseline_git/current_git 当前明确 unavailable（原因 repository_filter_execution_disabled），不能声称已读取 staged/unstaged/HEAD 差异；项目根无 `.git` 时只表示根目录未检测到标记，不判断父目录仓库。
+- 不修改 Git index/config，不执行 stage/reset/revert/commit。**生产采集不启动任何 Git 或其他子进程**：git status 会触发仓库 clean/process filters，不能在授权与沙箱之外执行。第四切片改用 cap-relative no-follow 的有界元数据读取器；不读取用户全局配置，不执行过滤器、hooks、fsmonitor、credential helper、网络或 lazy fetch，不读取外部 alternates。
+- `baseline_git` / `current_git` 为刻意不完整的 `partial` 概览：支持 SHA-1 index v2/v3/v4、loose/packed refs、loose/pack v2 索引及带深度限制的 OFS/REF delta 对象。只读取 HEAD commit/tree 元数据，不展示或持久化历史普通文件 blobs。索引列比较已验证原始 HEAD 树与 index 的 mode/OID（A/M/D/U/?）；不独占归因于任务，不把它等同执行区间 diff。
+- 工作区列始终未知，另用 `raw_worktree` 展示 equal_bytes/different_bytes/missing/unknown/not_in_index_ignore_unknown/not_present；只比较当前有界文件快照的原始 blob 字节，不应用 Git 换行/编码/clean filter 或忽略规则。未纳入 index 不等于未跟踪，字节相同不证明 Git 干净。冲突、特殊 flags、未读取和不支持的文件类型保持 unknown；missing 需 no-follow 再确认路径确实不存在，不能因扫描遗漏或大小写名称差异推断删除。
+- 元数据读取累计最多 64 MiB，单元数据文件最多 8 MiB，index/tree 最多 20,000 entries，单解压对象 4 MiB、对象访问 1024 次、delta 深度 16、tree 深度 24、pack 文件最多 16 个且单文件不超过 4 GiB。压缩须到实际流结束，已使用对象重新核对 SHA-1；不扫描整个 pack CRC/trailer，校验范围不冒充仓库完整性审计。未知必需 index extension、SHA-256、split/sparse index、损坏/超限内容均明确 unknown/unavailable，不按空列表报干净。
+- loose ref 只有 no-follow 证明确实缺失才回退 packed refs；后者须完整有界验证、无重复和非法行，才能判断 unborn HEAD。外部/链接 gitdir、commondir、reftable、loose 或 packed replacement refs 均拒绝，不能选择旧 packed 值或读取外部目标。普通项目根没有 `.git` 时只报告根目录未检测到标记，不判断父目录仓库。报告不保证跨外部并发 Git 写入的原子快照。
 - 快照只含 `task.changes_summary`，状态 pending/available/unavailable/expired 及可见文件数、排除数、partial 等；数量不是完整项目改动总数。取消终态可能早于报告完成，前端显示待采集而非空 diff。
 - 认证 `GET /api/v1/tasks/{task_id}/changes` 按需返回安全报告（files/skipped/baseline_git/current_git 等），或 HTTP 200 的 `{state,task_id,reason,summary}` 不可用/过期状态。不存在任务仍报错误，不当成空报告。
 - 每份报告最多 512 KiB，最多保留最新 128 份（详情总量不超过 64 MiB）；过期保留任务和摘要。后台重启丢失内存基线时明确 unavailable，不恢复或重放写入。HTTP、桌面受控桥、浏览器代理和 CLI 共用同一详情接口。
@@ -143,4 +148,4 @@ Native 估算 source=`native_local`，phase=`before_compaction` / `request`，�
 
 默认仅本地 HTTP/stdio 夹具，不调用真实模型。原八组回归保持；`streaming_smoke.py` 覆盖流式/恢复，`continuation_smoke.py` 覆盖续接，`steering_smoke.py` 覆盖补充、ACK、取消及未知交付，`changes_smoke.py` 覆盖已有文件/index 保留、失败/取消改动、重启、锁后基线和恶意 Git filters 不执行；代理另有 `web_stream_smoke.py`。Codex 可执行夹具只在 Unix 运行，Windows 明确跳过该部分但继续 Native 场景。
 
-剩余 0.7 验收边界：托管登录身份的安全 thread 复用、不会执行项目配置且有严格资源边界的 Git 状态概览，以及受环境阻止的原生/浏览器视觉验收。实际服务与 GUI 未验证不能写作通过；应用版本仍为 0.6.0，完整 0.7 未发布。切片跟踪见 `acceptance-v0.7.md`。
+剩余 0.7 验收边界：托管登录身份的安全 thread 复用、Git 完整转换/忽略语义及未支持存储格式，以及受环境阻止的原生/浏览器视觉验收。实际服务与 GUI 未验证不能写作通过；应用版本仍为 0.6.0，完整 0.7 未发布。切片跟踪见 `acceptance-v0.7.md`。

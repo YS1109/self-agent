@@ -9,10 +9,10 @@
 | Codex 事件、已知身份 thread 续接 | 已提交；实际 stable schema + stdio 夹具 | 托管/动态/未知身份仍明确新 thread 导入历史 |
 | Native 跨任务摘要 | 已提交；三轮、重启、后缀/取消/策略失效 | 真实长上下文质量未测 |
 | 桌面/浏览器事件桥 | 已提交；前端、真实 HTTP 代理、Rust bridge、三平台 CI | 云端 GUI/布局/缩放实测受系统库与沙箱限制 |
-| 补充、排队、停止、继续 | 第三切片已实现；Native/Codex ACK、拒绝、终态竞态、断线、重启夹具 | 冻结本地门禁已通过；对应提交 CI 待运行；Applied 不是模型遵守保证 |
+| 补充、排队、停止、继续 | 第三切片已实现；Native/Codex ACK、拒绝、终态竞态、断线、重启夹具 | 冻结本地门禁及后续修复提交三平台 CI 已通过；Applied 不是模型遵守保证 |
 | 持久估算/压缩展示 | 已实现；本地估算与服务用量分离，事件淘汰/重开回归 | Codex 当前输入估算不是完整 thread 占用 |
 | 项目执行区间 diff | 已实现；cap-std 有界 no-follow、失败/取消、锁后基线、隐私及持久化回归 | 不能把外部并发编辑独占归给 Agent |
-| 项目全部 Git 状态 | **待安全实现**；当前明确不可用，index/config 保留 | git status 可执行 clean/process filters；不能绕过授权运行。单纯换 libgit2 也不能假设满足资源/no-follow 边界 |
+| Git 元数据概览 | 第四切片工作树已实现有界 no-follow index/HEAD/pack 读取，静态复审通过；不启动任何 Git 子进程 | 刻意 partial：工作区仅原始字节，转换/忽略语义未知；SHA-256、split/sparse、外部/替换 refs 等拒绝，不能声称全部 Git 状态 |
 | 联合 GUI 与正式 0.7 交付 | 尚未完成 | 应用版本提升、最终验证矩阵和已知边界需整合；没有发布授权 |
 
 ## 已发布检查点
@@ -25,10 +25,20 @@
 
 默认只用本地 HTTP / stdio 模拟模型，工具操作发生在隔离临时项目。禁止读取用户认证文件、发送真实通讯消息、购买/部署服务、合并 main 或发布。GUI 失败/未运行如实记录，不以 Web 构建代替视觉验收。
 
-新增 smoke：`steering_smoke.py`、`changes_smoke.py`；保留原八组及 streaming/continuation/web_stream。Codex 可执行夹具只在 Unix 运行，Windows 明确跳过并继续 Native 回归。第三切片冻结本地门禁：core 5、daemon 185、CLI 19、前端 104、同文件 Rust 事件桥无头测试 7 项；格式、全目标 Clippy、daemon/CLI/Web 构建通过。十二个后台 smoke 脚本全部通过，其中 streaming 8、continuation 8、steering 10、changes 7 组；HTTP 代理另有 3 组。对应提交三平台 CI 待运行，不能用上一切片成功代替。
+新增 smoke：`steering_smoke.py`、`changes_smoke.py`；保留原八组及 streaming/continuation/web_stream。Codex 可执行夹具只在 Unix 运行，Windows 明确跳过并继续 Native 回归。第三切片冻结本地门禁：core 5、daemon 185、CLI 19、前端 104、同文件 Rust 事件桥无头测试 7 项；格式、全目标 Clippy、daemon/CLI/Web 构建通过。十二个后台 smoke 脚本全部通过，其中 streaming 8、continuation 8、steering 10、changes 7 组；HTTP 代理另有 3 组。对应提交的跨平台修复和结果见下文，不能用上一切片成功代替。
 
 已修复的本地门禁失败：取消夹具过早观察服务端标记，尚不能证明客户端取得 turn ID；改为同步实际客户端 ACK 进度后完整重跑通过。仍未运行/未验证：真实模型、当前版本原生 GUI、云端完整 Tauri 构建（缺 GTK/WebKit 开发库）；事件桥无头测试不是完整桌面构建。
 
 ## 第三切片跨平台修复
 
-第三切片 `4d77bab2d8f000bde2b4ab8d844c09f5721f881d` 的 push 40743839739 / PR 40743844899 均在 Windows 新 changes smoke 发现夹具换行差异：Python write_text 默认生成 CRLF，而 Native 实际写入 LF，正确的区间 diff 因此包含先前行的换行变化。夹具现显式使用 LF，字节长度与预期跨平台一致；不修改生产 diff，也不隐藏真实换行变化。隔离该提交的独立工作树构建及七组 changes smoke 重跑通过。修复提交三平台 CI 另行跟踪，不能记作已通过。
+第三切片 `4d77bab2d8f000bde2b4ab8d844c09f5721f881d` 的 push 40743839739 / PR 40743844899 均在 Windows 新 changes smoke 发现夹具换行差异：Python write_text 默认生成 CRLF，而 Native 实际写入 LF，正确的区间 diff 因此包含先前行的换行变化。夹具现显式使用 LF，字节长度与预期跨平台一致；不修改生产 diff，也不隐藏真实换行变化。隔离该提交的独立工作树构建及七组 changes smoke 重跑通过。后续取消连接夹具修复与最终三平台结果见下文。
+
+## 第四切片：安全 Git 元数据读取
+
+不把 `git status` 当作无副作用读取，也不直接用缺少严格资源/no-follow 边界的 libgit2 statuses。新增本地有界解析器；格式依据 [Git index](https://git-scm.com/docs/gitformat-index)、[pack](https://git-scm.com/docs/gitformat-pack) 与 [loose object](https://git-scm.com/docs/gitformat-loose) 官方说明。
+
+独立审查已修复并复核：loose ref 安全失败不得回退旧 packed 值；packed refs 必须完整验证才证明 unborn；重复/失序树条目不得合成虚假 HEAD；冲突及遗漏文件不推断原始工作区状态；commondir/reftable/replacement refs 拒绝。另修复选定根目录重新 canonicalize 的链接替换风险：逐组件 no-follow 打开并在整个区间使用同一目录句柄，覆盖根/祖先链接拒绝及中途替换回归。界面和持久化 schema 已区分 staged 元数据与 raw bytes；原始内容和私有凭据不新增持久化。
+
+第四切片隔离冻结门禁通过：core 5、daemon 195、CLI 19、前端 105 项；格式、全目标 Clippy、daemon/CLI/Web 构建和十二个后台 smoke 脚本通过。隔离工作树的前端直接使用已安装的 Vitest/tsc/Vite，与 package scripts 等价；pnpm 的自动依赖状态检查试图写不可用的 home 缓存，未继续该安装动作。独立静态复审无剩余阻塞项。真实模型和 GUI 未运行，跨平台 CI 按本切片提交另记；不称整版已完成。
+
+第三切片修复 `365942c3` 的 Windows smoke 已通过换行断言，随后发现取消连接以 ConnectionAbortedError（10053）结束的预期差异；`7142474c89e33e4c8a0b6fa473b5dcf9b1182708` 单行补齐该异常类别，意外异常仍记录失败。该精确提交的 push `40746966975` / PR `40746977940` 均已成功，两次各六项三平台检查；第四切片仍须自己的 CI。

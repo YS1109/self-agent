@@ -25,9 +25,10 @@ function GitState({ title, observation }: { title: string; observation?: GitObse
   </section>;
   return <details className="changes-git">
     <summary>{title} · {({available:"已读取",partial:"部分可见",not_git:"非 Git 项目",unavailable:"不可读取"})[observation.state] ?? "状态未知"}</summary>
-    <p className="help-text">Git 工作区状态不是本任务增量。索引列表示已暂存状态，工作区列表示未暂存状态；未跟踪文件单独标记。</p>
+    {observation.worktree_comparison === "raw_bytes_only" ? <p className="help-text">仅索引列比较 HEAD 与暂存区；文件列比较原始字节，不执行过滤器、换行/编码转换或忽略规则。未纳入索引不等于未跟踪；字节相同也不能认定 Git 干净。{observation.head_comparison === "unknown" && " HEAD 不可完整读取，暂存状态未知。"}</p> : <p className="help-text">Git 工作区状态不是本任务增量。索引列表示已暂存状态，工作区列表示未暂存状态；未跟踪文件单独标记。</p>}
+    {observation.reasons?.length ? <p className="help-text">有界读取说明：{observation.reasons.map(reason => reason === "worktree_conversion_and_ignore_rules_not_executed" ? "未执行项目转换与忽略规则" : reason).join("；")}</p> : null}
     {observation.entries.length > 0 ? <ul>{observation.entries.map((entry, index) => <li key={`${index}:${entry.path}`}>
-      <code>{entry.path}</code><span>{entry.untracked ? "未跟踪" : `索引 ${entry.index.trim() || "—"} / 工作区 ${entry.worktree.trim() || "—"}`}</span>
+      <code>{entry.path}</code><span>{entry.raw_worktree ? `索引 ${entry.index.trim() || "—"} / 文件 ${({equal_bytes:"字节相同",different_bytes:"字节不同",missing:"未找到",unknown:"未知",not_in_index_ignore_unknown:"未纳入索引（忽略状态未知）",not_present:"不存在"})[entry.raw_worktree]}` : entry.untracked ? "未跟踪" : `索引 ${entry.index.trim() || "—"} / 工作区 ${entry.worktree.trim() || "—"}`}</span>
     </li>)}</ul> : <p className="help-text">没有可展示的 Git 状态条目；不可读取或过滤时不等于工作区干净。</p>}
     {!!observation.omitted_count && <p>另有 {observation.omitted_count} 条已排除。</p>}
   </details>;

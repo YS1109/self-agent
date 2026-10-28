@@ -13,6 +13,8 @@ cap-fs-ext.workspace = true
 cap-std.workspace = true
 dirs.workspace = true
 futures-util.workspace = true
+flate2.workspace = true
+sha1.workspace = true
 fs2 = "0.4"
 harness-core = { path = "../harness-core" }
 reqwest.workspace = true

@@ -47,11 +47,19 @@ export interface ChangesSummary {
   excluded_count?: number;
   attribution?: string;
 }
+export interface GitStatusEntry {
+  path: string; index: string; worktree: string; untracked: boolean;
+  raw_worktree?: "equal_bytes" | "different_bytes" | "missing" | "unknown" | "not_in_index_ignore_unknown" | "not_present";
+}
 export interface GitObservation {
   state: "available" | "partial" | "not_git" | "unavailable";
   reason?: string;
   omitted_count?: number;
-  entries: { path: string; index: string; worktree: string; untracked: boolean }[];
+  head_comparison?: "available" | "unknown";
+  worktree_comparison?: "raw_bytes_only";
+  reasons?: string[];
+  notice?: string;
+  entries: GitStatusEntry[];
 }
 export interface ChangesReport {
   version?: number;

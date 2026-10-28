@@ -220,13 +220,16 @@ def main():
             assert (project / "tracked.txt").read_text(encoding="utf-8") == USER_CONTENT + "TASK_NATIVE\n"
             assert (project / "untracked-user.txt").read_text(encoding="utf-8") == "USER_UNTRACKED_MUST_SURVIVE"
             assert (project / ".git" / "index").read_bytes() == original_index
-            assert normal_report["baseline_git"]["state"] == "unavailable"
-            assert normal_report["current_git"]["state"] == "unavailable"
-            assert normal_report["current_git"]["reason"] == "repository_filter_execution_disabled"
+            assert normal_report["baseline_git"]["state"] == "partial"
+            assert normal_report["current_git"]["state"] == "partial"
+            assert normal_report["current_git"]["worktree_comparison"] == "raw_bytes_only"
+            assert normal_report["current_git"]["head_comparison"] == "available"
+            tracked = next(item for item in normal_report["current_git"]["entries"] if item["path"] == "tracked.txt")
+            assert tracked["index"] == "M" and tracked["raw_worktree"] == "different_bytes" and tracked["worktree"] == "?"
             assert normal_report["partial"] is True
             assert not any(marker.exists() for marker in filter_markers), "Repository filter executed or received daemon credentials"
             print("PASS actual Native diff preserves staged, unstaged, untracked and Git index; HTTP/CLI agree")
-            print("PASS hostile clean/process Git filters never execute; Git status explicitly unavailable, not falsely clean")
+            print("PASS hostile clean/process Git filters never execute; bounded Git metadata separates staged and raw bytes, never falsely clean")
 
             serialized = json.dumps(normal_report, ensure_ascii=False)
             assert SECRET not in serialized and "ordinary.txt" not in serialized and ".env" not in serialized

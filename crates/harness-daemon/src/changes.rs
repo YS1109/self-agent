@@ -1,6 +1,7 @@
 //! Read-only, bounded observations of a workspace execution interval.
 //! Call capture after the project writer permit is acquired; call finish before
 //! releasing it, including failed/cancelled runs. This does not prove authorship.
+mod git;
 use anyhow::{bail, Context, Result};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -24,6 +25,7 @@ const MAX_REPORT: usize = 512 * 1024;
 /// must never accidentally enter task JSON, logs or a frontend snapshot.
 pub(crate) struct Baseline {
     root: PathBuf,
+    directory: Dir,
     files: Scan,
     git: Value,
     secrets: Vec<String>,
@@ -42,13 +44,15 @@ struct FileState {
     kind: &'static str,
     bytes: u64,
     digest: Option<[u8; 32]>,
+    git_oid: Option<[u8; 20]>,
     text: Option<String>,
     readonly: bool,
     mode: Option<u32>,
 }
 
 pub(crate) fn capture(root: &Path, known_secrets: &[String]) -> Result<Baseline> {
-    let root = std::fs::canonicalize(root).context("无法读取项目改动基线目录")?;
+    let directory = open_root(root)?;
+    let root = root.to_path_buf();
     if known_secrets.iter().map(String::len).sum::<usize>() > 512 * 1024 {
         bail!("敏感值配置超过改动检查预算");
     }
@@ -57,10 +61,11 @@ pub(crate) fn capture(root: &Path, known_secrets: &[String]) -> Result<Baseline>
         .filter(|s| !s.is_empty())
         .cloned()
         .collect();
-    let files = scan(&root, &secrets)?;
-    let git = git_status(&root);
+    let files = scan(&directory, &secrets);
+    let git = git::observe(&directory, &files, &secrets);
     Ok(Baseline {
         root,
+        directory,
         files,
         git,
         secrets,
@@ -91,27 +96,28 @@ pub(crate) fn finish(
             baseline.files.sensitive.insert(path.clone());
         }
     }
-    let canonical = std::fs::canonicalize(root).context("项目目录已不可用，无法读取执行后改动")?;
-    if canonical != baseline.root {
+    if root != baseline.root {
         bail!("项目目录已变化，不能与原改动基线比较");
     }
-    let after = scan(&canonical, &baseline.secrets)?;
+    let after = scan(&baseline.directory, &baseline.secrets);
     let hidden: BTreeSet<_> = baseline
         .files
         .sensitive
         .union(&after.sensitive)
         .cloned()
         .collect();
-    let current_git = git_status(&canonical);
+    let mut current_git = git::observe(&baseline.directory, &after, &baseline.secrets);
     let mut before_git = baseline.git;
     // A formerly safe file can become sensitive during execution. Never retain
     // its earlier name/status in a report that otherwise excludes that file.
-    if let Some(entries) = before_git["entries"].as_array_mut() {
-        entries.retain(|entry| {
-            entry["path"]
-                .as_str()
-                .is_some_and(|p| !hidden.contains(p) && !secret_in_path(p, &baseline.secrets))
-        });
+    for observation in [&mut before_git, &mut current_git] {
+        if let Some(entries) = observation["entries"].as_array_mut() {
+            entries.retain(|entry| {
+                entry["path"]
+                    .as_str()
+                    .is_some_and(|p| !hidden.contains(p) && !secret_in_path(p, &baseline.secrets))
+            });
+        }
     }
     let mut changes = Vec::new();
     let mut skipped = Vec::new();
@@ -231,7 +237,7 @@ pub(crate) fn finish(
         "notice":"以下为取得项目执行权后至结束时观察到的变化；外部程序也可能修改工作区，不能全部归因于本任务。此视图只读，不会暂存、重置或回滚文件。",
         "baseline_git":before_git,"current_git":current_git,"files":changes,"skipped":skipped,
         "partial":truncated || !baseline.files.complete || !after.complete || !skipped.is_empty()
-            || before_git["state"] == "unavailable" || current_git["state"] == "unavailable",
+            || matches!(before_git["state"].as_str(), Some("unavailable" | "partial")) || matches!(current_git["state"].as_str(), Some("unavailable" | "partial")),
         "excluded_count":baseline.files.excluded.max(after.excluded),
         "sensitive_file_count":hidden.len(),
         "limits":{"files":MAX_FILES,"file_bytes":MAX_FILE,"capture_bytes":MAX_CAPTURE,
@@ -304,15 +310,50 @@ fn push_bounded(output: &mut Vec<Value>, value: Value, size: &mut usize) -> bool
     true
 }
 
-fn scan(root: &Path, secrets: &[String]) -> Result<Scan> {
-    let dir = Dir::open_ambient_dir(root, cap_std::ambient_authority())
-        .context("无法打开项目改动目录")?;
+/// The saved root is already canonical at project selection. Do not canonicalize
+/// it again here: a queued root or ancestor may have been replaced by a symlink.
+/// Pin the directory for the entire interval, including its Git observations.
+fn open_root(root: &Path) -> Result<Dir> {
+    if !root.is_absolute() {
+        bail!("项目根目录必须是绝对路径");
+    }
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::new();
+    for component in root.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                #[cfg(windows)]
+                if !matches!(
+                    prefix.kind(),
+                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                ) {
+                    bail!("改动检查不接受远程或设备根目录");
+                }
+                anchor.push(prefix.as_os_str());
+            }
+            Component::RootDir => anchor.push(component.as_os_str()),
+            Component::Normal(name) => names.push(name.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => bail!("项目根目录不能包含上级路径"),
+        }
+    }
+    let mut directory = Dir::open_ambient_dir(anchor, cap_std::ambient_authority())
+        .context("无法打开项目所在文件系统")?;
+    for name in names {
+        directory = directory
+            .open_dir_nofollow(name)
+            .context("项目目录不可用或包含符号链接")?;
+    }
+    Ok(directory)
+}
+
+fn scan(dir: &Dir, secrets: &[String]) -> Scan {
     let mut scan = Scan {
         complete: true,
         ..Scan::default()
     };
-    walk(&dir, "", 0, secrets, &mut scan);
-    Ok(scan)
+    walk(dir, "", 0, secrets, &mut scan);
+    scan
 }
 
 fn walk(dir: &Dir, prefix: &str, depth: usize, secrets: &[String], scan: &mut Scan) {
@@ -449,6 +490,7 @@ fn walk(dir: &Dir, prefix: &str, depth: usize, secrets: &[String], scan: &mut Sc
                     kind: if text.is_some() { "text" } else { "binary" },
                     bytes: bytes.len() as u64,
                     digest: Some(digest),
+                    git_oid: Some(git::blob_oid(&bytes)),
                     text,
                     readonly: opened.permissions().readonly(),
                     mode: file_mode(&opened),
@@ -466,6 +508,7 @@ fn unavailable(kind: &'static str, bytes: u64) -> FileState {
         kind,
         bytes,
         digest: None,
+        git_oid: None,
         text: None,
         readonly: false,
         mode: None,
@@ -617,24 +660,6 @@ fn unified_diff(path: &str, old: Option<&str>, new: Option<&str>) -> Option<Stri
     Some(result)
 }
 
-/// Never run Git while collecting a baseline. Even `git status` can execute
-/// repository-controlled clean/process filters; disabling hooks and fsmonitor
-/// does not make it read-only. Enumerating filters and overriding them is racy.
-/// Until a separate non-executing index/object reader exists, do not claim a
-/// staged/unstaged/clean result. The filesystem interval report remains useful.
-fn git_status(root: &Path) -> Value {
-    match std::fs::symlink_metadata(root.join(".git")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            json!({"state":"not_git","entries":[],"scope":"project_root_metadata_only"})
-        }
-        _ => json!({
-            "state":"unavailable","entries":[],
-            "reason":"repository_filter_execution_disabled",
-            "scope":"current_worktree_status_not_task_attribution"
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,9 +670,10 @@ mod tests {
             let path =
                 std::env::temp_dir().join(format!("self-agent-changes-{}", harness_core::new_id()));
             std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(std::fs::canonicalize(path).unwrap())
         }
         fn write(&self, path: &str, text: impl AsRef<[u8]>) {
+            std::fs::create_dir_all(self.0.join(path).parent().unwrap()).unwrap();
             std::fs::write(self.0.join(path), text).unwrap();
         }
     }
@@ -656,6 +682,30 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn changed_root_links_are_rejected_and_interval_keeps_pinned_directory() {
+        use std::os::unix::fs::symlink;
+        let temp = Temp::new();
+        temp.write("project/file.txt", "before");
+        temp.write("outside/private.txt", "outside-marker-must-not-be-observed");
+        let root = temp.0.join("project");
+        let baseline = capture(&root, &[]).unwrap();
+        std::fs::rename(&root, temp.0.join("original")).unwrap();
+        symlink(temp.0.join("outside"), &root).unwrap();
+        assert!(capture(&root, &[]).is_err());
+        temp.write("original/file.txt", "after");
+        let report = finish(&root, baseline, &[]).unwrap();
+        let encoded = report.to_string();
+        assert!(encoded.contains("file.txt"));
+        assert!(encoded.contains("after"));
+        assert!(!encoded.contains("private.txt"));
+        assert!(!encoded.contains("outside-marker"));
+        symlink(temp.0.join("outside"), temp.0.join("linked-parent")).unwrap();
+        std::fs::create_dir(temp.0.join("outside/child")).unwrap();
+        assert!(capture(&temp.0.join("linked-parent/child"), &[]).is_err());
+    }
+
     fn git(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .current_dir(root)
@@ -702,8 +752,8 @@ mod tests {
             "user evidence"
         );
         assert_eq!(report["attribution"], "not_exclusive");
-        assert_eq!(report["baseline_git"]["state"], "unavailable");
-        assert_eq!(report["current_git"]["state"], "unavailable");
+        assert_eq!(report["baseline_git"]["state"], "partial");
+        assert_eq!(report["current_git"]["state"], "partial");
         assert_eq!(report["partial"], true);
         let files = report["files"].as_array().unwrap();
         assert_eq!(files.len(), 2);
@@ -753,10 +803,10 @@ mod tests {
             assert!(!outside.0.join("credential-leak").exists());
             assert_eq!(std::fs::read(root.0.join(".git/index")).unwrap(), index);
             assert_eq!(std::fs::read(root.0.join(".git/config")).unwrap(), config);
-            assert_eq!(report["baseline_git"]["state"], "unavailable");
+            assert_eq!(report["baseline_git"]["state"], "partial");
             assert_eq!(
-                report["current_git"]["reason"],
-                "repository_filter_execution_disabled"
+                report["current_git"]["worktree_comparison"],
+                "raw_bytes_only"
             );
             assert_eq!(report["files"][0]["path"], "tracked.txt");
             assert!(report["files"][0]["diff"]
@@ -933,5 +983,162 @@ mod tests {
         enforce_report_budget(&mut report);
         assert!(serde_json::to_vec(&report).unwrap().len() <= MAX_REPORT);
         assert_eq!(report["partial"], true);
+    }
+
+    #[test]
+    fn git_metadata_reads_loose_and_packed_heads_without_commands_or_conversions() {
+        let root = Temp::new();
+        git(&root.0, &["init", "-q"]);
+        git(&root.0, &["config", "user.name", "Fixture"]);
+        git(
+            &root.0,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        for n in 0..12 {
+            root.write(
+                "nested/main.txt",
+                format!("original {}\n", "x".repeat(1000 + n)),
+            );
+            root.write("中文.txt", format!("第{n}轮\n"));
+            git(&root.0, &["add", "."]);
+            git(&root.0, &["commit", "-qm", "fixture"]);
+        }
+        for packed in [false, true] {
+            if packed {
+                git(&root.0, &["gc", "--aggressive", "--prune=now"]);
+            }
+            root.write("中文.txt", "staged\n");
+            git(&root.0, &["add", "中文.txt"]);
+            root.write("中文.txt", "different raw bytes\r\n");
+            root.write("outside-index.txt", "untracked or ignored, unknown\n");
+            let state = capture(&root.0, &[]).unwrap().git;
+            assert_eq!(state["state"], "partial", "{state}");
+            assert_eq!(
+                state["head_comparison"], "available",
+                "packed={packed}: {state}"
+            );
+            let changed = state["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["path"] == "中文.txt")
+                .unwrap();
+            assert_eq!(changed["index"], "M");
+            assert_eq!(changed["raw_worktree"], "different_bytes");
+            assert_eq!(changed["worktree"], "?");
+            let new = state["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["path"] == "outside-index.txt")
+                .unwrap();
+            assert_eq!(new["raw_worktree"], "not_in_index_ignore_unknown");
+            assert_eq!(new["untracked"], false);
+        }
+    }
+
+    #[test]
+    fn index_versions_and_corruption_never_silently_report_clean() {
+        let root = Temp::new();
+        git(&root.0, &["init", "-q"]);
+        root.write("a/中文.txt", "content");
+        root.write("a/second.txt", "second");
+        git(&root.0, &["add", "."]);
+        for version in ["2", "3", "4"] {
+            git(
+                &root.0,
+                &["update-index", &format!("--index-version={version}")],
+            );
+            let state = capture(&root.0, &[]).unwrap().git;
+            assert_eq!(state["state"], "partial", "version={version}: {state}");
+        }
+        let good = std::fs::read(root.0.join(".git/index")).unwrap();
+        for n in 0..good.len() {
+            assert!(git::index(&good[..n], &mut git::Budget::new()).is_err());
+        }
+        let mut corrupt = good;
+        corrupt[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(root.0.join(".git/index"), corrupt).unwrap();
+        let state = capture(&root.0, &[]).unwrap().git;
+        assert_eq!(state["state"], "unavailable");
+        assert!(state["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_never_follows_external_directory_or_index_links() {
+        use std::os::unix::fs::symlink;
+        let root = Temp::new();
+        let outside = Temp::new();
+        outside.write("index", "OUTSIDE_CREDENTIAL");
+        symlink(&outside.0, root.0.join(".git")).unwrap();
+        let state = capture(&root.0, &[]).unwrap().git;
+        assert_eq!(state["state"], "unavailable");
+        assert!(!state.to_string().contains("OUTSIDE_CREDENTIAL"));
+        std::fs::remove_file(root.0.join(".git")).unwrap();
+        std::fs::create_dir(root.0.join(".git")).unwrap();
+        symlink(outside.0.join("index"), root.0.join(".git/index")).unwrap();
+        let state = capture(&root.0, &[]).unwrap().git;
+        assert_eq!(state["state"], "unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_loose_ref_never_falls_back_to_stale_packed_head() {
+        use std::os::unix::fs::symlink;
+        let root = Temp::new();
+        let outside = Temp::new();
+        git(&root.0, &["init", "-q"]);
+        git(&root.0, &["config", "user.name", "Fixture"]);
+        git(&root.0, &["config", "user.email", "fixture@invalid"]);
+        root.write("file.txt", "old");
+        git(&root.0, &["add", "."]);
+        git(&root.0, &["commit", "-qm", "old"]);
+        let reference = git(&root.0, &["symbolic-ref", "HEAD"]);
+        git(&root.0, &["pack-refs", "--all", "--prune"]);
+        root.write("file.txt", "new");
+        git(&root.0, &["add", "."]);
+        git(&root.0, &["commit", "-qm", "new"]);
+        let loose = root.0.join(".git").join(reference.trim());
+        std::fs::remove_file(&loose).unwrap();
+        outside.write("ref", "OUTSIDE_VALUE_MUST_NOT_BE_READ");
+        symlink(outside.0.join("ref"), &loose).unwrap();
+        let state = capture(&root.0, &[]).unwrap().git;
+        assert_eq!(state["head_comparison"], "unknown", "{state}");
+        assert!(state["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["index"] == "?"));
+        assert!(!state.to_string().contains("OUTSIDE_VALUE"));
+    }
+
+    #[test]
+    fn external_ref_markers_and_unobserved_names_do_not_invent_git_state() {
+        let root = Temp::new();
+        git(&root.0, &["init", "-q"]);
+        root.write("Known.txt", "bytes");
+        git(&root.0, &["add", "."]);
+        let mut baseline = capture(&root.0, &[]).unwrap();
+        baseline.files.files.clear();
+        let observed = git::observe(&baseline.directory, &baseline.files, &[]);
+        assert_eq!(
+            observed["entries"][0]["raw_worktree"], "unknown",
+            "{observed}"
+        );
+        for marker in ["commondir", "reftable", "refs/replace"] {
+            root.write(
+                &format!(".git/{marker}"),
+                "external target must not be opened",
+            );
+            let state = capture(&root.0, &[]).unwrap().git;
+            assert_eq!(state["state"], "unavailable", "{marker}: {state}");
+            std::fs::remove_file(root.0.join(".git").join(marker)).unwrap();
+        }
+        root.write(
+            ".git/packed-refs",
+            format!("{} refs/replace/{}\n", "1".repeat(40), "2".repeat(40)),
+        );
+        assert_eq!(capture(&root.0, &[]).unwrap().git["state"], "unavailable");
     }
 }
