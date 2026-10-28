@@ -2158,6 +2158,8 @@ mod tests {
     async fn search_redacts_matched_source_before_character_limit() {
         let root = std::env::temp_dir().join(harness_core::new_id());
         std::fs::create_dir(&root).unwrap();
+        // macOS temp_dir may use /var while scoped_path returns /private/var.
+        let root = root.canonicalize().unwrap();
         let secret = "fixture-search-boundary-secret";
         std::fs::write(
             root.join("source.txt"),

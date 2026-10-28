@@ -226,7 +226,7 @@ pub(crate) enum CodexLifecycle {
     TurnCompleted { thread_id: String, turn_id: String },
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn execute_with_context(
     binary: &str,
     model: &str,
