@@ -21,7 +21,7 @@ export function modelOptions(models: ModelOption[], current: string): ModelOptio
     : models;
 }
 
-export function useModelCatalog(body: { base_url?: string; api_key?: string; executor?: string }, enabled: boolean): ModelCatalog {
+export function useModelCatalog(body: { base_url?: string; api_key?: string; executor?: string; provider_source?: string }, enabled: boolean): ModelCatalog {
   const key = JSON.stringify(body);
   const [reload, setReload] = useState(0);
   const [result, setResult] = useState<{ key: string; models: ModelOption[]; loading: boolean; error: string }>({

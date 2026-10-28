@@ -94,6 +94,9 @@ pub async fn api_request(
         .join(&path)
         .map_err(|_| "本机接口路径无效".to_string())?;
     let mut request = bridge.client.request(method, url).bearer_auth(&info.token);
+    if path == "/api/v1/settings/check" {
+        request = request.timeout(Duration::from_secs(35));
+    }
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -149,10 +152,16 @@ fn validate_base_url(base_url: &str) -> Result<Url, String> {
 
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
     match (method, path) {
-        ("GET", "/api/v1/snapshot" | "/api/v1/settings" | "/api/v1/codex/status") => {
-            Ok(Method::GET)
+        (
+            "GET",
+            "/api/v1/snapshot"
+            | "/api/v1/settings"
+            | "/api/v1/codex/status"
+            | "/api/v1/provider/local-codex",
+        ) => Ok(Method::GET),
+        ("POST", "/api/v1/commands" | "/api/v1/models" | "/api/v1/settings/check") => {
+            Ok(Method::POST)
         }
-        ("POST", "/api/v1/commands" | "/api/v1/models") => Ok(Method::POST),
         ("PUT", "/api/v1/settings") => Ok(Method::PUT),
         _ => Err("不允许使用此本机接口路径或请求方法".into()),
     }
@@ -245,6 +254,8 @@ mod tests {
         assert!(validate_route("GET", "/api/v1/snapshot").is_ok());
         assert!(validate_route("POST", "/api/v1/commands").is_ok());
         assert!(validate_route("POST", "/api/v1/models").is_ok());
+        assert!(validate_route("GET", "/api/v1/provider/local-codex").is_ok());
+        assert!(validate_route("POST", "/api/v1/settings/check").is_ok());
         assert!(validate_route("PUT", "/api/v1/settings").is_ok());
         assert!(validate_route("GET", "/api/v1/codex/status").is_ok());
         for (method, path) in [

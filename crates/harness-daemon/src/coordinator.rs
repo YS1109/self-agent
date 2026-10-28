@@ -109,9 +109,7 @@ async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Va
     if mode == "demo" {
         return Ok(demo(kind, context));
     }
-    if !settings.configured() {
-        bail!("请先在模型设置中配置兼容的模型服务，再发送目标或继续计划");
-    }
+    let settings = crate::configuration::resolve(settings)?;
     let context_text = serde_json::to_string(&json!({"job":job,"context":context}))
         .context("无法编码主 Agent 会话上下文")?;
     if context_text.len() > MAX_CONTEXT_BYTES {
@@ -136,10 +134,7 @@ async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Va
         "{}/chat/completions",
         settings.base_url.trim_end_matches('/')
     );
-    let mut request = client.post(endpoint).json(&request_body);
-    if !settings.api_key.is_empty() {
-        request = request.bearer_auth(&settings.api_key);
-    }
+    let request = settings.authorize(client.post(endpoint).json(&request_body));
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         let response = request
             .send()
@@ -164,6 +159,14 @@ async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Va
             .map_err(|_| anyhow::anyhow!("主 Agent 模型服务返回了无效 JSON"))?;
         let mut parsed = parse_response(kind, &body)?;
         redact(&mut parsed, &settings.api_key);
+        for value in settings.provider_headers.values() {
+            if let Ok(value) = value.to_str() {
+                redact(&mut parsed, value);
+                if let Some(secret) = value.strip_prefix("Bearer ") {
+                    redact(&mut parsed, secret);
+                }
+            }
+        }
         Ok(parsed)
     })
     .await

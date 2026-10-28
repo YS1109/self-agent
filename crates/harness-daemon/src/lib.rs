@@ -1,4 +1,5 @@
 mod codex;
+mod configuration;
 mod coordinator;
 mod models;
 pub mod profiles;
@@ -43,11 +44,13 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub base_url: String,
     pub model: String,
     pub execution_mode: String,
+    #[serde(default = "configuration::default_source")]
+    pub provider_source: String,
     #[serde(default = "profiles::default_agents")]
     pub agents: Vec<profiles::AgentProfile>,
     #[serde(default = "profiles::default_agent_id")]
@@ -56,6 +59,8 @@ pub struct Settings {
     pub codex_binary: String,
     #[serde(skip)]
     pub api_key: String,
+    #[serde(skip)]
+    pub provider_headers: reqwest::header::HeaderMap,
 }
 
 impl Default for Settings {
@@ -65,10 +70,12 @@ impl Default for Settings {
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
             model: std::env::var("HARNESS_MODEL").unwrap_or_default(),
             execution_mode: "native".into(),
+            provider_source: configuration::default_source(),
             agents: profiles::default_agents(),
             default_agent_id: profiles::default_agent_id(),
             codex_binary: default_codex_binary(),
             api_key: std::env::var("HARNESS_API_KEY").unwrap_or_default(),
+            provider_headers: reqwest::header::HeaderMap::new(),
         }
     }
 }
@@ -96,15 +103,52 @@ fn default_codex_binary() -> String {
 
 impl Settings {
     pub fn configured(&self) -> bool {
-        !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+        configuration::resolve(self).is_ok()
+    }
+
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.headers(self.provider_headers.clone());
+        if self.api_key.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.api_key)
+        }
+    }
+
+    fn redact(&self, text: &str) -> String {
+        let mut text = redact_secret(text, &self.api_key);
+        for value in self.provider_headers.values() {
+            if let Ok(value) = value.to_str() {
+                text = redact_secret(&text, value);
+                if let Some(secret) = value.strip_prefix("Bearer ") {
+                    text = redact_secret(&text, secret);
+                }
+            }
+        }
+        text
     }
 
     fn public(&self) -> Value {
+        let result = configuration::resolve(self);
+        let effective = result.as_ref().unwrap_or(self);
+        let model = if configuration::validate_model(&effective.model).is_ok() {
+            effective.model.as_str()
+        } else {
+            ""
+        };
+        let mut agents = self.agents.clone();
+        for agent in &mut agents {
+            if configuration::looks_like_credential(&agent.model) {
+                agent.model.clear();
+            }
+        }
         json!({
-            "base_url": self.base_url, "model": self.model,
-            "execution_mode": self.execution_mode, "configured": self.configured(),
-            "api_key_configured": !self.api_key.is_empty(),
-            "agents":self.agents, "default_agent_id":self.default_agent_id,
+            "base_url": effective.base_url, "model": model,
+            "provider_source": self.provider_source,
+            "configuration_error": result.as_ref().err().map(ToString::to_string),
+            "execution_mode": self.execution_mode, "configured": result.is_ok(),
+            "api_key_configured": !effective.api_key.is_empty() || !effective.provider_headers.is_empty(),
+            "agents":agents, "default_agent_id":self.default_agent_id,
             "codex_binary":self.codex_binary
         })
     }
@@ -144,6 +188,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/commands", post(command))
         .route("/api/v1/settings", get(settings).put(update_settings))
+        .route("/api/v1/settings/check", post(check_settings))
+        .route("/api/v1/provider/local-codex", get(local_codex_provider))
         .route("/api/v1/codex/status", get(codex_status))
         .route("/api/v1/models", post(models::discover))
         .route("/api/v1/events", get(events))
@@ -252,6 +298,13 @@ async fn update_settings(
     Json(patch): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let mut settings = state.settings.write().unwrap();
+    let updated = patch_settings(&settings, &patch)?;
+    state.store.lock().unwrap().save_settings(&updated)?;
+    *settings = updated;
+    Ok(Json(settings.public()))
+}
+
+fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings> {
     let mut updated = settings.clone();
     for (field, target) in [
         ("base_url", &mut updated.base_url),
@@ -260,38 +313,71 @@ async fn update_settings(
         ("api_key", &mut updated.api_key),
         ("default_agent_id", &mut updated.default_agent_id),
         ("codex_binary", &mut updated.codex_binary),
+        ("provider_source", &mut updated.provider_source),
     ] {
         if let Some(value) = patch.get(field) {
             *target = value
                 .as_str()
-                .ok_or_else(|| {
-                    ApiError(StatusCode::BAD_REQUEST, format!("{field} 字段必须为文本"))
-                })?
+                .ok_or_else(|| anyhow::anyhow!("{field} 字段必须为文本"))?
                 .trim()
                 .to_string();
         }
     }
     if let Some(agents) = patch.get("agents") {
         updated.agents = serde_json::from_value(agents.clone())
-            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "子智能体角色配置格式无效".into()))?;
+            .map_err(|_| anyhow::anyhow!("子智能体角色配置格式无效"))?;
     }
     profiles::validate_agents(&updated.agents, &updated.default_agent_id)?;
     if updated.codex_binary.trim().is_empty()
         || updated.codex_binary.len() > 4096
         || updated.codex_binary.contains(['\0', '\n', '\r'])
     {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "Codex 可执行文件需要填写有效命令名或路径，参数由后台管理".into(),
-        ));
+        anyhow::bail!("Codex 可执行文件需要填写有效命令名或路径，参数由后台管理");
     }
     if !matches!(updated.execution_mode.as_str(), "native" | "demo") {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "执行模式无效".into()));
+        anyhow::bail!("执行模式无效");
     }
-    models::service_url(&updated.base_url)?;
-    state.store.lock().unwrap().save_settings(&updated)?;
-    *settings = updated;
+    configuration::validate_model(&updated.model)?;
+    match updated.provider_source.as_str() {
+        "manual" => {
+            models::service_url(&updated.base_url)?;
+            // Retaining an old credential while changing hosts would send it to a new service.
+            if (updated.base_url.trim_end_matches('/') != settings.base_url.trim_end_matches('/')
+                || settings.provider_source != "manual")
+                && patch.get("api_key").is_none()
+            {
+                updated.api_key.clear();
+            }
+        }
+        "local_codex" => {
+            configuration::resolve(&updated)?;
+            updated.api_key.clear();
+            updated.provider_headers.clear();
+            // The address and credentials are read from the source for each request.
+            updated.base_url.clear();
+        }
+        _ => anyhow::bail!("模型配置来源无效"),
+    }
+    Ok(updated)
+}
+
+async fn local_codex_provider() -> ApiResult<Json<Value>> {
+    let settings = Settings {
+        provider_source: "local_codex".into(),
+        model: String::new(),
+        ..Settings::default()
+    };
+    configuration::resolve(&settings)?;
     Ok(Json(settings.public()))
+}
+
+async fn check_settings(
+    State(state): State<Arc<AppState>>,
+    Json(patch): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    let settings = state.settings.read().unwrap().clone();
+    let draft = patch_settings(&settings, &patch)?;
+    Ok(Json(configuration::check(&draft).await?))
 }
 
 async fn command(
@@ -589,6 +675,88 @@ pub fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_credential_models_and_clears_credentials_when_service_changes() {
+        let settings = Settings {
+            base_url: "http://localhost:1234/v1".into(),
+            model: "fixture-model".into(),
+            api_key: "fixture-old-secret".into(),
+            ..Settings::default()
+        };
+        for patch in [
+            json!({"model":format!("sk-{}", "a".repeat(40))}),
+            json!({"agents":[{"id":"coder", "name":"编码", "executor":"native","model":format!("sk-{}", "a".repeat(40)), "instructions":""}]}),
+        ] {
+            assert!(patch_settings(&settings, &patch).is_err());
+        }
+        let updated =
+            patch_settings(&settings, &json!({"base_url":"http://localhost:4321/v1"})).unwrap();
+        assert!(updated.api_key.is_empty());
+        assert_eq!(settings.api_key, "fixture-old-secret");
+        assert_eq!(
+            patch_settings(&settings, &json!({"model":"another-model"}))
+                .unwrap()
+                .api_key,
+            "fixture-old-secret"
+        );
+        let malformed = Settings {
+            model: format!("sk-{}", "a".repeat(40)),
+            ..settings
+        };
+        let public = malformed.public();
+        assert_eq!(public["configured"], false);
+        assert_eq!(public["model"], "");
+        assert!(!public.to_string().contains(&malformed.model));
+    }
+
+    #[tokio::test]
+    async fn checking_a_draft_does_not_persist_it_or_block_settings_updates() {
+        use axum::routing::post;
+        let state = AppState::open(std::path::Path::new(":memory:"), "test".into()).unwrap();
+        let before = state.settings.read().unwrap().public();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let started = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let (seen, release) = (started.clone(), finish.clone());
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let (seen, release) = (seen.clone(), release.clone());
+                async move {
+                    seen.notify_one();
+                    release.notified().await;
+                    Json(json!({"choices":[{"message":{"content":"{\"ok\":true}"}}]}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+        let task_state = state.clone();
+        let check = tokio::spawn(async move {
+            check_settings(
+                State(task_state),
+                Json(json!({"base_url":base,"model":"fixture-model","api_key":"fixture-secret"})),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(state.settings.read().unwrap().public(), before);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            update_settings(State(state.clone()), Json(json!({"model":"changed-model"}))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        finish.notify_one();
+        assert_eq!(check.await.unwrap().unwrap().0["ok"], true);
+        assert_eq!(state.settings.read().unwrap().model, "changed-model");
+        assert!(state.settings.read().unwrap().api_key.is_empty());
+        server.abort();
+    }
 
     #[tokio::test]
     async fn invalid_settings_patch_cannot_partially_replace_roles_or_credentials() {

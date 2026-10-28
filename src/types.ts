@@ -148,6 +148,8 @@ export interface Snapshot {
 }
 export interface Settings {
   api_key_configured?: boolean;
+  provider_source?: "manual" | "local_codex";
+  configuration_error?: string | null;
   base_url: string;
   model: string;
   configured: boolean;

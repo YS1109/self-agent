@@ -73,7 +73,7 @@ function daemonProxy(): Plugin {
               "Content-Type": "application/json",
             },
             body: chunks.length ? Buffer.concat(chunks) : undefined,
-            signal: AbortSignal.timeout(15_000),
+            signal: AbortSignal.timeout(req.url === "/api/v1/settings/check" ? 35_000 : 15_000),
             redirect: "error",
           });
           res.statusCode = upstream.status;

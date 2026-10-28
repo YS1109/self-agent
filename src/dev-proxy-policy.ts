@@ -6,6 +6,8 @@ const localOrigins = new Set([
 const routes: Record<string, string> = {
   "GET /api/v1/snapshot": "GET",
   "GET /api/v1/settings": "GET",
+  "GET /api/v1/provider/local-codex": "GET",
+  "POST /api/v1/settings/check": "POST",
   "POST /api/v1/commands": "POST",
   "POST /api/v1/models": "POST",
   "GET /api/v1/codex/status": "GET",

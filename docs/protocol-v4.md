@@ -70,6 +70,14 @@
 
 ## 验证入口
 
+0.5.2 配置扩展沿用本机认证：
+
+- `GET /api/v1/settings` 返回有效来源的公开地址、模型、`provider_source`、`configured`、`api_key_configured` 与 `configuration_error`；不返回凭据或请求头。`configured` 只表示配置可解析，不代表已请求模型。
+- `PUT /api/v1/settings` 支持 `provider_source: "manual" | "local_codex"`，缺失时保留原来源，旧记录默认为 manual。local_codex 每次请求读取本机顶层自定义服务，保存可选模型覆盖；凭据与源地址不复制到配置记录。
+- `GET /api/v1/provider/local-codex` 只读来源公开元信息，不保存、不请求模型。
+- `POST /api/v1/settings/check` 接受与设置相同的草稿字段，发出一次无工具的 JSON 模型请求。成功返回 `{ok: true, message}`，失败返回中文错误；不保存、不建任务，等待模型时不持有设置锁。最长 30 秒、响应最多 256 KiB。
+- `POST /api/v1/models` 可显式指定 `provider_source`；来源为 local_codex 时使用源地址及鉴权，不采用草稿中的地址或密钥。manual 仅在同一来源和相同地址复用内存密钥。
+
 `python scripts/plan_change_smoke.py` 使用确定性模型响应和真实 Native 工具，覆盖独立布局版本、建议异步接收与幂等、跨入口显式路由、确认后应用、过期拒绝、重启，以及失败修复／命令验收／原来源回调。默认三平台 CI 执行该脚本。
 
 显式云端验收：

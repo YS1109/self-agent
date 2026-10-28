@@ -12,6 +12,7 @@ pub(crate) struct ModelRequest {
     base_url: Option<String>,
     api_key: Option<String>,
     executor: Option<String>,
+    provider_source: Option<String>,
 }
 
 pub(crate) fn service_url(value: &str) -> Result<Url> {
@@ -41,7 +42,7 @@ pub(crate) fn normalize_models(rows: &[Value], codex: bool) -> Result<Vec<Value>
         let Some(id) = id
             .as_str()
             .map(str::trim)
-            .filter(|id| !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control))
+            .filter(|id| !id.is_empty() && crate::configuration::validate_model(id).is_ok())
         else {
             continue;
         };
@@ -62,35 +63,66 @@ pub(crate) async fn discover(
     let models = match request.executor.as_deref().unwrap_or("native") {
         "codex" => crate::codex::list_models(&settings.codex_binary).await?,
         "native" => {
-            let url = service_url(request.base_url.as_deref().unwrap_or(&settings.base_url))?;
-            let saved_url = service_url(&settings.base_url)?;
-            // Never forward the saved credential to a newly entered service.
-            let key = request.api_key.unwrap_or_else(|| {
-                if url.as_str().trim_end_matches('/') == saved_url.as_str().trim_end_matches('/') {
-                    settings.api_key
-                } else {
-                    String::new()
+            let source = request
+                .provider_source
+                .as_deref()
+                .unwrap_or(&settings.provider_source);
+            let provider = match source {
+                "local_codex" => crate::configuration::resolve(&crate::Settings {
+                    provider_source: source.into(),
+                    model: String::new(),
+                    ..settings.clone()
+                })?,
+                "manual" => {
+                    let url =
+                        service_url(request.base_url.as_deref().unwrap_or(&settings.base_url))?;
+                    let same_service = settings.provider_source == "manual"
+                        && service_url(&settings.base_url).is_ok_and(|saved| {
+                            url.as_str().trim_end_matches('/')
+                                == saved.as_str().trim_end_matches('/')
+                        });
+                    crate::Settings {
+                        provider_source: "manual".into(),
+                        base_url: url.to_string(),
+                        api_key: request.api_key.unwrap_or_else(|| {
+                            if same_service {
+                                settings.api_key.clone()
+                            } else {
+                                String::new()
+                            }
+                        }),
+                        provider_headers: Default::default(),
+                        ..settings
+                    }
                 }
-            });
-            fetch_models(url, &key).await?
+                _ => return Err(anyhow::anyhow!("模型配置来源无效").into()),
+            };
+            fetch_models_with_provider(&provider).await?
         }
         _ => return Err(anyhow::anyhow!("模型列表执行器无效").into()),
     };
     Ok(Json(json!({"models":models})))
 }
 
+#[cfg(test)]
 async fn fetch_models(base: Url, key: &str) -> Result<Vec<Value>> {
-    let endpoint = format!("{}/models", base.as_str().trim_end_matches('/'));
+    fetch_models_with_provider(&crate::Settings {
+        base_url: base.to_string(),
+        api_key: key.into(),
+        ..Default::default()
+    })
+    .await
+}
+
+async fn fetch_models_with_provider(provider: &crate::Settings) -> Result<Vec<Value>> {
+    let endpoint = format!("{}/models", provider.base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(12))
         .build()
         .context("无法初始化模型列表连接")?;
-    let mut request = client.get(endpoint);
-    if !key.is_empty() {
-        request = request.bearer_auth(key);
-    }
+    let request = provider.authorize(client.get(endpoint));
     let mut response = request.send().await.map_err(|_| {
         anyhow::anyhow!("无法获取模型列表，请检查服务地址和连接，或手动填写模型 ID")
     })?;

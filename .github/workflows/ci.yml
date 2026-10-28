@@ -30,6 +30,7 @@ jobs:
           python-version: "3.12"
       - run: python scripts/smoke.py
       - run: python scripts/provider_smoke.py
+      - run: python scripts/configuration_smoke.py
       - run: python scripts/orchestration_smoke.py
       - run: python scripts/agents_smoke.py
       - run: python scripts/runtime_smoke.py

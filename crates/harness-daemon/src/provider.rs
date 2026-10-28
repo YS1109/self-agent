@@ -36,10 +36,22 @@ pub async fn execute_with_evidence(
     cancelled: impl Fn() -> bool,
     evidence: impl Fn(CommandEvidence),
 ) -> Result<String> {
-    execute_inner(settings, root, objective, progress, cancelled, evidence)
-        .await
-        .map(|text| redact(&text, &settings.api_key))
-        .map_err(|error| anyhow!(redact(&error.to_string(), &settings.api_key)))
+    let settings = crate::configuration::resolve(settings)?;
+    execute_inner(
+        &settings,
+        root,
+        objective,
+        progress,
+        cancelled,
+        |mut item| {
+            item.command = settings.redact(&item.command);
+            item.output = settings.redact(&item.output);
+            evidence(item);
+        },
+    )
+    .await
+    .map(|text| settings.redact(&text))
+    .map_err(|error| anyhow!(settings.redact(&error.to_string())))
 }
 
 fn redact(text: &str, secret: &str) -> String {
@@ -94,10 +106,7 @@ async fn execute_inner(
         if serde_json::to_vec(&request_body)?.len() > 2 * 1024 * 1024 {
             bail!("原生执行已达到 2 MiB 上下文预算，请检查已有改动后创建后续任务");
         }
-        let mut request = client.post(&endpoint).json(&request_body);
-        if !settings.api_key.is_empty() {
-            request = request.bearer_auth(&settings.api_key);
-        }
+        let request = settings.authorize(client.post(&endpoint).json(&request_body));
         let response = interruptible(
             async {
                 let response = request

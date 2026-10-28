@@ -51,7 +51,8 @@ import { PlanChanges } from "./components/plan-changes";
 import { ExecutionEvidence } from "./components/execution-evidence";
 import { Status } from "./components/status";
 import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/agent-settings";
-import { ModelSelect, QuickModelSelect, useModelCatalog } from "./components/model-select";
+import { QuickModelSelect, useModelCatalog } from "./components/model-select";
+import { ProviderSettings } from "./components/provider-settings";
 import { syncNativeTheme, type AppTheme } from "./theme";
 import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./labels";
 import { Button } from "./components/ui/button";
@@ -221,8 +222,8 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [codexStatus, setCodexStatus] = useState("");
   const [checkingCodex, setCheckingCodex] = useState(false);
-  const quickModels = useModelCatalog({ base_url: settings.base_url }, connected && !!settings.base_url);
-  const nativeModels = useModelCatalog({ base_url: settingsForm.base_url, ...(apiKey ? { api_key: apiKey } : {}) }, connected && modal === "settings" && !!settingsForm.base_url);
+  const quickModels = useModelCatalog({ provider_source: settings.provider_source ?? "manual", base_url: settings.base_url }, connected && (!!settings.base_url || settings.provider_source === "local_codex"));
+  const nativeModels = useModelCatalog({ provider_source: settingsForm.provider_source ?? "manual", base_url: settingsForm.base_url, ...(apiKey ? { api_key: apiKey } : {}) }, connected && modal === "settings" && (!!settingsForm.base_url || settingsForm.provider_source === "local_codex"));
   const codexModels = useModelCatalog({ executor: "codex" }, connected && modal === "settings"
     && settingsForm.codex_binary === settings.codex_binary && settingsForm.agents.some((agent) => agent.executor === "codex"));
   const [inputModes, setInputModes] = useState<Record<string, "goal" | "change">>({});
@@ -412,6 +413,7 @@ export default function App() {
     try {
       const value = await api<Settings>("PUT", "/settings", {
         base_url: settingsForm.base_url,
+        provider_source: settingsForm.provider_source ?? "manual",
         model: settingsForm.model,
         execution_mode: settingsForm.execution_mode,
         agents: settingsForm.agents,
@@ -583,7 +585,7 @@ export default function App() {
               <span className="avatar">Y</span>
               <span>
                 <strong>个人工作空间</strong>
-              <small>本地优先 · v0.5.1</small>
+              <small>本地优先 · v0.5.2</small>
               </span>
               <Settings2 size={15} />
             </button>
@@ -1224,41 +1226,8 @@ export default function App() {
               )}
             </button>
           </div>
-          <label>
-            主智能体 · 模型服务地址
-            <input
-              type="url"
-              placeholder="https://api.example.com/v1"
-              value={settingsForm.base_url}
-              onChange={(e) =>
-                setSettingsForm((s) => ({ ...s, base_url: e.target.value }))
-              }
-            />
-          </label>
-          <ModelSelect label="主智能体 · 模型" value={settingsForm.model} catalog={nativeModels} disabled={busy}
-            onChange={(model) => setSettingsForm((current) => ({ ...current, model }))} />
-          <label>
-            访问密钥{" "}
-            <span className="field-note">
-              {settings.api_key_configured ? "已配置 · 留空保留" : "未配置"}
-            </span>
-            <input
-              type="password"
-              autoComplete="off"
-              placeholder={
-                settings.api_key_configured ? "留空保留现有密钥" : "输入访问密钥"
-              }
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-            />
-          </label>
-          <div className="form-info">
-            <ShieldCheck size={16} />
-            <p>
-              访问密钥仅保存在后台进程内存中，重启后需重新填写，也可通过环境变量配置。模型协议为
-              Chat Completions。
-            </p>
-          </div>
+          <ProviderSettings settings={settingsForm} saved={settings} onChange={setSettingsForm} apiKey={apiKey}
+            onKeyChange={setApiKey} catalog={nativeModels} disabled={busy || !connected} />
           <AgentSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy}
             nativeModels={nativeModels} codexModels={codexModels} codexPathChanged={settingsForm.codex_binary !== settings.codex_binary} />
           <div className="codex-check">

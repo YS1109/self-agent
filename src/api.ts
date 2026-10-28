@@ -18,7 +18,7 @@ export async function api<T>(
     headers:
       body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(20_000),
+    signal: AbortSignal.timeout(path === "/settings/check" ? 35_000 : 20_000),
   });
   const data = await response.json();
   if (!response.ok)

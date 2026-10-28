@@ -55,6 +55,20 @@ impl Store {
             .map(|body| serde_json::from_str::<Settings>(&body))
             .transpose()?
             .unwrap_or_default();
+        let mut repaired = false;
+        if crate::configuration::looks_like_credential(&settings.model) {
+            settings.model.clear();
+            repaired = true;
+        }
+        for agent in &mut settings.agents {
+            if crate::configuration::looks_like_credential(&agent.model) {
+                agent.model.clear();
+                repaired = true;
+            }
+        }
+        if repaired {
+            self.save_settings(&settings)?;
+        }
         if let Ok(value) = std::env::var("HARNESS_BASE_URL") {
             settings.base_url = value;
         }
@@ -285,8 +299,15 @@ impl Store {
                 let agent = resolve_agent(&settings.agents, &settings.default_agent_id, requested)?;
                 if settings.execution_mode == "native"
                     && agent.executor == "native"
-                    && (settings.base_url.trim().is_empty()
-                        || (settings.model.trim().is_empty() && agent.model.trim().is_empty()))
+                    && !(Settings {
+                        model: if agent.model.trim().is_empty() {
+                            settings.model.clone()
+                        } else {
+                            agent.model.clone()
+                        },
+                        ..settings.clone()
+                    })
+                    .configured()
                 {
                     bail!(CONFIGURATION_HINT);
                 }
@@ -2300,6 +2321,26 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn loading_legacy_settings_removes_mislocated_credentials_from_saved_models() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let secret = format!("sk-{}", "x".repeat(40));
+        let mut settings = config();
+        settings.model = secret.clone();
+        settings.agents[0].model = secret.clone();
+        store.save_settings(&settings).unwrap();
+        let loaded = store.load_settings().unwrap();
+        assert!(loaded.model.is_empty());
+        assert!(loaded.agents[0].model.is_empty());
+        let body: String = store
+            .db
+            .query_row("SELECT body FROM settings WHERE id='provider'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!body.contains(&secret));
     }
 
     #[test]

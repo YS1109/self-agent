@@ -36,6 +36,7 @@ pub fn validate_agents(agents: &[AgentProfile], default_id: &str) -> Result<()> 
         if agent.instructions.len() > 32_000 || agent.model.len() > 200 {
             bail!("角色指令不能超过 32000 字节，模型名不能超过 200 字节");
         }
+        crate::configuration::validate_model(&agent.model)?;
         if !matches!(agent.executor.as_str(), "native" | "codex") {
             bail!("角色执行器仅支持 native 或 codex");
         }
