@@ -6,7 +6,7 @@
 
 - 后台启动先取得私有数据目录的 `daemon.lock`，处理既有恢复 journal，再以只读 `SQLITE_OPEN_NOFOLLOW` 连接检查 `user_version` 和 `storage_migrations`。检查成功后才打开可写 Store、运行迁移和恢复。
 - 数据目录须为绝对本地路径；逐个组件拒绝链接，Windows 拒绝非固定本地驱动及重解析路径。新 Unix 目录使用 0700；既有目录不擅自改权限，Windows 使用继承 ACL，不声称等价于 Unix 权限。所有者应选择自己控制的私有目录。
-- 当前 schema 为 **1**，ledger identity 为 `self-agent-schema-v1-atomic-baseline`。没有 ledger 的版本 0 是历史基线；当前全部建表、旧事件有序序号转换、能力/服务/QQ schema 和备份任务表在一个事务内迁移，失败回滚。未来新增 schema 必须显式提高版本并定义迁移，不能继续偷偷建表。
+- 本协议第一应用切片的 schema 为 **1**，ledger identity 为 `self-agent-schema-v1-atomic-baseline`。没有 ledger 的版本 0 是历史基线；当前全部建表、旧事件有序序号转换、能力/服务/QQ schema 和备份任务表在一个事务内迁移，失败回滚。未来新增 schema 必须显式提高版本并定义迁移，不能继续偷偷建表。
 - 较新版本、缺失/冲突 ledger、不可安全只读检查的 hot journal 均拒绝启动，不重建或删除原数据库。只读检查不执行应用迁移；WAL 的共享内存协调不代表所有 SHM 字节永远不变。
 
 ## 2. 所有者 HTTP 接口
@@ -57,7 +57,7 @@ self-agent-cli --data-dir /absolute/data restore /absolute/backup --confirm-sha2
 - QQ 配置停用，绑定、配对、ACL、选择、checkpoint、回复资格撤销；历史 routes、sent/unknown 审计保留；pending 不发送、sending 转 unknown。恢复中的凭据操作不重放，也不自动删除外部秘密。
 - 备份操作 pending/running 转 unknown；备份自身包含的在途回执也不重新导出。
 
-H5/gateway 的恢复撤权需随其显式 schema 迁移接入，未接线模块不算本切片完成。
+后续已接入 H5/gateway 的 schema v2 迁移与恢复撤权，见 protocol-v11；当前索引调度 schema v3 见 protocol-v13。该后续实现不改变本节不重放和保留未知事实的原则。
 
 ## 5. 诊断与界面
 

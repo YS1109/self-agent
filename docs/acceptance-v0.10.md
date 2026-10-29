@@ -51,3 +51,5 @@
 - 独立只读审查覆盖隔离服务与实际 Store/API/supervisor/restore/UI/CLI，已报告的修复复读 clear，无剩余源码 blocker。最终精确提交与远端 CI 另行跟踪；没有 merge、tag、release 或部署。
 
 仅作格式/容量提示的 Web chunk-size 警告仍存在，不是构建失败。当前环境未安装 nginx，示例仅官方指令核对与源码审查，未运行 `nginx -t` 或真实 TLS 代理。
+
+精确提交 `3160a4e2e0b0cf54030c56c43b50c6f8e136680c` 的 push `40792802861` / PR `40792812481` 均终态 6/6 成功（三平台 Rust 与 Desktop）。这不替代真实部署、系统凭据和手机视觉验证。

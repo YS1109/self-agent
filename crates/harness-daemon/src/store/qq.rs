@@ -456,7 +456,7 @@ pub(super) fn check_source(db: &Connection, value: &Value) -> Result<()> {
 pub(super) fn reconcile(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
     let mut produced = Vec::new();
     // Record the first stop cause before cancel_plan touches parent/worker tasks.
-    for mut task in rows(tx, "tasks")? {
+    for mut task in scheduling::active_remote(tx, scheduling::RemoteTable::Tasks, "qq")? {
         if task_active(&task) && check_source(tx, &task).is_err() {
             if task["stop_reason"].is_null() {
                 task["stop_reason"] = json!("remote_permission_revoked");
@@ -464,7 +464,7 @@ pub(super) fn reconcile(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
             put(tx, "tasks", &task)?;
         }
     }
-    for plan in rows(tx, "plans")? {
+    for plan in scheduling::active_remote(tx, scheduling::RemoteTable::Plans, "qq")? {
         if !matches!(
             plan["status"].as_str(),
             Some("completed" | "failed" | "cancelled")
@@ -473,7 +473,7 @@ pub(super) fn reconcile(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
             produced.extend(cancel_plan(tx, text(&plan, "id")?)?);
         }
     }
-    for mut task in rows(tx, "tasks")? {
+    for mut task in scheduling::active_remote(tx, scheduling::RemoteTable::Tasks, "qq")? {
         if task_active(&task) && check_source(tx, &task).is_err() {
             task["status"] = json!("cancelled");
             task["error"] = json!("QQ 来源权限已失效；未继续执行。");
@@ -484,7 +484,7 @@ pub(super) fn reconcile(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
             produced.push(complete_transaction(tx, &mut task)?);
         }
     }
-    for mut job in rows(tx, "coordinator_jobs")? {
+    for mut job in scheduling::active_remote(tx, scheduling::RemoteTable::Jobs, "qq")? {
         if matches!(job["status"].as_str(), Some("pending" | "running"))
             && check_source(tx, &job).is_err()
         {

@@ -697,6 +697,10 @@ fn validate_private_record(table: &str, value: &Value) -> Result<()> {
 }
 
 pub(crate) fn validate_records(db: &Connection) -> Result<()> {
+    validate_v2_records(db)?;
+    scheduling::validate(db)
+}
+pub(crate) fn validate_v2_records(db: &Connection) -> Result<()> {
     validate_records_version(db, true)?;
     validate_gateway_records(db)
 }

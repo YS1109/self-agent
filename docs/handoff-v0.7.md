@@ -174,3 +174,9 @@ MCP 环境凭据后续切片见 protocol-v9 附节与 acceptance-mcp-credentials
 0.10 接线与边界见 `protocol-v11.md` / `acceptance-v0.10.md`。当前 gateway wire 在 core，独立服务在 `crates/harness-gateway`，daemon private modules 在 `gateway/`、可信 Store 边界在 `store/gateway.rs`，移动构建在 `src/mobile`。schema 已显式扩到 v2；后续表结构变更不能绕过迁移 ledger 或恢复撤权。
 
 真实本地 HTTP/WS 联合入口是 `scripts/gateway_smoke.py`；它只用临时设备 token、模拟 Native HTTP 和 isolated SQLite。不要把其通过扩写为真实公网/TLS、系统凭据、原生 GUI 或手机浏览器视觉验收。源码冻结、提交与 CI 结果按 0.10 验收文档更新。
+
+## 1.0 性能第一切片：索引调度与保留失败
+
+显式 schema v3 索引调度已接入 Store，旧 v1/v2 的启动与备份恢复依次迁移；候选筛选不再反序列化全部已完成历史，仍保留暂停/串行/远端撤权语义。协议见 [v13](protocol-v13.md)，实际同 seed 指标见 [performance-v1.0](performance-v1.0.md)。
+
+1,000 / 5,000 任务的空闲 CPU 和完整 SSE 回放已有明显改善，但 5,000 任务全量快照仍超出 CLI 16 MiB 上限，高峰内存与活动主任务历史检查仍待后续有界读取切片。失败保留，不宣称性能验收全部通过。生命周期及更新 helper 不混入本提交；实际门禁和精确 CI 见 acceptance-v1.0。

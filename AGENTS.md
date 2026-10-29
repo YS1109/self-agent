@@ -11,3 +11,5 @@
 - QQ 开发切片协议见 `docs/protocol-v10.md`，范围见 `docs/iteration-v0.9.md`，模拟门禁与真实平台延期边界见 `docs/acceptance-v0.9.md`；QQ 不是本机管理 API 代理。
 - 1.0 版本化存储、备份恢复及诊断见 `docs/protocol-v12.md`、`docs/iteration-v1.0.md` 与 `docs/acceptance-v1.0.md`。schema 迁移必须显式提高 ledger 版本；恢复需要撤销所有执行、远端及凭据操作权威，不自动重放副作用。独立 lifecycle/update helper 不等于已完成应用生命周期或生产发布。
 - 0.10 自托管网关/H5 合同见 `docs/protocol-v11.md`，联合门禁与未验证范围见 `docs/acceptance-v0.10.md`。远端仅经白名单 RPC 与本机作用域授权；不得复用 owner bearer、自动重发未知命令、提供任意路径下载或把观察结果误记为已投递。gateway schema 由显式 v2 ledger 管理，恢复必须撤销其配置/配对/凭据与回执权威。
+
+- 有索引调度与 schema v3 见 `docs/protocol-v13.md`，长历史真实失败和同 seed 对照见 `docs/performance-v1.0.md`；分页尚未接线前，不能把空闲 CPU/回放改善当成大快照容量通过。

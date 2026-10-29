@@ -21,6 +21,7 @@ pub(crate) mod gateway;
 pub(crate) mod providers;
 pub(crate) mod qq;
 pub(crate) mod reliability;
+mod scheduling;
 mod steering;
 
 const MAX_NODES: usize = 12;
@@ -89,7 +90,11 @@ pub(crate) fn prepare_database(db: &mut Connection) -> Result<()> {
         |tx| {
             reliability::validate_v1_records(tx)?;
             gateway::migrate(tx)?;
-            reliability::validate_records(tx)
+            reliability::validate_v2_records(tx)
+        },
+        |tx| {
+            reliability::validate_v2_records(tx)?;
+            scheduling::migrate(tx)
         },
     )?;
     reliability::validate_records(db)
@@ -429,8 +434,7 @@ impl Store {
         qq::reconcile(&tx)?;
         gateway::reconcile(&tx)?;
         advance_plans(&tx)?;
-        let mut candidates = rows(&tx, "tasks")?;
-        candidates.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
+        let candidates = scheduling::queued_tasks(&tx)?;
         let Some(mut task) = candidates.into_iter().find(|task| {
             task["status"] == "queued"
                 && task["task_kind"] != "plan"
@@ -633,8 +637,7 @@ impl Store {
         qq::reconcile(&tx)?;
         gateway::reconcile(&tx)?;
         advance_plans(&tx)?;
-        let mut jobs = rows(&tx, "coordinator_jobs")?;
-        jobs.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
+        let jobs = scheduling::pending_jobs(&tx)?;
         let mut claimed = None;
         for mut job in jobs {
             if job["status"] != "pending" {
@@ -839,10 +842,7 @@ impl Store {
 
     pub fn deliver_one(&mut self) -> Result<Option<RunEvent>> {
         let tx = self.db.transaction()?;
-        let Some(mut delivery) = rows(&tx, "deliveries")?
-            .into_iter()
-            .find(|item| item["status"] == "pending" && item["target"]["channel_id"] != "qq")
-        else {
+        let Some(mut delivery) = scheduling::pending_delivery(&tx)? else {
             return Ok(None);
         };
         delivery["status"] = json!("sending");
@@ -2310,7 +2310,7 @@ fn sync_task_node(tx: &Transaction<'_>, task: &Value) -> Result<()> {
 
 fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
     let mut produced = Vec::new();
-    for mut plan in rows(tx, "plans")? {
+    for mut plan in scheduling::running_plans(tx)? {
         if plan["status"] != "running" {
             continue;
         }
@@ -4641,6 +4641,42 @@ mod tests {
         assert_eq!(
             record(&store.db, "tasks", cancelled["task_id"].as_str().unwrap()).unwrap()["status"],
             "cancelled"
+        );
+    }
+
+    #[test]
+    fn indexed_claim_skips_paused_plan_and_blocked_session_without_starvation() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("paused-first", &[])]));
+        start(&mut store, &plan);
+        control(&mut store, plan["id"].as_str().unwrap(), "pause_plan");
+        // The oldest queued child is in a paused plan, not a reason to stop
+        // searching the queue before a later independently runnable main task.
+        let first = send(&mut store, json!({"type":"run_agent","content":"FIRST"}));
+        let blocked = send(&mut store, json!({"type":"run_agent","content":"BLOCKED"}));
+        assert_eq!(store.claim_task().unwrap().unwrap()["id"], first["task_id"]);
+        assert!(store.claim_task().unwrap().is_none());
+        session(&mut store);
+        let other = send(
+            &mut store,
+            json!({"type":"run_agent","content":"OTHER SESSION"}),
+        );
+        assert_eq!(store.claim_task().unwrap().unwrap()["id"], other["task_id"]);
+        assert_eq!(
+            record(&store.db, "tasks", blocked["task_id"].as_str().unwrap()).unwrap()["status"],
+            "queued"
+        );
+        store
+            .finish(first["task_id"].as_str().unwrap(), Ok("done".into()))
+            .unwrap();
+        assert_eq!(
+            store.claim_task().unwrap().unwrap()["id"],
+            blocked["task_id"]
+        );
+        assert_eq!(
+            current_plan(&store, plan["id"].as_str().unwrap())["status"],
+            "paused"
         );
     }
 

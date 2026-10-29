@@ -1,5 +1,14 @@
 use super::*;
 use rusqlite::OpenFlags;
+// Minimal storage fixtures deliberately have no application tables/indexes.
+fn migrate(
+    db: &mut Connection,
+    baseline: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    upgrade: impl FnOnce(&Transaction<'_>) -> Result<()>,
+) -> Result<()> {
+    super::migrate(db, baseline, upgrade, |_| Ok(()))
+}
+
 struct Root(PathBuf);
 impl Root {
     fn new() -> Self {
@@ -102,7 +111,7 @@ fn migration_is_atomic_and_preserves_legacy_history() {
     assert!(!table_exists(&c, "tasks").unwrap());
     assert_eq!(value(&c), "old");
     migrate(&mut c, schema, |_| Ok(())).unwrap();
-    assert_eq!(preflight(&c).unwrap(), 2);
+    assert_eq!(preflight(&c).unwrap(), 3);
     assert_eq!(value(&c), "old");
 }
 #[test]
@@ -1038,7 +1047,7 @@ fn v1_upgrade_skips_baseline_and_failed_v2_rolls_back_ddl_and_ledger() {
         },
     )
     .unwrap();
-    assert_eq!(preflight(&c).unwrap(), 2);
+    assert_eq!(preflight(&c).unwrap(), 3);
     let records: Vec<(u32, String)> = c
         .prepare("SELECT version,identity FROM storage_migrations ORDER BY version")
         .unwrap()
@@ -1046,7 +1055,14 @@ fn v1_upgrade_skips_baseline_and_failed_v2_rolls_back_ddl_and_ledger() {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(records, vec![(1, LEDGER_V1.into()), (2, LEDGER_V2.into())]);
+    assert_eq!(
+        records,
+        vec![
+            (1, LEDGER_V1.into()),
+            (2, LEDGER_V2.into()),
+            (3, LEDGER_V3.into())
+        ]
+    );
     migrate(&mut c, |_| panic!("v2 baseline"), |_| panic!("v2 upgrade")).unwrap();
 }
 #[test]
@@ -1063,7 +1079,7 @@ fn fresh_v2_failure_rolls_back_even_the_baseline_and_readonly_ledger_preflight_w
     drop(disk);
     let before = std::fs::read(&path).unwrap();
     let readonly = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    assert_eq!(preflight(&readonly).unwrap(), 2);
+    assert_eq!(preflight(&readonly).unwrap(), 3);
     drop(readonly);
     assert_eq!(before, std::fs::read(&path).unwrap());
     let c = Connection::open(&path).unwrap();

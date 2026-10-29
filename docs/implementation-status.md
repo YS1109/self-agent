@@ -264,3 +264,9 @@ H5 的 task/session/result/event/diff/纯文本产物读取都按实时授权；
 最终冻结/源码复核/精确 SHA CI 以 [acceptance-v0.10.md](acceptance-v0.10.md) 为准。浏览器会话仅内存、网关重启需重新配对；headless Chromium 被环境沙箱阻止，真实手机视觉、OS vault、公网 nginx/TLS、实际部署均未验证。0.10 不替代仍待交付的完整 1.0 生命周期/生产更新。
 
 0.10 最终本地冻结：core9 / daemon595 / CLI37 / gateway17 / 前端265、18个后台smoke、Web流式代理3组、桥路由提取4项、fmt/Clippy/构建均通过；独立实际集成审查clear。精确提交CI不能用这些本地证据替代。
+
+## 1.0 性能第一切片：索引调度与保留失败
+
+显式 schema v3 索引调度已接入 Store，旧 v1/v2 的启动与备份恢复依次迁移；候选筛选不再反序列化全部已完成历史，仍保留暂停/串行/远端撤权语义。协议见 [v13](protocol-v13.md)，实际同 seed 指标见 [performance-v1.0](performance-v1.0.md)。
+
+1,000 / 5,000 任务的空闲 CPU 和完整 SSE 回放已有明显改善，但 5,000 任务全量快照仍超出 CLI 16 MiB 上限，高峰内存与活动主任务历史检查仍待后续有界读取切片。失败保留，不宣称性能验收全部通过。生命周期及更新 helper 不混入本提交；实际门禁和精确 CI 见 acceptance-v1.0。

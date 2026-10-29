@@ -22,10 +22,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 pub(crate) const MAX_DATABASE_BYTES: usize = 128 * 1024 * 1024;
 const LEDGER_V1: &str = "self-agent-schema-v1-atomic-baseline";
 const LEDGER_V2: &str = "self-agent-schema-v2-gateway";
+const LEDGER_V3: &str = "self-agent-schema-v3-indexed-scheduling";
 const MAIN: &str = "harness.sqlite";
 const JOURNAL: &str = ".restore-journal.json";
 const COMMIT: &str = ".restore-committed.json";
@@ -61,11 +62,13 @@ fn preflight_inner(db: &Connection) -> Result<u32> {
             .prepare("SELECT version,identity FROM storage_migrations ORDER BY version")?
             .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let expected = if version == 1 {
-            vec![(1, LEDGER_V1.into())]
-        } else {
-            vec![(1, LEDGER_V1.into()), (2, LEDGER_V2.into())]
-        };
+        let mut expected = vec![(1, LEDGER_V1.into())];
+        if version >= 2 {
+            expected.push((2, LEDGER_V2.into()));
+        }
+        if version >= 3 {
+            expected.push((3, LEDGER_V3.into()));
+        }
         if records != expected {
             bail!("数据库迁移记录不受支持；未修改原数据");
         }
@@ -79,14 +82,16 @@ pub(crate) fn migrate(
     db: &mut Connection,
     baseline: impl FnOnce(&Transaction<'_>) -> Result<()>,
     upgrade: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    upgrade_v3: impl FnOnce(&Transaction<'_>) -> Result<()>,
 ) -> Result<()> {
-    migrate_inner(db, baseline, upgrade)
+    migrate_inner(db, baseline, upgrade, upgrade_v3)
         .map_err(|_| anyhow::anyhow!("数据库迁移失败；事务已回滚，未重建或删除原数据"))
 }
 fn migrate_inner(
     db: &mut Connection,
     baseline: impl FnOnce(&Transaction<'_>) -> Result<()>,
     upgrade: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    upgrade_v3: impl FnOnce(&Transaction<'_>) -> Result<()>,
 ) -> Result<()> {
     let version = preflight(db)?;
     if version == SCHEMA_VERSION {
@@ -105,6 +110,11 @@ fn migrate_inner(
         upgrade(&tx)?;
         tx.execute("INSERT INTO storage_migrations VALUES(2,?1)", [LEDGER_V2])?;
         tx.execute_batch("PRAGMA user_version=2;")?;
+    }
+    if version < 3 {
+        upgrade_v3(&tx)?;
+        tx.execute("INSERT INTO storage_migrations VALUES(3,?1)", [LEDGER_V3])?;
+        tx.execute_batch("PRAGMA user_version=3;")?;
     }
     tx.commit()?;
     Ok(())

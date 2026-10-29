@@ -404,8 +404,114 @@ fn downgrade_actual_store_to_v1(db: &Connection) {
     {
         db.execute_batch(&format!("DROP TABLE {table};")).unwrap();
     }
-    db.execute_batch("DELETE FROM storage_migrations WHERE version=2; PRAGMA user_version=1;")
+    for (name, _) in scheduling::INDEXES {
+        db.execute_batch(&format!("DROP INDEX {name};")).unwrap();
+    }
+    db.execute_batch("DELETE FROM storage_migrations WHERE version>=2; PRAGMA user_version=1;")
         .unwrap();
+}
+
+fn downgrade_actual_store_to_v2(db: &Connection) {
+    for (name, _) in scheduling::INDEXES {
+        db.execute_batch(&format!("DROP INDEX {name};")).unwrap();
+    }
+    db.execute_batch("DELETE FROM storage_migrations WHERE version=3; PRAGMA user_version=2;")
+        .unwrap();
+}
+
+#[test]
+fn actual_v2_history_upgrades_to_indexed_v3_and_old_backup_restores_without_replay() {
+    let f = Fixture::new();
+    let mut store = f.store("v2");
+    put_body(&store.db, "sessions", "session", &session("session"));
+    let mut completed = legacy_record("tasks", "history");
+    completed["result"] = json!("preserved completed result");
+    put_body(&store.db, "tasks", "history", &completed);
+    downgrade_actual_store_to_v2(&store.db);
+    assert_eq!(storage::preflight(&store.db).unwrap(), 2);
+    validate_v2_records(&store.db).unwrap();
+    let old_bundle = f.bundle(&store, "version-two");
+    let old_manifest = storage::inspect_backup(&old_bundle).unwrap();
+    assert_eq!(old_manifest.schema, 2);
+    let before: String = store
+        .db
+        .query_row("SELECT body FROM tasks WHERE id='history'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    super::super::prepare_database(&mut store.db).unwrap();
+    assert_eq!(storage::preflight(&store.db).unwrap(), 3);
+    validate_records(&store.db).unwrap();
+    assert_eq!(
+        store
+            .db
+            .query_row("SELECT body FROM tasks WHERE id='history'", [], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        before
+    );
+    assert!(store.claim_task().unwrap().is_none());
+    assert!(store.claim_coordinator_job().unwrap().is_none());
+    let destination = f.0.join("restored-version-two");
+    crate::maintenance::restore_backup(&destination, &old_bundle, &old_manifest.sha256).unwrap();
+    let mut restored = Store::open(&destination.join("harness.sqlite")).unwrap();
+    assert_eq!(storage::preflight(&restored.db).unwrap(), 3);
+    assert_eq!(
+        record(&restored.db, "tasks", "history").unwrap()["result"],
+        completed["result"]
+    );
+    assert!(restored.claim_task().unwrap().is_none());
+}
+
+#[test]
+fn failed_v3_index_migration_rolls_back_without_repeating_baseline_or_gateway() {
+    let f = Fixture::new();
+    let mut store = f.store("v2");
+    downgrade_actual_store_to_v2(&store.db);
+    assert!(storage::migrate(
+        &mut store.db,
+        |_| panic!("v2 cannot rerun baseline"),
+        |_| panic!("v2 cannot rerun gateway migration"),
+        |tx| {
+            validate_v2_records(tx)?;
+            scheduling::migrate(tx)?;
+            bail!("fixture after index creation")
+        }
+    )
+    .is_err());
+    assert_eq!(storage::preflight(&store.db).unwrap(), 2);
+    for (name, _) in scheduling::INDEXES {
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name=?1",
+                    [name],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+    validate_v2_records(&store.db).unwrap();
+    super::super::prepare_database(&mut store.db).unwrap();
+    let changes = store.db.total_changes();
+    super::super::prepare_database(&mut store.db).unwrap();
+    assert_eq!(store.db.total_changes(), changes);
+}
+
+#[test]
+fn forged_v3_missing_or_redefined_scheduler_index_cannot_replace_database() {
+    for sql in [
+        "DROP INDEX scheduler_tasks_status_created",
+        "DROP INDEX scheduler_tasks_status_created; CREATE INDEX scheduler_tasks_status_created ON tasks(id)",
+    ] {
+        let f = Fixture::new();
+        let source = f.store("source");
+        let bundle = f.bundle(&source, "forged-index");
+        let sha = forge(&bundle, |db| db.execute_batch(sql).unwrap());
+        rejected_without_replacement(&f, &bundle, &sha);
+    }
 }
 #[test]
 fn real_v1_migration_only_adds_gateway_preserves_history_and_ledger_identity() {
@@ -421,7 +527,10 @@ fn real_v1_migration_only_adds_gateway_preserves_history_and_ledger_identity() {
         .unwrap();
     assert_eq!(storage::preflight(&store.db).unwrap(), 1);
     super::super::prepare_database(&mut store.db).unwrap();
-    assert_eq!(storage::preflight(&store.db).unwrap(), 2);
+    assert_eq!(
+        storage::preflight(&store.db).unwrap(),
+        storage::SCHEMA_VERSION
+    );
     let after: String = store
         .db
         .query_row("SELECT body FROM sessions WHERE id='session'", [], |r| {
@@ -442,7 +551,8 @@ fn real_v1_migration_only_adds_gateway_preserves_history_and_ledger_identity() {
         ids,
         [
             "self-agent-schema-v1-atomic-baseline",
-            "self-agent-schema-v2-gateway"
+            "self-agent-schema-v2-gateway",
+            "self-agent-schema-v3-indexed-scheduling"
         ]
     );
 }
@@ -466,7 +576,8 @@ fn real_v1_failed_gateway_upgrade_rolls_back_all_gateway_tables() {
             validate_v1_records(tx)?;
             super::super::gateway::migrate(tx)?;
             bail!("fixture after gateway DDL")
-        }
+        },
+        |_| panic!("must not advance after failed v2")
     )
     .is_err());
     assert_eq!(storage::preflight(&store.db).unwrap(), 1);

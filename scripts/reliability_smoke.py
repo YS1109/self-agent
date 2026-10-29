@@ -53,7 +53,7 @@ def main():
             assert str(root) not in json.dumps(receipt)
             diagnostics = cli(data, "diagnostics")
             assert PRIVATE not in json.dumps(diagnostics) and str(root) not in json.dumps(diagnostics)
-            assert diagnostics["database_schema"] == 2 and diagnostics["vault"] == "not_checked"
+            assert diagnostics["database_schema"] == 3 and diagnostics["vault"] == "not_checked"
             assert diagnostics["connection_check_history"] == "not_recorded"
             print("PASS real online consistent backup, exact receipt replay, offline inspection and allowlisted diagnostics")
 
