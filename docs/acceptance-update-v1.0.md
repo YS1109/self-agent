@@ -63,3 +63,10 @@
 - floor/witness依赖受保护数据目录；不防同用户恶意删除整个数据根，不宣称硬件单调计数器或通用断电安装事务。生产自动下载与安装始终禁用。
 
 精确提交/CI：待此冻结树发布后跟踪，不能用本地门禁或其它 SHA 的 CI 替代。
+
+
+## 首次精确 CI 与 Windows 条件编译窄修复（2026-10-29）
+
+`7aea4f15f04a4ce3ffdbf944fdc454160dcc465c` 的 push `40827179414` / PR `40827184463` 均在 Windows Rust Clippy 报 `storage.rs` 的 `unused_mut`；该平台后续测试、构建及 smoke 尚未运行，不记作通过。三平台 Desktop 和 Ubuntu Rust 已通过，macOS Rust 后台烟测继续跟踪。
+
+修复仅将目录 builder 的可变绑定放入 Unix cfg 块：Unix 仍设置 0700，Windows 使用原默认 builder，创建、AlreadyExists、no-follow capability 和身份复核逻辑不变。独立静态复核通过；隔离源码的 storage 34 / Store updates 4、fmt、四 crate all-target Clippy 通过。精确生产 builder 片段的 Windows GNU compile-only Clippy 通过；完整 daemon Windows 交叉检查因本地缺少 `x86_64-w64-mingw32-gcc`（ring C 构建）未完成，不能冒充 Windows 执行通过。后续修复精确提交 CI 单独跟踪。
