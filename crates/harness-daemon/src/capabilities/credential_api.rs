@@ -5,6 +5,7 @@ use super::{
     vault::{FreshCredential, SecretBytes, VaultCancellation, VaultCertainty},
 };
 use crate::{
+    reliability::lifecycle::{WorkerExit, WorkerKind},
     store::capability_credentials::{self, CredentialOutcome, CredentialWorkKind},
     ApiError, ApiResult, AppState,
 };
@@ -124,22 +125,25 @@ async fn set_credential(
     let binding = capability_credentials::mcp_binding(&server, &slot, &record.config_digest)
         .map_err(invalid)?;
     let fresh = FreshCredential::new(&binding, secret);
-    let receipt = state
-        .store
-        .lock()
-        .unwrap()
-        .begin_mcp_credential_set(
-            &request.id,
-            &server,
-            &slot,
-            request.expected_revision,
-            fresh.reference(),
-        )
-        .map_err(invalid)?;
+    let (admission, receipt) = state.admit_store(|store| {
+        store
+            .begin_mcp_credential_set(
+                &request.id,
+                &server,
+                &slot,
+                request.expected_revision,
+                fresh.reference(),
+            )
+            .map_err(invalid)
+    })?;
     if receipt["replayed"] != true {
-        tokio::spawn(async move {
-            mutate(state, request.id, Some(fresh)).await;
-        });
+        admission
+            .spawn(WorkerKind::Credential, async move {
+                (mutate(state, request.id, Some(fresh)).await, ())
+            })
+            .map_err(crate::lifecycle_error)?;
+    } else {
+        admission.settle();
     }
     Ok(Json(receipt))
 }
@@ -148,16 +152,19 @@ async fn delete_credential(
     Path((server, slot)): Path<(String, String)>,
     Json(request): Json<DeleteRequest>,
 ) -> ApiResult<Json<Value>> {
-    let receipt = state
-        .store
-        .lock()
-        .unwrap()
-        .begin_mcp_credential_delete(&request.id, &server, &slot, request.expected_revision)
-        .map_err(invalid)?;
+    let (admission, receipt) = state.admit_store(|store| {
+        store
+            .begin_mcp_credential_delete(&request.id, &server, &slot, request.expected_revision)
+            .map_err(invalid)
+    })?;
     if receipt["replayed"] != true {
-        tokio::spawn(async move {
-            mutate(state, request.id, None).await;
-        });
+        admission
+            .spawn(WorkerKind::Credential, async move {
+                (mutate(state, request.id, None).await, ())
+            })
+            .map_err(crate::lifecycle_error)?;
+    } else {
+        admission.settle();
     }
     Ok(Json(receipt))
 }
@@ -166,39 +173,51 @@ async fn cleanup(
     Path(target): Path<String>,
     Json(request): Json<CleanupRequest>,
 ) -> ApiResult<Json<Value>> {
-    let receipt = state
-        .store
-        .lock()
-        .unwrap()
-        .begin_mcp_credential_cleanup(&request.id, &target)
-        .map_err(invalid)?;
+    let (admission, receipt) = state.admit_store(|store| {
+        store
+            .begin_mcp_credential_cleanup(&request.id, &target)
+            .map_err(invalid)
+    })?;
     if receipt["replayed"] != true {
-        tokio::spawn(async move {
-            mutate(state, request.id, None).await;
-        });
+        admission
+            .spawn(WorkerKind::Credential, async move {
+                (mutate(state, request.id, None).await, ())
+            })
+            .map_err(crate::lifecycle_error)?;
+    } else {
+        admission.settle();
     }
     Ok(Json(receipt))
 }
-async fn mutate(state: Arc<AppState>, id: String, fresh: Option<FreshCredential>) {
-    let work = match state
-        .store
-        .lock()
-        .unwrap()
-        .claim_mcp_credential_operation(&id)
-    {
-        Ok(Some(work)) => work,
-        _ => return,
+async fn mutate(state: Arc<AppState>, id: String, fresh: Option<FreshCredential>) -> WorkerExit {
+    let work = {
+        let mut store = state.store.lock().unwrap();
+        let stopping = state.lifecycle.check_locked(&store).is_err();
+        let work = match store.claim_mcp_credential_operation(&id) {
+            Ok(Some(work)) => work,
+            Ok(None) => return WorkerExit::Settled,
+            Err(_) => return WorkerExit::Unknown,
+        };
+        if stopping {
+            // This is settlement of the original accepted intent, not a new
+            // external admission: no vault request was attempted by this worker.
+            return settled(
+                store.finish_mcp_credential_operation(&id, CredentialOutcome::Rejected),
+            );
+        }
+        work
     };
     if work.operation_id != id
         || uuid::Uuid::parse_str(&work.server_id).is_err()
         || capability_credentials::validate_slot(&work.slot).is_err()
     {
-        let _ = state
-            .store
-            .lock()
-            .unwrap()
-            .finish_mcp_credential_operation(&id, CredentialOutcome::Rejected);
-        return;
+        return settled(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .finish_mcp_credential_operation(&id, CredentialOutcome::Rejected),
+        );
     }
     let deadline = Instant::now() + Duration::from_secs(20);
     let cancel = VaultCancellation::default();
@@ -218,12 +237,13 @@ async fn mutate(state: Arc<AppState>, id: String, fresh: Option<FreshCredential>
                 .await
         }
         _ => {
-            let _ = state
-                .store
-                .lock()
-                .unwrap()
-                .finish_mcp_credential_operation(&id, CredentialOutcome::Rejected);
-            return;
+            return settled(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .finish_mcp_credential_operation(&id, CredentialOutcome::Rejected),
+            );
         }
     };
     let outcome = match result {
@@ -231,11 +251,23 @@ async fn mutate(state: Arc<AppState>, id: String, fresh: Option<FreshCredential>
         Err(e) if e.certainty == VaultCertainty::Unknown => CredentialOutcome::Unknown,
         Err(_) => CredentialOutcome::Rejected,
     };
-    let _ = state
-        .store
-        .lock()
-        .unwrap()
-        .finish_mcp_credential_operation(&id, outcome);
+    // Vault certainty is an audited result, not physical-thread cleanup. The
+    // separately tracked vault shutdown custodian waits for its real OS worker.
+    settled(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .finish_mcp_credential_operation(&id, outcome),
+    )
+}
+
+fn settled<T>(result: anyhow::Result<T>) -> WorkerExit {
+    if result.is_ok() {
+        WorkerExit::Settled
+    } else {
+        WorkerExit::Unknown
+    }
 }
 
 #[cfg(test)]

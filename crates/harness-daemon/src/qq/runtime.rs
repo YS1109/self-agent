@@ -22,6 +22,11 @@ pub(crate) enum ConnectionState {
 /// Implementations use short authoritative transactions and never trust a route,
 /// principal or revision supplied by remote input. Failing reads fail closed.
 pub(crate) trait Backend: Send + Sync + 'static {
+    /// Current worker ownership/finalization failure, never historical audit status.
+    fn failed_worker(&self) {}
+    fn worker_certain(&self) -> bool {
+        true
+    }
     fn current(&self) -> bool;
     fn checkpoint(&self) -> Result<Option<Checkpoint>>;
     /// Commit input AND checkpoint atomically before returning success.
@@ -39,13 +44,29 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn finish(&self, claim: &OutboxClaim, outcome: DeliveryOutcome) -> Result<()>;
 }
 const TICK: Duration = Duration::from_millis(100);
+pub(super) fn storage_uncertain(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some()
+            || cause.downcast_ref::<tokio::task::JoinError>().is_some()
+    })
+}
 async fn database<B: Backend, T: Send + 'static>(
     backend: Arc<B>,
     operation: impl FnOnce(&B) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    tokio::task::spawn_blocking(move || operation(backend.as_ref()))
-        .await
-        .map_err(|_| anyhow::anyhow!("QQ 本地事务工作中断"))?
+    let owned = backend.clone();
+    match tokio::task::spawn_blocking(move || operation(owned.as_ref())).await {
+        Ok(result) => {
+            if result.as_ref().is_err_and(storage_uncertain) {
+                backend.failed_worker();
+            }
+            result
+        }
+        Err(_) => {
+            backend.failed_worker();
+            Err(anyhow::anyhow!("QQ 本地事务工作中断"))
+        }
+    }
 }
 async fn current(backend: Arc<impl Backend>) -> bool {
     database(backend, |b| Ok(b.current()))
@@ -59,14 +80,13 @@ async fn connection(backend: Arc<impl Backend>, state: ConnectionState) {
     })
     .await;
 }
-async fn stopped(backend: Arc<impl Backend>, stop: &mut watch::Receiver<bool>) {
+async fn stopped(_backend: Arc<impl Backend>, stop: &mut watch::Receiver<bool>) {
     loop {
-        if *stop.borrow() || !current(backend.clone()).await {
+        if *stop.borrow() {
             return;
         }
-        tokio::select! {
-            changed = stop.changed() => if changed.is_err() { return; },
-            _ = tokio::time::sleep(TICK) => {}
+        if stop.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -88,18 +108,54 @@ pub(crate) async fn run(
     receive: Transport,
     delivery: Transport,
     stop: watch::Receiver<bool>,
-) {
-    tokio::join!(
-        receive_loop(backend.clone(), receive, stop.clone()),
-        command_loop(backend.clone(), stop.clone()),
-        delivery_loop(backend, delivery, stop),
+) -> Result<()> {
+    // A separate joined monitor owns every blocking authority check. Selecting
+    // a stop future must never drop a spawn_blocking handle still using Store.
+    let (generation_stop, local_stop) = watch::channel(false);
+    let monitor_backend = backend.clone();
+    let monitor_stop = generation_stop.clone();
+    let mut external_stop = stop;
+    let monitor = async move {
+        while !*external_stop.borrow() && !*monitor_stop.borrow() {
+            if !current(monitor_backend.clone()).await {
+                break;
+            }
+            tokio::select! {
+                _ = external_stop.changed() => break,
+                _ = tokio::time::sleep(TICK) => {}
+            }
+        }
+        let _ = monitor_stop.send(true);
+    };
+    let receive_stop = generation_stop.clone();
+    let delivery_stop = generation_stop.clone();
+    let receiver = async {
+        let result = receive_loop(backend.clone(), receive, local_stop.clone()).await;
+        let _ = receive_stop.send(true);
+        result
+    };
+    let sender = async {
+        let result = delivery_loop(backend.clone(), delivery, local_stop.clone()).await;
+        let _ = delivery_stop.send(true);
+        result
+    };
+    let (_, received, (), delivered) = tokio::join!(
+        monitor,
+        receiver,
+        command_loop(backend.clone(), local_stop.clone()),
+        sender
     );
+    received?;
+    delivered?;
+    anyhow::ensure!(backend.worker_certain(), "QQ 清理或持久确认未完成");
+    Ok(())
 }
+
 async fn receive_loop(
     backend: Arc<impl Backend>,
     mut transport: Transport,
     mut stop: watch::Receiver<bool>,
-) {
+) -> Result<()> {
     let mut attempt = 0u32;
     while !*stop.borrow() && current(backend.clone()).await {
         let checkpoint = match database(backend.clone(), |b| b.checkpoint()).await {
@@ -167,7 +223,7 @@ async fn receive_loop(
                     Ok(GatewayItem::Reconnect) | Err(_) => break,
                 }
             }
-            gateway.shutdown().await;
+            gateway.shutdown().await?;
         }
         if !storage_failed {
             connection(backend.clone(), ConnectionState::Disconnected).await;
@@ -184,6 +240,7 @@ async fn receive_loop(
         attempt = attempt.saturating_add(1);
     }
     connection(backend, ConnectionState::Disconnected).await;
+    Ok(())
 }
 async fn command_loop(backend: Arc<impl Backend>, mut stop: watch::Receiver<bool>) {
     while !*stop.borrow() && current(backend.clone()).await {
@@ -201,7 +258,7 @@ async fn delivery_loop(
     backend: Arc<impl Backend>,
     mut transport: Transport,
     mut stop: watch::Receiver<bool>,
-) {
+) -> Result<()> {
     while !*stop.borrow() && current(backend.clone()).await {
         let claim = match database(backend.clone(), |b| b.claim()).await {
             Ok(Some(value)) => value,
@@ -235,7 +292,7 @@ async fn delivery_loop(
                     reason: FailureReason::ConfigurationDisabled,
                 },
             )
-            .await;
+            .await?;
             continue;
         }
         let reply = Reply {
@@ -249,10 +306,17 @@ async fn delivery_loop(
             content: &claim.record.payload,
             expires_at: std::time::UNIX_EPOCH + Duration::from_millis(claim.route.expires_at_ms),
         };
+        let sending = transport.send_passive_with_control(reply, &allowed);
+        tokio::pin!(sending);
         let outcome = tokio::select! {
-            // Dropping an HTTP future cannot establish whether QQ received it.
-            _ = stopped(backend.clone(), &mut stop) => DeliveryOutcome::Unknown,
-            result = transport.send_passive_with_control(reply, &allowed) => match result {
+            // Interruption is an unknown external result, but not permission to
+            // drop physical ownership. Await the original bounded HTTP/auth
+            // future; no retry/new POST may pass the now-closed allowed gate.
+            _ = stopped(backend.clone(), &mut stop) => {
+                let _ = sending.await;
+                DeliveryOutcome::Unknown
+            },
+            result = &mut sending => match result {
                 Ok(SendOutcome::Sent { id }) => DeliveryOutcome::Sent { platform_id: id },
                 Ok(SendOutcome::Unknown) => DeliveryOutcome::Unknown,
                 Ok(SendOutcome::Rejected { status: 429, retry_after_seconds }) => {
@@ -264,11 +328,16 @@ async fn delivery_loop(
                 Err(_) => DeliveryOutcome::Failed { reason: FailureReason::PlatformRejected },
             },
         };
-        finish(backend.clone(), claim, outcome).await;
+        finish(backend.clone(), claim.clone(), outcome).await?;
     }
+    Ok(())
 }
-async fn finish(backend: Arc<impl Backend>, claim: OutboxClaim, outcome: DeliveryOutcome) {
-    let _ = database(backend, move |b| {
+async fn finish(
+    backend: Arc<impl Backend>,
+    claim: OutboxClaim,
+    outcome: DeliveryOutcome,
+) -> Result<()> {
+    database(backend, move |b| {
         if b.finish(&claim, outcome).is_err() {
             // Retry only the local CAS, never HTTP. Prior commit is preserved by
             // the original nonce and terminal-state check.
@@ -276,7 +345,7 @@ async fn finish(backend: Arc<impl Backend>, claim: OutboxClaim, outcome: Deliver
         }
         Ok(())
     })
-    .await;
+    .await
 }
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()

@@ -43,6 +43,7 @@ struct TestBackend {
     db: Mutex<Connection>,
     path: PathBuf,
     enabled: AtomicBool,
+    failed: AtomicBool,
     authority: AtomicBool,
     outbox: bool,
     gate: Option<Arc<Gate>>,
@@ -88,6 +89,7 @@ impl TestBackend {
             db: Mutex::new(db),
             path,
             enabled: AtomicBool::new(true),
+            failed: AtomicBool::new(false),
             authority: AtomicBool::new(true),
             outbox,
             gate,
@@ -122,10 +124,17 @@ impl TestBackend {
     }
 }
 impl Backend for TestBackend {
+    fn failed_worker(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+    fn worker_certain(&self) -> bool {
+        !self.failed.load(Ordering::Acquire)
+    }
+
     fn current(&self) -> bool {
         // Match the real Store-backed generation check, including mutex contention.
         let _db = self.db.lock().unwrap();
-        self.enabled.load(Ordering::Acquire)
+        self.enabled.load(Ordering::Acquire) && self.worker_certain()
     }
     fn checkpoint(&self) -> Result<Option<Checkpoint>> {
         let db = self.db.lock().unwrap();
@@ -496,17 +505,18 @@ fn start(
     backend: Arc<TestBackend>,
     receive: &Fixture,
     delivery: &Fixture,
-) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+) -> (watch::Sender<bool>, tokio::task::JoinHandle<Result<()>>) {
     let (tx, rx) = watch::channel(false);
     (
         tx,
         tokio::spawn(run(backend, receive.transport(), delivery.transport(), rx)),
     )
 }
-async fn stop(tx: watch::Sender<bool>, worker: tokio::task::JoinHandle<()>) {
-    tx.send(true).unwrap();
+async fn stop(tx: watch::Sender<bool>, worker: tokio::task::JoinHandle<Result<()>>) {
+    let _ = tx.send(true);
     timeout(Duration::from_secs(5), worker)
         .await
+        .unwrap()
         .unwrap()
         .unwrap();
 }
@@ -651,7 +661,7 @@ async fn commands_continue_during_blocked_post_and_stop_unknown_is_never_resent(
     let receive = Fixture::start("normal", None).await;
     let delivery = Fixture::start("post-gate", None).await;
     let backend = TestBackend::new(true, None);
-    let (shutdown, worker) = start(backend.clone(), &receive, &delivery);
+    let (shutdown, mut worker) = start(backend.clone(), &receive, &delivery);
     until(|| backend.checkpoint().unwrap().is_some()).await;
     receive.emit(inbound("first-message", 2, &timestamp()));
     timeout(Duration::from_secs(10), delivery.post_entered.notified())
@@ -663,6 +673,11 @@ async fn commands_continue_during_blocked_post_and_stop_unknown_is_never_resent(
     receive.emit(inbound("second-message", 3, &timestamp()));
     until(|| backend.count("fixture_commands") == 2).await;
     assert_eq!(delivery.seen.lock().unwrap().posts.len(), 1);
+    shutdown.send(true).unwrap();
+    assert!(timeout(Duration::from_millis(100), &mut worker)
+        .await
+        .is_err());
+    delivery.post_release.notify_one();
     stop(shutdown, worker).await;
     let statuses = backend.statuses();
     assert!(statuses.contains(&"unknown".into()) && statuses.contains(&"pending".into()));
@@ -722,4 +737,45 @@ async fn authority_revocation_while_token_is_pending_prevents_post() {
     assert!(delivery.seen.lock().unwrap().posts.is_empty());
     assert_eq!(backend.count("fixture_commands"), 1);
     stop(shutdown, worker).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_original_delivery_finalization_returns_cleanup_unknown_not_success() {
+    let receive = Fixture::start("normal", None).await;
+    let delivery = Fixture::start("post-gate", None).await;
+    let backend = TestBackend::new(true, None);
+    let (_shutdown, worker) = start(backend.clone(), &receive, &delivery);
+    until(|| backend.checkpoint().unwrap().is_some()).await;
+    receive.emit(inbound("failed-finalize", 2, &timestamp()));
+    timeout(Duration::from_secs(10), delivery.post_entered.notified())
+        .await
+        .unwrap();
+    backend.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_finalize BEFORE UPDATE ON qq_outbox BEGIN SELECT RAISE(ABORT, 'fixture rejected finalize'); END;").unwrap();
+    delivery.post_release.notify_one();
+    assert!(timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert_eq!(backend.statuses(), vec!["sending"]);
+    assert_eq!(delivery.seen.lock().unwrap().posts.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_command_transaction_failure_stops_generation_without_retry_or_send() {
+    let receive = Fixture::start("normal", None).await;
+    let delivery = Fixture::start("normal", None).await;
+    let backend = TestBackend::new(true, None);
+    backend.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_command BEFORE INSERT ON fixture_commands BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;").unwrap();
+    let (_shutdown, worker) = start(backend.clone(), &receive, &delivery);
+    until(|| backend.checkpoint().unwrap().is_some()).await;
+    receive.emit(inbound("failed-command", 2, &timestamp()));
+    assert!(timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert!(!backend.worker_certain());
+    assert_eq!(backend.count("fixture_commands"), 0);
+    assert!(delivery.seen.lock().unwrap().posts.is_empty());
 }

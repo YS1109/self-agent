@@ -77,7 +77,12 @@ def known_binaries(root: Path = ROOT) -> tuple[dict[str, Path], str]:
     if (root / "target").is_symlink() or output.is_symlink():
         raise RuntimeError("构建输出目录不能是链接")
     for name in NAMES:
-        relevant=[p for p in inputs if p.parent==root or p.relative_to(root).parts[1] in dependencies[name]]
+        # CLI links the daemon library, not its binary entrypoint. Keep the
+        # entrypoint in the source digest and in the daemon's own freshness gate.
+        relevant=[p for p in inputs
+                  if (p.parent==root or p.relative_to(root).parts[1] in dependencies[name])
+                  and not (name == "self-agent-cli"
+                           and p == root / "crates" / "harness-daemon" / "src" / "main.rs")]
         newest=max(p.stat().st_mtime_ns for p in relevant)
         path = root / "target" / "debug" / (name + (".exe" if os.name == "nt" else ""))
         if path.is_symlink() or not path.is_file() or path.resolve().parent != (root / "target" / "debug").resolve():
@@ -424,6 +429,42 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(env["HARNESS_API_KEY"], "")
             self.assertTrue(Path(env["HOME"]).is_relative_to(temporary))
             self.assertFalse(any(key.startswith(("OPENAI_", "ANTHROPIC_")) for key in env))
+
+    def test_cli_freshness_tracks_daemon_library_not_daemon_binary_entrypoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Cargo.toml").write_text("[workspace]")
+            (root / "Cargo.lock").write_text("fixture")
+            for name in ("harness-core", "harness-daemon", "harness-cli", "harness-gateway"):
+                package = root / "crates" / name
+                (package / "src").mkdir(parents=True)
+                (package / "Cargo.toml").write_text("fixture")
+                (package / "src" / "lib.rs").write_text("fixture-not-compiled")
+                (package / "src" / "main.rs").write_text("fixture-not-compiled")
+            baseline = time.time() - 20
+            for path in source_inputs(root):
+                os.utime(path, (baseline, baseline))
+            output = root / "target" / "debug"
+            output.mkdir(parents=True)
+            binaries = {}
+            for name in NAMES:
+                path = output / (name + (".exe" if os.name == "nt" else ""))
+                path.write_bytes(b"synthetic-not-executed")
+                os.utime(path, (baseline + 1, baseline + 1))
+                binaries[name] = path
+            entrypoint = root / "crates" / "harness-daemon" / "src" / "main.rs"
+            os.utime(entrypoint, (baseline + 2, baseline + 2))
+            with self.assertRaises(RuntimeError):
+                known_binaries(root)  # The daemon itself still requires rebuild.
+            os.utime(binaries["harness-daemon"], (baseline + 3, baseline + 3))
+            self.assertEqual(len(known_binaries(root)[0]), 3)
+            library = root / "crates" / "harness-daemon" / "src" / "lib.rs"
+            os.utime(library, (baseline + 4, baseline + 4))
+            os.utime(binaries["harness-daemon"], (baseline + 5, baseline + 5))
+            with self.assertRaises(RuntimeError):
+                known_binaries(root)  # CLI really does link the daemon library.
+            os.utime(binaries["self-agent-cli"], (baseline + 5, baseline + 5))
+            self.assertEqual(len(known_binaries(root)[0]), 3)
 
 
 def main():

@@ -13,3 +13,4 @@ pub(crate) mod provider_runtime;
 
 pub(crate) mod credential_api;
 pub(crate) mod credentials;
+pub(crate) mod lifecycle;

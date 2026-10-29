@@ -17,3 +17,5 @@
 - 有界工作区/历史读取见 `docs/protocol-v14.md`。新客户端显式 `snapshot?window=1`，不得把局部数组当全集、离窗 ID 当不存在或自动换成其它动作目标；返回/刷新首页复用 `current_cursor`，只有明确重新读取首页才建立新上界。旧无 query 快照保留全量语义或显式失败。
 
 - 本机签名校验/私有暂存与兼容握手见 `docs/protocol-v15.md`、`docs/acceptance-update-v1.0.md`；schema v4 的witness不随task DB备份回滚，恢复不能降低保留下限。verification-only配置不是生产安装授权，任何请求/环境不得临时选信任根或执行artifact。Native超时/不兼容不得自动替换后台，保留原启动观察与明确错误；包夹具不等于OS安装/生产签名/GUI验收。
+
+- 同一后台实例的实际停止合同见 `docs/protocol-v16.md` 与 `docs/acceptance-lifecycle-v1.0.md`。新工作必须先登记真实所有者，再在同 Store 锁下检查 admission；HTTP observer 取消不能丢弃 blocking/OS/进程工作。只有两次 quiesce 与真实 worker 清理均确认才能标记 Stopped；历史结果未知与当前物理清理未知分开，不自动重发或启动替代后台。

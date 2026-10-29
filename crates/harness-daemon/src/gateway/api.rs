@@ -8,6 +8,7 @@ use crate::{
     capabilities::vault::{
         CredentialRef, FreshCredential, SecretBytes, VaultCancellation, VaultCertainty,
     },
+    reliability::lifecycle::{AdmissionError, WorkerExit, WorkerKind},
     ApiError, ApiResult, AppState,
 };
 use axum::{
@@ -50,6 +51,26 @@ fn invalid(_: impl std::fmt::Display) -> ApiError {
         "网关 操作未确认，请刷新原记录核对；不会回显输入或底层错误".into(),
     )
 }
+fn runtime_error(error: anyhow::Error) -> ApiError {
+    if let Some(error) = error.downcast_ref::<AdmissionError>() {
+        crate::lifecycle_error(*error)
+    } else {
+        invalid(error)
+    }
+}
+fn uncertain_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some()
+            || cause.downcast_ref::<tokio::task::JoinError>().is_some()
+    })
+}
+fn exit_for<T>(result: &anyhow::Result<T>) -> WorkerExit {
+    if result.as_ref().is_err_and(uncertain_error) {
+        WorkerExit::Unknown
+    } else {
+        WorkerExit::Settled
+    }
+}
 const MAX_ADMITTED: usize = 8;
 fn admission() -> &'static Arc<tokio::sync::Semaphore> {
     static LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -75,17 +96,22 @@ async fn database<T: Send + 'static>(
     action: impl FnOnce(&mut crate::store::Store) -> anyhow::Result<T> + Send + 'static,
 ) -> ApiResult<T> {
     let permit = reserve()?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("store unavailable"))?;
-        action(&mut store)
-    })
-    .await
-    .map_err(invalid)?
-    .map_err(invalid)
+    let admission = state.lifecycle.admit().map_err(crate::lifecycle_error)?;
+    let observer = admission
+        .spawn(WorkerKind::BlockingCleanup, async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let mut store = state.store.lock().unwrap();
+                state.lifecycle.check_locked(&store)?;
+                action(&mut store)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|value| value);
+            (exit_for(&result), result)
+        })
+        .map_err(crate::lifecycle_error)?;
+    observer.await.map_err(invalid)?.map_err(runtime_error)
 }
 /// Already-admitted credential work keeps its reservation through finalization;
 /// it must not be rejected for overload after a possible OS side effect.
@@ -108,25 +134,49 @@ async fn credential_request(
     begin: impl FnOnce(&mut crate::store::Store) -> anyhow::Result<CredentialStart> + Send + 'static,
 ) -> ApiResult<Json<Value>> {
     let permit = reserve()?;
-    tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let (receipt, id, fresh) = {
-            let mut store = state
-                .store
-                .lock()
-                .map_err(|_| anyhow::anyhow!("store unavailable"))?;
-            begin(&mut store)?
-        };
-        if receipt["replayed"] != true {
-            // Launch from the durable-admission closure, not the cancellable
-            // HTTP continuation. The reserved slot is owned until settle.
-            tokio::spawn(mutate(state, id, fresh, permit));
-        }
-        Ok(receipt)
-    })
-    .await
-    .map_err(invalid)?
-    .map(Json)
-    .map_err(invalid)
+    let admission = state.lifecycle.admit().map_err(crate::lifecycle_error)?;
+    let (reply, observer) = tokio::sync::oneshot::channel();
+    let _worker_observer = admission
+        .spawn(WorkerKind::Credential, async move {
+            let db = state.clone();
+            let started = tokio::task::spawn_blocking(move || {
+                let mut store = db.store.lock().unwrap();
+                db.lifecycle.check_locked(&store)?;
+                begin(&mut store)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|value| value);
+            match started {
+                Ok((receipt, id, fresh)) => {
+                    let replayed = receipt["replayed"] == true;
+                    let _ = reply.send(Ok(receipt));
+                    // The registry, not the receipt observer, retains the permit and
+                    // actual OS/DB work. Never detach after returning the receipt.
+                    let exit = if replayed {
+                        WorkerExit::Settled
+                    } else {
+                        mutate(state, id, fresh, permit).await
+                    };
+                    (exit, ())
+                }
+                Err(error) => {
+                    let exit = if uncertain_error(&error) {
+                        WorkerExit::Unknown
+                    } else {
+                        WorkerExit::Settled
+                    };
+                    let _ = reply.send(Err(error));
+                    (exit, ())
+                }
+            }
+        })
+        .map_err(crate::lifecycle_error)?;
+    observer
+        .await
+        .map_err(invalid)?
+        .map(Json)
+        .map_err(runtime_error)
 }
 pub(crate) async fn snapshot(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
     database(state, |store| {
@@ -263,7 +313,7 @@ async fn mutate(
     id: String,
     fresh: Option<FreshCredential>,
     _permit: tokio::sync::OwnedSemaphorePermit,
-) {
+) -> WorkerExit {
     let claimed_id = id.clone();
     let work = match in_flight(state.clone(), move |store| {
         store.gateway_claim_credential(&claimed_id)
@@ -271,7 +321,8 @@ async fn mutate(
     .await
     {
         Ok(Some(work)) => work,
-        _ => return,
+        Ok(None) => return WorkerExit::Settled,
+        Err(_) => return WorkerExit::Unknown,
     };
     let prepared = (|| -> anyhow::Result<_> {
         let binding = super::credential_binding(&work.config_id, &work.binding_digest)?;
@@ -281,43 +332,58 @@ async fn mutate(
     let (binding, reference) = match prepared {
         Ok(value) => value,
         Err(_) => {
-            let _ = in_flight(state.clone(), move |store| {
+            return if in_flight(state.clone(), move |store| {
                 store.gateway_finish_credential(&id, Outcome::NotApplied)
             })
-            .await;
-            return;
+            .await
+            .is_ok()
+            {
+                WorkerExit::Settled
+            } else {
+                WorkerExit::Unknown
+            }
         }
     };
     let cancel = VaultCancellation::default();
+    let signal = state.lifecycle.signal();
     let deadline = Instant::now() + Duration::from_secs(20);
-    let result = match (work.kind, fresh) {
-        (WorkKind::Set, Some(fresh)) if fresh.reference() == &reference => {
-            state.vault.set(fresh, &binding, deadline, &cancel).await
-        }
-        (WorkKind::Delete, None) => {
-            state
-                .vault
-                .delete(&reference, &binding, deadline, &cancel)
-                .await
-        }
-        _ => {
-            let _ = in_flight(state.clone(), move |store| {
-                store.gateway_finish_credential(&id, Outcome::NotApplied)
-            })
-            .await;
-            return;
+    let apply = async {
+        let result = match (work.kind, fresh) {
+            (WorkKind::Set, Some(fresh)) if fresh.reference() == &reference => {
+                state.vault.set(fresh, &binding, deadline, &cancel).await
+            }
+            (WorkKind::Delete, None) => {
+                state
+                    .vault
+                    .delete(&reference, &binding, deadline, &cancel)
+                    .await
+            }
+            _ => return Outcome::NotApplied,
+        };
+        match result {
+            Ok(()) => Outcome::Succeeded,
+            Err(error) if error.certainty == VaultCertainty::Unknown => Outcome::Unknown,
+            Err(_) => Outcome::NotApplied,
         }
     };
-    let outcome = match result {
-        Ok(()) => Outcome::Succeeded,
-        Err(error) if error.certainty == VaultCertainty::Unknown => Outcome::Unknown,
-        Err(_) => Outcome::NotApplied,
+    tokio::pin!(apply);
+    let outcome = if signal.is_cancelled() {
+        Outcome::NotApplied
+    } else {
+        tokio::select! {biased; _=signal.cancelled()=>{cancel.cancel();apply.await}, result=&mut apply=>result}
     };
-    let _ = in_flight(state.clone(), move |store| {
+    // Vault has a separately registered physical custodian; an Unknown audit
+    // result alone does not mean this completed wrapper still owns an OS call.
+    let result = in_flight(state.clone(), move |store| {
         store.gateway_finish_credential(&id, outcome)
     })
     .await;
     state.wake.notify_waiters();
+    if result.is_ok() {
+        WorkerExit::Settled
+    } else {
+        WorkerExit::Unknown
+    }
 }
 
 #[cfg(test)]

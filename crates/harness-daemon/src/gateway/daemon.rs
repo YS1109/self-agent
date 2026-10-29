@@ -9,11 +9,15 @@ use super::{
 };
 use crate::{
     capabilities::vault::{CredentialRef, VaultCancellation},
+    reliability::lifecycle::{WorkerExit, WorkerKind},
     AppState,
 };
 use anyhow::{Context, Result};
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -25,12 +29,10 @@ pub(crate) fn fixture_enabled() -> bool {
 fn fixture_origin() -> Result<String> {
     std::env::var("HARNESS_GATEWAY_FIXTURE_URL").context("网关夹具缺少数字 loopback 地址")
 }
-pub(crate) fn spawn(state: Arc<AppState>) {
-    let owned = state.clone();
-    let handle = tokio::spawn(async move {
-        supervise(owned).await;
-    });
-    *state.gateway_worker.lock().unwrap() = Some(handle);
+pub(crate) fn spawn(state: Arc<AppState>) -> Result<()> {
+    let lifecycle = state.lifecycle.clone();
+    lifecycle.spawn(WorkerKind::Channel, async move { supervise(state).await })?;
+    Ok(())
 }
 async fn database<T: Send + 'static>(
     state: Arc<AppState>,
@@ -38,20 +40,23 @@ async fn database<T: Send + 'static>(
 ) -> Result<T> {
     tokio::task::spawn_blocking(move || f(&mut state.store.lock().unwrap()))
         .await
-        .map_err(|_| anyhow::anyhow!("网关数据库工作中断"))?
+        .context("网关数据库工作中断")?
 }
 async fn wait(state: &AppState, stop: &mut watch::Receiver<bool>) -> bool {
     tokio::select! { _=state.wake.notified()=>{}, _=tokio::time::sleep(Duration::from_millis(500))=>{}, result=stop.changed()=>{if result.is_err(){return false}} }
-    !*stop.borrow()
+    !*stop.borrow() && !state.lifecycle.signal().is_cancelled()
 }
-async fn supervise(state: Arc<AppState>) {
+async fn supervise(state: Arc<AppState>) -> WorkerExit {
+    let fault = Arc::new(AtomicBool::new(false));
     let mut stop = state.gateway_stop.subscribe();
-    while !*stop.borrow() {
-        let config = database(state.clone(), |s| s.gateway_config())
-            .await
-            .ok()
-            .flatten()
-            .filter(|c| c.enabled);
+    while !*stop.borrow()
+        && !state.lifecycle.signal().is_cancelled()
+        && !fault.load(Ordering::Acquire)
+    {
+        let config = match database(state.clone(), |s| s.gateway_config()).await {
+            Ok(value) => value.filter(|c| c.enabled),
+            Err(_) => return WorkerExit::Unknown,
+        };
         let Some(config) = config else {
             if !wait(&state, &mut stop).await {
                 break;
@@ -60,6 +65,7 @@ async fn supervise(state: Arc<AppState>) {
         };
         let backend = Arc::new(DaemonBackend {
             state: state.clone(),
+            fault: fault.clone(),
             id: config.id.clone(),
             channel: TrustedChannel {
                 device_id: config.device_id.clone(),
@@ -76,10 +82,14 @@ async fn supervise(state: Arc<AppState>) {
             Err(_) => {
                 let id = config.id.clone();
                 let rev = config.revision;
-                let _ = database(state.clone(), move |s| {
+                if database(state.clone(), move |s| {
                     s.gateway_connection(&id, rev, "credential_unavailable")
                 })
-                .await;
+                .await
+                .is_err_and(|error| storage_uncertain(&error))
+                {
+                    return WorkerExit::Unknown;
+                }
                 // Do not turn a locked/denied OS vault into an automatic prompt loop.
                 while database(state.clone(), {
                     let id = config.id.clone();
@@ -89,21 +99,41 @@ async fn supervise(state: Arc<AppState>) {
                     }
                 })
                 .await
-                .unwrap_or(false)
-                {
+                .unwrap_or_else(|_| {
+                    fault.store(true, Ordering::Release);
+                    false
+                }) {
                     if !wait(&state, &mut stop).await {
-                        return;
+                        return if fault.load(Ordering::Acquire) {
+                            WorkerExit::Unknown
+                        } else {
+                            WorkerExit::Settled
+                        };
                     }
                 }
             }
         }
     }
+    if fault.load(Ordering::Acquire) {
+        WorkerExit::Unknown
+    } else {
+        WorkerExit::Settled
+    }
+}
+fn storage_uncertain(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some()
+            || cause.downcast_ref::<tokio::task::JoinError>().is_some()
+    })
 }
 async fn transport(
     state: &Arc<AppState>,
     config: &Config,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(Transport, Zeroizing<String>)> {
+    if *stop.borrow() || state.lifecycle.signal().is_cancelled() {
+        anyhow::bail!("后台停止接收网关连接");
+    }
     if fixture_enabled() {
         // Process-only test override; never persisted or obtainable through API.
         let token = Zeroizing::new(
@@ -131,7 +161,7 @@ async fn transport(
     );
     tokio::pin!(read);
     let secret = loop {
-        if *stop.borrow() {
+        if *stop.borrow() || state.lifecycle.signal().is_cancelled() {
             cancellation.cancel();
         }
         tokio::select! {
@@ -157,6 +187,7 @@ async fn transport(
 }
 struct DaemonBackend {
     state: Arc<AppState>,
+    fault: Arc<AtomicBool>,
     id: String,
     channel: TrustedChannel,
     redaction_token: std::sync::Mutex<Zeroizing<String>>,
@@ -164,20 +195,20 @@ struct DaemonBackend {
 impl Backend for DaemonBackend {
     fn current(&self) -> bool {
         !*self.state.gateway_stop.borrow()
-            && self
-                .state
-                .store
-                .lock()
-                .unwrap()
-                .gateway_config()
-                .ok()
-                .flatten()
-                .is_some_and(|c| {
+            && !self.state.lifecycle.signal().is_cancelled()
+            && !self.fault.load(Ordering::Acquire)
+            && match self.state.store.lock().unwrap().gateway_config() {
+                Ok(config) => config.is_some_and(|c| {
                     c.enabled
                         && c.id == self.id
                         && c.revision == self.channel.config_revision
                         && c.device_id == self.channel.device_id
-                })
+                }),
+                Err(_) => {
+                    self.uncertain();
+                    false
+                }
+            }
     }
     fn handle(&self, request: GatewayRequest) -> GatewayResult {
         if !self.current() {
@@ -187,14 +218,18 @@ impl Backend for DaemonBackend {
         settings
             .redaction_secrets
             .push(self.redaction_token.lock().unwrap().as_str().to_owned());
-        let outcome = self.state.store.lock().unwrap().gateway_handle(
-            &self.id,
-            &self.channel,
-            &request,
-            &settings,
-        );
+        let outcome = {
+            let mut store = self.state.store.lock().unwrap();
+            if self.state.lifecycle.check_locked(&store).is_err() {
+                return GatewayResult::error(GatewayCode::Forbidden);
+            }
+            store.gateway_handle(&self.id, &self.channel, &request, &settings)
+        };
         match outcome {
             Ok((result, event)) => {
+                if result.code == GatewayCode::OutcomeUnknown {
+                    self.uncertain();
+                }
                 if let Some(event) = event {
                     self.state.publish(event);
                 }
@@ -203,27 +238,42 @@ impl Backend for DaemonBackend {
             }
             // Storage commit acknowledgements can be uncertain. Never translate
             // an error into a definitive rejection that invites a new execution.
-            Err(_) => GatewayResult::error(
-                if matches!(request.rpc, super::wire::GatewayRpc::Command { .. }) {
-                    GatewayCode::OutcomeUnknown
-                } else {
-                    GatewayCode::Internal
-                },
-            ),
+            Err(_) => {
+                self.uncertain();
+                GatewayResult::error(
+                    if matches!(request.rpc, super::wire::GatewayRpc::Command { .. }) {
+                        GatewayCode::OutcomeUnknown
+                    } else {
+                        GatewayCode::Internal
+                    },
+                )
+            }
         }
     }
+    fn uncertain(&self) {
+        self.fault.store(true, Ordering::Release);
+    }
     fn revoked(&self, principals: &[(String, u64)]) -> Result<Vec<String>> {
-        self.state
-            .store
-            .lock()
-            .unwrap()
-            .gateway_revoked(&self.id, &self.channel, principals)
+        let mut store = self.state.store.lock().unwrap();
+        // The fixed channel worker was registered before any receive; shutdown
+        // gates new reconciliation while its already accepted receipts settle.
+        if self.state.lifecycle.check_locked(&store).is_err() {
+            return Ok(Vec::new());
+        }
+        let result = store.gateway_revoked(&self.id, &self.channel, principals);
+        if result.as_ref().is_err_and(storage_uncertain) {
+            self.uncertain();
+        }
+        result
     }
     fn connection(&self, connected: bool) {
-        let _ = self.state.store.lock().unwrap().gateway_connection(
+        let result = self.state.store.lock().unwrap().gateway_connection(
             &self.id,
             self.channel.config_revision,
             if connected { "ready" } else { "disconnected" },
         );
+        if result.as_ref().is_err_and(storage_uncertain) {
+            self.uncertain();
+        }
     }
 }

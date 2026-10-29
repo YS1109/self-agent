@@ -10,6 +10,18 @@ use std::{
 
 struct Database(Mutex<Connection>);
 impl UpdateDatabase for Database {
+    fn new_transaction<T>(
+        &self,
+        lifecycle: &crate::reliability::lifecycle_runtime::LifecycleRuntime,
+        action: impl FnOnce(&Transaction<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut db = self.0.lock().unwrap();
+        lifecycle.check_locked(&db)?;
+        let tx = db.transaction()?;
+        let result = action(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
     fn transaction<T>(
         &self,
         action: impl FnOnce(&Transaction<'_>) -> anyhow::Result<T>,
@@ -22,6 +34,7 @@ impl UpdateDatabase for Database {
     }
 }
 struct Fixture {
+    lifecycle: Arc<crate::reliability::lifecycle_runtime::LifecycleRuntime>,
     root: PathBuf,
     server: tokio::task::JoinHandle<()>,
     base: String,
@@ -43,6 +56,7 @@ impl Fixture {
         let tx = db.transaction().unwrap();
         state::migrate(&tx).unwrap();
         tx.commit().unwrap();
+        let lifecycle = crate::reliability::lifecycle_runtime::LifecycleRuntime::new();
         let runtime = UpdateRuntime::new(
             Arc::new(Database(Mutex::new(db))),
             cap_std::fs::Dir::open_ambient_dir(root.join("stage"), cap_std::ambient_authority())
@@ -51,6 +65,7 @@ impl Fixture {
                 .unwrap(),
             "1.0.0".into(),
             4,
+            lifecycle.clone(),
         )
         .unwrap();
         // Production mounts inside its existing owner middleware. This fixture
@@ -79,6 +94,7 @@ impl Fixture {
         )
         .unwrap();
         Self {
+            lifecycle,
             root,
             server,
             base: format!("http://{addr}/api/v1/reliability/updates"),
@@ -327,4 +343,39 @@ fn upload_headers_are_unambiguous_canonical_and_bounded() {
     assert_eq!(upload_length(&h).unwrap(), 1);
     h.append(header::CONTENT_LENGTH, "1".parse().unwrap());
     assert!(upload_length(&h).is_err());
+}
+
+#[tokio::test]
+async fn draining_update_metadata_returns_static_503_but_validation_remains_400() {
+    use crate::reliability::lifecycle_runtime::{
+        QuiesceStage, QuiescenceCheck, ShutdownBackend, ShutdownFault,
+    };
+    struct Backend;
+    impl ShutdownBackend for Backend {
+        fn stop_external_inputs(&self) {}
+        fn quiesce(&self, _: QuiesceStage) -> std::result::Result<QuiescenceCheck, ShutdownFault> {
+            Ok(Default::default())
+        }
+    }
+    let f = Fixture::new().await;
+    f.lifecycle.request_shutdown(Arc::new(Backend)).unwrap();
+    let response = f.request(reqwest::Method::GET, "").send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains(&f.root.to_string_lossy().to_string()));
+    assert!(!body.contains("fixture-owner"));
+    let response = f
+        .request(reqwest::Method::POST, "/trust")
+        .json(&f.trust(None, true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = f
+        .request(reqwest::Method::POST, "/trust")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

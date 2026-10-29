@@ -18,6 +18,8 @@ struct Fixture {
     gate: (Mutex<bool>, Condvar),
     revoked: AtomicBool,
     oversized: AtomicBool,
+    uncertain: AtomicBool,
+    panic_handle: AtomicBool,
 }
 impl Fixture {
     fn new(blocked: bool) -> Arc<Self> {
@@ -28,6 +30,8 @@ impl Fixture {
             gate: (Mutex::new(!blocked), Condvar::new()),
             revoked: AtomicBool::new(false),
             oversized: AtomicBool::new(false),
+            uncertain: AtomicBool::new(false),
+            panic_handle: AtomicBool::new(false),
         })
     }
     fn release(&self) {
@@ -40,6 +44,9 @@ impl Backend for Fixture {
         self.current.load(Ordering::SeqCst)
     }
     fn handle(&self, request: GatewayRequest) -> GatewayResult {
+        if self.panic_handle.load(Ordering::SeqCst) {
+            panic!("intentional worker failure");
+        }
         self.entered.store(true, Ordering::SeqCst);
         let mut open = self.gate.0.lock().unwrap();
         while !*open {
@@ -59,6 +66,10 @@ impl Backend for Fixture {
         })
     }
     fn connection(&self, _: bool) {}
+    fn uncertain(&self) {
+        self.uncertain.store(true, Ordering::SeqCst);
+        self.current.store(false, Ordering::SeqCst);
+    }
 }
 
 fn request() -> GatewayServerFrame {
@@ -237,6 +248,7 @@ async fn blocking_transaction_does_not_stop_socket_heartbeat_and_is_awaited_afte
         .unwrap()
         .unwrap();
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert!(!backend.uncertain.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -314,5 +326,36 @@ async fn worst_case_json_escaping_returns_bounded_unknown_without_breaking_gener
         matches!(next_json(&mut socket).await,GatewayDaemonFrame::Reply{request_id,result} if request_id==second_request.request_id&&result.code==GatewayCode::Ok)
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        !backend.uncertain.load(Ordering::SeqCst),
+        "wire unknown is not physical cleanup uncertainty"
+    );
     stop_link(socket, task, stop).await;
+}
+
+#[tokio::test]
+async fn current_database_worker_panic_is_reported_as_cleanup_uncertainty() {
+    let (_, mut socket, task, backend, stop) = connected().await;
+    backend.panic_handle.store(true, Ordering::SeqCst);
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&request()).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while !backend.uncertain.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send_replace(true);
+    drop(socket);
+    timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(backend.uncertain.load(Ordering::SeqCst));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
 }

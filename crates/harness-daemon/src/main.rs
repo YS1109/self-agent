@@ -1,4 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    future::IntoFuture,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use anyhow::{bail, Context, Result};
 use harness_core::{data_dir, new_id, DaemonInfo};
@@ -22,12 +25,14 @@ async fn main() -> Result<()> {
     }
     let directory = data_dir();
     let lease = harness_daemon::maintenance::DataLease::acquire(&directory)?;
-    // Bind before opening SQLite so a second process cannot run crash recovery
-    // against a still-active daemon using the usual address.
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .context("无法绑定本机服务端口，可能已有实例正在运行")?;
     let address = listener.local_addr()?;
+    // Install Unix termination handlers before creating the Vault or execution
+    // workers. Keep the streams alive through the original cleanup owner: a
+    // second signal must not introduce an untracked forced-exit path.
+    let mut shutdown_signal = ShutdownSignal::new().context("无法监听本机关闭信号")?;
     let token = format!("{}{}", new_id(), new_id());
     let state = AppState::open_managed(lease.clone(), token.clone())?;
     let info = DaemonInfo {
@@ -35,14 +40,103 @@ async fn main() -> Result<()> {
         token,
         pid: std::process::id(),
     };
-    lease.write_daemon_metadata(&info)?;
-    spawn_workers(state.clone());
-    tracing::info!(base_url=%info.base_url, "本机后台服务已就绪");
-    let result = axum::serve(listener, router(state.clone())).await;
-    if !state.shutdown_credentials().await {
-        tracing::warn!("凭据工作线程未确认停止；未完成操作将在下次启动保守恢复，不能自动重放");
+    if let Err(error) = lease.write_daemon_metadata(&info) {
+        // State already owns the real Vault thread. A metadata failure is not
+        // permission to release the lease or runtime before that thread joins.
+        if state.request_shutdown().is_err() {
+            tracing::error!("启动失败且无法启动关闭监督器；保持数据目录所有权，未确认停止");
+        }
+        state.wait_stopped().await;
+        return Err(error);
     }
-    // Do not remove metadata after an abrupt exit; clients verify health and PID.
-    result?;
+    if let Err(error) = spawn_workers(state.clone()) {
+        // A partial startup may already own OS/async workers. Do not drop the
+        // runtime/data lease merely because the remaining registration failed.
+        if state.request_shutdown().is_err() {
+            tracing::error!("启动失败且关闭控制不可用；保持原工作所有权");
+        }
+        state.wait_stopped().await;
+        return Err(error);
+    }
+    tracing::info!(base_url=%info.base_url, "本机后台服务已就绪");
+    let (stop_http, mut http_stop) = tokio::sync::watch::channel(false);
+    let server = axum::serve(listener, router(state.clone()))
+        .with_graceful_shutdown(async move {
+            while !*http_stop.borrow_and_update() {
+                if http_stop.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .into_future();
+    tokio::pin!(server);
+    // This owner observer is continuously driven, not a worker in the set it
+    // drains. A failure is detected even with zero HTTP clients or polls.
+    let serving_result = tokio::select! {
+        result = &mut server => Some(result),
+        _ = state.monitor_shutdown() => None,
+        result = shutdown_signal.wait() => {
+            if result.is_err() { tracing::error!("无法监听本机关闭信号；启动安全排空"); }
+            None
+        }
+    };
+    if state.request_shutdown().is_err() {
+        tracing::error!("关闭控制不可用；保持原工作和数据目录所有权，未确认停止");
+    }
+    // Pending/Unknown retains actual ownership indefinitely; repeated HTTP
+    // observation/connection loss never aborts cleanup or claims Stopped.
+    // Keep polling the server while draining so status remains available.
+    if let Some(result) = serving_result {
+        state.wait_stopped().await;
+        result?;
+    } else {
+        tokio::select! {
+            _ = state.wait_stopped() => {},
+            result = &mut server => {
+                state.wait_stopped().await;
+                result?;
+                return Ok(());
+            }
+        }
+        stop_http.send_replace(true);
+        server.await?;
+    }
+    // Stale metadata is not a stop proof; clients already check health/identity.
+    // The directory lease lives until this confirmed cleanup/graceful exit.
     Ok(())
+}
+
+/// Signal observation only. Every accepted signal enters the same retained
+/// supervisor as HTTP and worker failure; this type never stops a worker.
+struct ShutdownSignal {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignal {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn wait(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let received = tokio::select! {
+                received = self.interrupt.recv() => received,
+                received = self.terminate.recv() => received,
+            };
+            received.ok_or_else(|| std::io::Error::other("关闭信号流已结束"))
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await
+        }
+    }
 }

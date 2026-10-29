@@ -23,7 +23,26 @@ struct State {
 }
 #[derive(Clone, Default)]
 pub(crate) struct MockVaultControl(Arc<Mutex<State>>);
-struct MemoryBackend(MockVaultControl);
+struct MemoryBackend(MockVaultControl, Option<Arc<GateState>>);
+impl Drop for MemoryBackend {
+    fn drop(&mut self) {
+        block(self.1.take());
+    }
+}
+
+pub(crate) fn memory_with_blocked_drop(
+    queue_capacity: usize,
+) -> Result<(Arc<Vault>, MockGate), VaultError> {
+    let control = MockVaultControl::default();
+    let gate = Arc::new(GateState::default());
+    Ok((
+        Arc::new(Vault::start(
+            MemoryBackend(control, Some(gate.clone())),
+            queue_capacity,
+        )?),
+        MockGate(gate),
+    ))
+}
 
 /// Fresh fixture storage. Construction performs no OS access. Reuse the control
 /// with `open` to simulate a daemon restart against the same credential service.
@@ -34,7 +53,7 @@ pub(crate) fn memory(queue_capacity: usize) -> Result<(Arc<Vault>, MockVaultCont
 impl MockVaultControl {
     pub(crate) fn open(&self, queue_capacity: usize) -> Result<Arc<Vault>, VaultError> {
         Ok(Arc::new(Vault::start(
-            MemoryBackend(self.clone()),
+            MemoryBackend(self.clone(), None),
             queue_capacity,
         )?))
     }

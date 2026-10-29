@@ -112,14 +112,20 @@ pub(crate) struct Gateway {
 }
 impl Drop for Gateway {
     fn drop(&mut self) {
-        self.worker.abort();
+        if !self.worker.is_finished() {
+            self.worker.abort();
+        }
     }
 }
 impl Gateway {
-    pub async fn shutdown(mut self) {
-        self.worker.abort();
-        let _ = (&mut self.worker).await;
+    pub async fn shutdown(mut self) -> Result<()> {
+        // Closing the receiver wakes sender.closed() in the heartbeat loop.
+        // During bounded handshake/write it finishes that owned future first.
         self.incoming.close();
+        self.pending.take();
+        (&mut self.worker)
+            .await
+            .map_err(|_| anyhow::anyhow!("QQ 网关清理工作中断"))
     }
     pub async fn next(&mut self) -> Result<GatewayItem> {
         if self.pending.is_some() {

@@ -4,7 +4,10 @@ use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::{AppState, Settings};
+use crate::{
+    reliability::lifecycle::{WorkerExit, WorkerKind},
+    AppState, Settings,
+};
 
 const MAX_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
@@ -33,17 +36,23 @@ const SYSTEM_PROMPT: &str = r#"你是本地编程工作台的主 Agent。默认�
 已有失败记录会保留；只有完成的验收节点带有实际成功命令证据时，后台才设置原失败节点的 resolved_by。所有节点已完成或失败已被验收解决，且目标达成，才可 complete。未解决失败、缺少证据时不得虚构成功。"#;
 
 /// The coordinator has its own worker so model latency never occupies a task worker.
-pub fn spawn(state: Arc<AppState>) {
-    tokio::spawn(async move {
+pub fn spawn(state: Arc<AppState>) -> Result<()> {
+    let lifecycle = state.lifecycle.clone();
+    lifecycle.spawn(WorkerKind::Coordinator, async move {
+        let stop = state.lifecycle.signal();
         loop {
-            let claimed = state.store.lock().unwrap().claim_coordinator_job();
+            let claimed = {
+                let mut store = state.store.lock().unwrap();
+                if state.lifecycle.check_locked(&store).is_err() { return WorkerExit::Settled; }
+                store.claim_coordinator_job()
+            };
             match claimed {
                 Ok(Some(job)) => {
                     let job_id = match job["id"].as_str() {
                         Some(id) => id.to_owned(),
                         None => {
                             tracing::error!("主 Agent 作业缺少标识");
-                            continue;
+                            return WorkerExit::Unknown;
                         }
                     };
                     let context = state.store.lock().unwrap().coordinator_context(&job);
@@ -64,6 +73,7 @@ pub fn spawn(state: Arc<AppState>) {
                             tokio::pin!(request);
                             loop {
                                 tokio::select! {
+                                    _ = stop.cancelled() => break Err(anyhow::anyhow!("后台正在关闭，未应用编排结果")),
                                     result = &mut request => break result,
                                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
                                         let active = {
@@ -80,11 +90,18 @@ pub fn spawn(state: Arc<AppState>) {
                         }
                         Err(_) => Err(anyhow::anyhow!("无法读取主 Agent 的会话上下文")),
                     };
-                    let completed = state
-                        .store
-                        .lock()
-                        .unwrap()
-                        .complete_coordinator_job(&job_id, result);
+                    let completed = {
+                        let mut store = state.store.lock().unwrap();
+                        if state.lifecycle.check_locked(&store).is_err() {
+                            match store.quiesce_for_shutdown() {
+                                Ok(report) => { for event in report.events { state.publish(event); } }
+                                Err(_) => return WorkerExit::Unknown,
+                            }
+                        }
+                        // Quiescence precedes this late settlement, so no plan,
+                        // dependent child or waiting state can be resurrected.
+                        store.complete_coordinator_job(&job_id, result)
+                    };
                     match completed {
                         Ok(events) => {
                             for event in events {
@@ -92,22 +109,27 @@ pub fn spawn(state: Arc<AppState>) {
                             }
                             state.wake.notify_waiters();
                         }
-                        Err(error) => tracing::error!(%error, "无法保存主 Agent 的处理结果"),
+                        Err(_) => {
+                            tracing::error!("无法确认主 Agent 结果记录；未重放");
+                            return WorkerExit::Unknown;
+                        },
                     }
                 }
                 Ok(None) => {
                     tokio::select! {
+                        _ = stop.cancelled() => return WorkerExit::Settled,
                         _ = state.wake.notified() => {},
                         _ = tokio::time::sleep(Duration::from_millis(250)) => {},
                     }
                 }
-                Err(error) => {
-                    tracing::error!(%error, "无法领取主 Agent 作业");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(_) => {
+                    tracing::error!("无法确认主 Agent 作业领取；停止新工作，未重放");
+                    return WorkerExit::Unknown;
                 }
             }
         }
-    });
+    })?;
+    Ok(())
 }
 
 async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Value> {

@@ -52,6 +52,7 @@ jobs:
       - run: python scripts/update_control_smoke.py
       - run: python scripts/package_lifecycle_smoke.py --self-test
       - run: python scripts/package_lifecycle_smoke.py
+      - run: python scripts/daemon_shutdown_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}

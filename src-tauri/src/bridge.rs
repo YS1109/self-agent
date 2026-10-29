@@ -54,6 +54,7 @@ impl Bridge {
                 .await
                 .map_err(|error| error.to_string())?
             {
+                startup.observed_peer();
                 return Ok((info, protocol));
             }
         }
@@ -203,7 +204,7 @@ pub async fn api_request(
         .request(method, url)
         .bearer_auth(&info.token)
         .header("X-Self-Agent-Protocol", protocol.to_string());
-    if path == "/api/v1/settings/check" {
+    if path == "/api/v1/settings/check" || path == "/api/v1/lifecycle/shutdown?wait_ms=30000" {
         request = request.timeout(Duration::from_secs(35));
     }
     if let Some(body) = body {
@@ -355,6 +356,18 @@ fn reliability_route(method: &str, path: &str) -> bool {
 }
 
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
+    if method == "GET" && path == "/api/v1/lifecycle" {
+        return Ok(Method::GET);
+    }
+    if method == "POST"
+        && matches!(
+            path,
+            "/api/v1/lifecycle/shutdown" | "/api/v1/lifecycle/shutdown?wait_ms=30000"
+        )
+    {
+        return Ok(Method::POST);
+    }
+
     if method == "GET"
         && (path == "/api/v1/reliability/updates"
             || path
@@ -732,6 +745,32 @@ mod updates_route_tests {
             for method in ["GET", "POST", "PUT", "DELETE"] {
                 assert!(validate_route(method, &path).is_err());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_route_tests {
+    use super::*;
+    #[test]
+    fn lifecycle_routes_are_exact_owner_observers_and_single_shutdown_only() {
+        for (method, path) in [
+            ("GET", "/api/v1/lifecycle"),
+            ("POST", "/api/v1/lifecycle/shutdown"),
+            ("POST", "/api/v1/lifecycle/shutdown?wait_ms=30000"),
+        ] {
+            assert!(validate_route(method, path).is_ok());
+        }
+        for (method, path) in [
+            ("POST", "/api/v1/lifecycle"),
+            ("GET", "/api/v1/lifecycle/shutdown"),
+            ("POST", "/api/v1/lifecycle/shutdown?wait_ms=30001"),
+            ("POST", "/api/v1/lifecycle/shutdown?wait_ms=30000&retry=1"),
+            ("POST", "/api/v1/lifecycle/shutdown?wait_ms=0"),
+            ("POST", "/api/v1/lifecycle/start"),
+            ("GET", "/api/v1/lifecycle?token=x"),
+        ] {
+            assert!(validate_route(method, path).is_err(), "{method} {path}");
         }
     }
 }

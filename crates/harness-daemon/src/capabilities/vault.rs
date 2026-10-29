@@ -8,7 +8,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -324,6 +324,7 @@ pub(crate) struct Vault {
     sender: mpsc::Sender<Job>,
     state: Arc<AtomicU8>,
     done: Arc<Notify>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Vault {
@@ -341,7 +342,7 @@ impl Vault {
         let done = Arc::new(Notify::new());
         let worker_state = state.clone();
         let worker_done = done.clone();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("self-agent-vault".into())
             .spawn(move || worker(backend, receiver, worker_state, worker_done))
             .map_err(|_| VaultError::not_attempted(VaultReason::Unavailable))?;
@@ -349,6 +350,7 @@ impl Vault {
             sender,
             state,
             done,
+            worker: Mutex::new(Some(worker)),
         })
     }
 
@@ -474,13 +476,27 @@ impl Vault {
             let done = self.done.notified();
             tokio::pin!(done);
             done.as_mut().enable();
-            match self.state.load(Ordering::SeqCst) {
-                STOPPED => return ShutdownStatus::Stopped,
-                FAILED => return ShutdownStatus::Failed,
-                _ => {}
+            // The backend destructor and thread epilogue may still be running
+            // after the logical state changes. Only a completed, joined thread
+            // proves that the OS custodian has actually released its ownership.
+            {
+                let mut worker = self.worker.lock().unwrap();
+                if worker.as_ref().is_some_and(|worker| worker.is_finished())
+                    && worker.take().unwrap().join().is_err()
+                {
+                    self.state.store(FAILED, Ordering::SeqCst);
+                }
+                if worker.is_none() {
+                    return if self.state.load(Ordering::SeqCst) == STOPPED {
+                        ShutdownStatus::Stopped
+                    } else {
+                        ShutdownStatus::Failed
+                    };
+                }
             }
             tokio::select! {
                 _ = done => {},
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {},
                 _ = tokio::time::sleep_until(deadline.into()) => return ShutdownStatus::Draining,
             }
         }

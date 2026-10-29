@@ -98,6 +98,19 @@ class Daemon:
         if self.log:
             self.log.close()
 
+    def crash(self):
+        """Deliberately bypass graceful drain for crash-recovery fixtures only.
+
+        Killing the daemon is never evidence that its original side effects
+        settled; the restart assertions must retain interrupted/unknown states.
+        """
+        if self.process is None or self.process.poll() is not None:
+            raise AssertionError("Crash fixture requires a live daemon")
+        self.process.kill()
+        assert self.process.wait(timeout=5) != 0
+        if self.log:
+            self.log.close()
+
     def request(self, method, path, body=None, authenticate=True):
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Content-Type": "application/json"}

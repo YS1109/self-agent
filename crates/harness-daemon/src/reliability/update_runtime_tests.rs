@@ -6,19 +6,35 @@ use std::path::PathBuf;
 struct Database {
     connection: Mutex<Connection>,
     reject_finalize: AtomicBool,
+    reject_next_transaction: AtomicBool,
 }
 impl UpdateDatabase for Database {
+    fn new_transaction<T>(
+        &self,
+        lifecycle: &crate::reliability::lifecycle_runtime::LifecycleRuntime,
+        action: impl FnOnce(&Transaction<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut db = self.connection.lock().unwrap();
+        lifecycle.check_locked(&db)?;
+        let tx = db.transaction()?;
+        let result = action(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
     fn transaction<T>(&self, action: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut db = self.connection.lock().unwrap();
         let tx = db.transaction()?;
         let result = action(&tx)?;
+        if self.reject_next_transaction.swap(false, Ordering::AcqRel) {
+            return Err(UpdateCommitUncertain.into());
+        }
         let verified: u64 = tx.query_row(
             "SELECT COUNT(*) FROM update_jobs WHERE status='verified'",
             [],
             |r| r.get(0),
         )?;
         if verified > 0 && self.reject_finalize.swap(false, Ordering::AcqRel) {
-            bail!("fixture commit failed after witness");
+            return Err(UpdateCommitUncertain.into());
         }
         tx.commit()?;
         Ok(result)
@@ -41,6 +57,7 @@ impl Fixture {
         let database = Arc::new(Database {
             connection: Mutex::new(db),
             reject_finalize: AtomicBool::new(false),
+            reject_next_transaction: AtomicBool::new(false),
         });
         let runtime = UpdateRuntime::new(
             database,
@@ -48,6 +65,7 @@ impl Fixture {
             Dir::open_ambient_dir(root.join("witness"), cap_std::ambient_authority()).unwrap(),
             "1.0.0".into(),
             4,
+            crate::reliability::lifecycle_runtime::LifecycleRuntime::new(),
         )
         .unwrap();
         let key = Ed25519KeyPair::from_pkcs8(
@@ -331,9 +349,22 @@ async fn failed_db_finalize_keeps_witness_floor_and_unknown_never_replays() {
         .is_err());
     assert!(f.names().is_empty());
     assert_eq!(witness::load(&f.runtime.witness).unwrap().len(), 1);
-    let receipt = f.runtime.receipt(id.clone()).await.unwrap().unwrap();
-    assert_eq!(receipt.receipt.status, state::Status::Unknown);
-    assert!(!receipt.current_stage_verified);
+    let receipt = f
+        .runtime
+        .db
+        .transaction(|tx| Ok(state::receipt(tx, &id)?.unwrap()))
+        .unwrap();
+    assert_eq!(receipt.status, state::Status::Unknown);
+    let lifecycle = f.runtime.lifecycle.clone();
+    lifecycle.request_shutdown(Arc::new(DrainBackend)).unwrap();
+    let drained = lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        drained.snapshot.outcome,
+        Some(super::super::lifecycle_runtime::ShutdownOutcome::Unknown)
+    );
+    assert!(drained.snapshot.workers.unknown_workers > 0);
     assert!(f
         .runtime
         .upload(id, std::io::Cursor::new(b"bytes".to_vec()), cancel())
@@ -680,4 +711,208 @@ async fn readback_rechecks_trust_revocation_and_newer_floor_after_hash() {
         assert!(!observed.current_stage_verified);
         assert!(!observed.receipt.stage_authority);
     }
+}
+
+struct DrainBackend;
+impl super::super::lifecycle_runtime::ShutdownBackend for DrainBackend {
+    fn stop_external_inputs(&self) {}
+    fn quiesce(
+        &self,
+        _: super::super::lifecycle_runtime::QuiesceStage,
+    ) -> std::result::Result<
+        super::super::lifecycle_runtime::QuiescenceCheck,
+        super::super::lifecycle_runtime::ShutdownFault,
+    > {
+        Ok(Default::default())
+    }
+}
+#[tokio::test]
+async fn drain_cancels_held_upload_and_settles_after_observer_drop() {
+    let f = Fixture::new().await;
+    let id = f.begin(b"bytes", "2.0.0", 10).await;
+    let (_writer, reader) = tokio::io::duplex(16);
+    let runtime = f.runtime.clone();
+    let job = id.clone();
+    let observer = tokio::spawn(async move { runtime.upload(job, reader, cancel()).await });
+    claimed(&f, &id).await;
+    observer.abort();
+    let lifecycle = f.runtime.lifecycle.clone();
+    lifecycle.request_shutdown(Arc::new(DrainBackend)).unwrap();
+    f.runtime.stop_active();
+    assert!(f.runtime.status().await.is_err());
+    assert!(f.runtime.receipt(id.clone()).await.is_err());
+    let drained = lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        drained.snapshot.outcome,
+        Some(super::super::lifecycle_runtime::ShutdownOutcome::Stopped)
+    );
+    assert!(f.names().is_empty());
+    let receipt = f
+        .runtime
+        .db
+        .transaction(|tx| Ok(state::receipt(tx, &id)?.unwrap()))
+        .unwrap();
+    assert!(matches!(
+        receipt.status,
+        state::Status::Failed | state::Status::Unknown
+    ));
+    assert!(witness::load(&f.runtime.witness).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn held_metadata_worker_stays_owned_after_observer_drop_and_drain() {
+    let f = Fixture::new().await;
+    let (entered, notified) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let runtime = f.runtime.clone();
+    let observer = tokio::spawn(async move {
+        runtime
+            .blocking(move |_| {
+                let _ = entered.send(());
+                wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(())
+            })
+            .await
+    });
+    notified.await.unwrap();
+    observer.abort();
+    let lifecycle = f.runtime.lifecycle.clone();
+    lifecycle.request_shutdown(Arc::new(DrainBackend)).unwrap();
+    let pending = lifecycle
+        .observe(Instant::now() + Duration::from_millis(30))
+        .await;
+    assert!(pending.deadline_reached);
+    assert!(pending.snapshot.workers.pending_workers > 0);
+    assert!(f.runtime.status().await.is_err());
+    release.send(()).unwrap();
+    let drained = lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        drained.snapshot.outcome,
+        Some(super::super::lifecycle_runtime::ShutdownOutcome::Stopped)
+    );
+}
+
+#[tokio::test]
+async fn drain_after_durable_floor_keeps_unknown_receipt_but_confirms_physical_settlement() {
+    let mut f = Fixture::new().await;
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, wait) = std::sync::mpsc::channel();
+    let wait = Mutex::new(wait);
+    Arc::get_mut(&mut f.runtime).unwrap().test_before_finalize = Some(Arc::new(move || {
+        let _ = entered.lock().unwrap().take().unwrap().send(());
+        wait.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+    }));
+    let id = f.begin(b"bytes", "2.0.0", 10).await;
+    let runtime = f.runtime.clone();
+    let op = id.clone();
+    let observer = tokio::spawn(async move {
+        runtime
+            .upload(op, std::io::Cursor::new(b"bytes"), cancel())
+            .await
+    });
+    ready.await.unwrap();
+    let lifecycle = f.runtime.lifecycle.clone();
+    lifecycle.request_shutdown(Arc::new(DrainBackend)).unwrap();
+    observer.abort();
+    assert!(
+        lifecycle
+            .observe(Instant::now() + Duration::from_millis(30))
+            .await
+            .deadline_reached
+    );
+    release.send(()).unwrap();
+    let drained = lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        drained.snapshot.outcome,
+        Some(super::super::lifecycle_runtime::ShutdownOutcome::Stopped)
+    );
+    let receipt = f
+        .runtime
+        .db
+        .transaction(|tx| Ok(state::receipt(tx, &id)?.unwrap()))
+        .unwrap();
+    assert_eq!(receipt.status, state::Status::Unknown);
+    assert!(!receipt.stage_authority);
+    assert_eq!(witness::load(&f.runtime.witness).unwrap().len(), 1);
+    assert!(f.names().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_hash_floor_import_commit_uncertainty_cannot_settle_metadata_worker() {
+    let mut f = Fixture::new().await;
+    let id = f.begin(b"bytes", "2.0.0", 10).await;
+    f.runtime
+        .upload(id.clone(), std::io::Cursor::new(b"bytes"), cancel())
+        .await
+        .unwrap();
+    let db = f.runtime.db.clone();
+    Arc::get_mut(&mut f.runtime).unwrap().test_after_hash = Some(Arc::new(move || {
+        // Initial import and receipt read have succeeded. Fail precisely the
+        // second floor-import transaction after actual file readback.
+        db.reject_finalize.store(true, Ordering::Release);
+    }));
+    let error = f
+        .runtime
+        .receipt(id)
+        .await
+        .err()
+        .expect("commit uncertainty must propagate");
+    assert!(error.is::<UpdateCommitUncertain>());
+    let lifecycle = f.runtime.lifecycle.clone();
+    lifecycle.request_shutdown(Arc::new(DrainBackend)).unwrap();
+    let observed = lifecycle
+        .observe(Instant::now() + Duration::from_secs(3))
+        .await;
+    assert_eq!(
+        observed.snapshot.outcome,
+        Some(super::super::lifecycle_runtime::ShutdownOutcome::Unknown)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_monitor_commit_uncertainty_survives_cancelled_stage_cleanup() {
+    let f = Fixture::new().await;
+    let id = f.begin(b"bytes", "2.0.0", 10).await;
+    let (_writer, reader) = tokio::io::duplex(16);
+    let runtime = f.runtime.clone();
+    let op = id.clone();
+    let upload = tokio::spawn(async move { runtime.upload(op, reader, cancel()).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.names().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Claim/preflight are done and the real .part owner is blocked only on its
+    // input. The next transaction is the registered staging monitor check.
+    f.runtime
+        .db
+        .reject_next_transaction
+        .store(true, Ordering::Release);
+    assert!(tokio::time::timeout(Duration::from_secs(3), upload)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert!(f.names().is_empty());
+    let lifecycle = f.runtime.lifecycle.clone();
+    lifecycle.request_shutdown(Arc::new(DrainBackend)).unwrap();
+    let observed = lifecycle
+        .observe(Instant::now() + Duration::from_secs(3))
+        .await;
+    assert_eq!(
+        observed.snapshot.outcome,
+        Some(super::super::lifecycle_runtime::ShutdownOutcome::Unknown)
+    );
 }

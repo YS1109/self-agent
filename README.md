@@ -239,3 +239,9 @@ docs/                     产品计划和当前协议
 `self-agent-cli updates --help` 提供独立本机 owner 的 verification-only 信任配置、原始签名清单与有界字节暂存、原 UUID 查询/取消/明确清理。生产自动下载与安装始终禁用；桌面可靠性面板只读显示验证状态，不执行产物。schema v4 的独立 witness 防止恢复旧任务库降低仍保留的验证下限。
 
 CLI、Native bridge 与开发代理先进行已认证兼容协商；不兼容后台不接收动作，也不会被自动替换。Native 单次启动具有可见进度、原始30秒就绪观察上限与迟到只读恢复，超时不自动重启。真实本地模拟门禁和未运行的完整 GUI/OS安装/生产签名边界见 [协议 v15](docs/protocol-v15.md) 与 [校验切片验收](docs/acceptance-update-v1.0.md)。
+
+## 同一后台实例的显式关闭（1.0 开发切片）
+
+可靠性面板和 `self-agent-cli daemon-status` 可只读观察；`self-agent-cli --wait 30 daemon-stop --confirm` 明确关闭共享后台，包括 QQ/H5 入口。关闭请求绑定当前实例 UUID，只发送一次；运行、排队及暂停中的任务和计划会取消，重启不会自动恢复。关闭桌面窗口不等于关闭后台。Ctrl-C 与 Unix SIGTERM 使用同一清理流程；外部强杀不是已清理证明。已写入的文件不会撤销。
+
+清理超时、断连或新实例出现都不等于原实例已停止。客户端只读观察原请求，不自动重发或启动替代后台；物理清理未知时继续持有数据目录租约。实际所有权、准入与两次 quiesce 合同见 [协议 v16](docs/protocol-v16.md)，开发门禁与未运行范围见 [生命周期验收](docs/acceptance-lifecycle-v1.0.md)。本节不宣称未发布工作树已通过精确提交 CI 或实机 GUI/安装验收。

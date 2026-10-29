@@ -1,5 +1,7 @@
 //! Verification/staging coordinator. All authority is local-owner committed
 //! state; no network, extraction, execution, installation or automatic download.
+use super::lifecycle::{WorkerExit, WorkerKind};
+use super::lifecycle_runtime::LifecycleRuntime;
 use super::{update, update_state as state, update_witness as witness};
 use anyhow::{bail, Context, Result};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -18,9 +20,22 @@ use std::{
 use tokio::{io::AsyncRead, sync::Semaphore};
 const QUOTA: u64 = 512 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(120);
+#[derive(Debug)]
+pub(crate) struct UpdateCommitUncertain;
+impl std::fmt::Display for UpdateCommitUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("更新状态提交未确认")
+    }
+}
+impl std::error::Error for UpdateCommitUncertain {}
 /// Implement with the authoritative Store mutex/connection. This callback must
 /// commit on Ok and roll back on Err; no separate runtime SQLite database.
 pub(crate) trait UpdateDatabase: Send + Sync + 'static {
+    fn new_transaction<T>(
+        &self,
+        lifecycle: &LifecycleRuntime,
+        action: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T>;
     fn transaction<T>(&self, action: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T>;
 }
 #[derive(Clone, Debug, Serialize)]
@@ -47,8 +62,12 @@ pub(crate) struct RuntimeReceipt {
     pub installed: bool,
     pub automatic_update_enabled: bool,
 }
+/// Constructed only inside a lifecycle-registered wrapper. Nested settlement
+/// borrows this context instead of admitting a new worker after drain.
+struct OwnedWork;
 pub(crate) struct UpdateRuntime<D: UpdateDatabase> {
     db: Arc<D>,
+    lifecycle: Arc<LifecycleRuntime>,
     stage: Arc<Dir>,
     witness: Arc<Dir>,
     current_version: String,
@@ -61,6 +80,8 @@ pub(crate) struct UpdateRuntime<D: UpdateDatabase> {
     test_now: Option<Arc<std::sync::atomic::AtomicU64>>,
     #[cfg(test)]
     test_after_hash: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    test_before_finalize: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -223,6 +244,7 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
         witness: Dir,
         current_version: String,
         schema: u32,
+        lifecycle: Arc<LifecycleRuntime>,
     ) -> Result<Arc<Self>> {
         if update::production_policy().status()
             != update::UpdateStatus::DisabledNoTrustedReleaseConfiguration
@@ -233,6 +255,7 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
         update::UpdateContext::new(&current_version, &current_version, 0, schema, target, now())?;
         Ok(Arc::new(Self {
             db,
+            lifecycle,
             stage: Arc::new(stage),
             witness: Arc::new(witness),
             current_version,
@@ -245,6 +268,8 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
             test_now: None,
             #[cfg(test)]
             test_after_hash: None,
+            #[cfg(test)]
+            test_before_finalize: None,
         }))
     }
     fn current_time(&self) -> u64 {
@@ -254,8 +279,43 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
         }
         now()
     }
+    /// No SQL or blocking work: the original registered upload retains cleanup.
+    pub(crate) fn stop_active(&self) {
+        if let Some((_, cancel)) = self.active.lock().unwrap().as_ref() {
+            cancel.store(true, Ordering::Release);
+        }
+    }
     async fn blocking<T: Send + 'static>(
         self: &Arc<Self>,
+        action: impl FnOnce(Arc<Self>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let admission = self.lifecycle.admit()?;
+        let runtime = self.clone();
+        let receive = admission.spawn(WorkerKind::BlockingCleanup, async move {
+            let owner = OwnedWork;
+            let result = runtime
+                .blocking_owned(&owner, move |r| {
+                    // Even read/import requests must linearize under the real Store
+                    // lock; a pre-admitted waiter cannot create work after drain.
+                    r.db.new_transaction(&r.lifecycle, |_| Ok(()))?;
+                    action(r)
+                })
+                .await;
+            let exit = if result.as_ref().err().is_some_and(|e| {
+                e.is::<tokio::task::JoinError>() || e.is::<UpdateCommitUncertain>()
+            }) {
+                WorkerExit::Unknown
+            } else {
+                WorkerExit::Settled
+            };
+            (exit, result)
+        })?;
+        receive.await.context("更新工作观察已中断")?
+    }
+    /// Private: called only inside the original registered metadata/upload owner.
+    async fn blocking_owned<T: Send + 'static>(
+        self: &Arc<Self>,
+        _owner: &OwnedWork,
         action: impl FnOnce(Arc<Self>) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let permit = self
@@ -278,7 +338,15 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
     }
     pub(crate) async fn status(self: &Arc<Self>) -> Result<RuntimeStatus> {
         self.blocking(|r| {
-            let witness_ok = import(r.db.as_ref(), &r.witness).is_ok();
+            let witness_result = import(r.db.as_ref(), &r.witness);
+            if witness_result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.is::<UpdateCommitUncertain>())
+            {
+                return Err(witness_result.unwrap_err());
+            }
+            let witness_ok = witness_result.is_ok();
             let staging = scan(&r.stage).ok();
             let (configuration, floors, mut receipts) = r.db.transaction(|tx| {
                 let config = state::config(tx)?;
@@ -333,8 +401,9 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
     ) -> Result<state::TrustConfig> {
         self.blocking(move |r| {
             import(r.db.as_ref(), &r.witness)?;
-            let c =
-                r.db.transaction(|tx| state::configure(tx, expected, input, millis()))?;
+            let c = r.db.new_transaction(&r.lifecycle, |tx| {
+                state::configure(tx, expected, input, millis())
+            })?;
             if let Some((_, cancel)) = r.active.lock().unwrap().as_ref() {
                 cancel.store(true, Ordering::Release);
             }
@@ -350,7 +419,7 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
     ) -> Result<state::Receipt> {
         self.blocking(move |r| {
             import(r.db.as_ref(), &r.witness)?;
-            r.db.transaction(|tx| {
+            r.db.new_transaction(&r.lifecycle, |tx| {
                 let c = state::config(tx)?.context("尚未配置本机更新验证信任")?;
                 if c.revision != revision {
                     bail!("更新信任版本已改变");
@@ -420,7 +489,15 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
     }
     pub(crate) async fn receipt(self: &Arc<Self>, id: String) -> Result<Option<RuntimeReceipt>> {
         self.blocking(move |r| {
-            let witness_ok = import(r.db.as_ref(), &r.witness).is_ok();
+            let witness_result = import(r.db.as_ref(), &r.witness);
+            if witness_result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.is::<UpdateCommitUncertain>())
+            {
+                return Err(witness_result.unwrap_err());
+            }
+            let witness_ok = witness_result.is_ok();
             let Some((mut receipt, current)) = r.db.transaction(|tx| {
                 let Some(receipt) = state::receipt(tx, &id)? else {
                     return Ok(None);
@@ -442,8 +519,20 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
             }
             // A bounded file hash can be slow. Revoke/config/floor changes during
             // it must not be projected as current stage authority afterward.
-            let current_stage_verified = bytes_verified
-                && import(r.db.as_ref(), &r.witness).is_ok()
+            let witness_rechecked = if bytes_verified {
+                let result = import(r.db.as_ref(), &r.witness);
+                if result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.is::<UpdateCommitUncertain>())
+                {
+                    return Err(result.unwrap_err());
+                }
+                result.is_ok()
+            } else {
+                false
+            };
+            let current_stage_verified = witness_rechecked
                 && r.db.transaction(|tx| {
                     let Some(latest) = state::receipt(tx, &id)? else {
                         return Ok(false);
@@ -462,7 +551,8 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
     }
     pub(crate) async fn cancel(self: &Arc<Self>, id: String) -> Result<state::Receipt> {
         self.blocking(move |r| {
-            let mut receipt = r.db.transaction(|tx| state::cancel(tx, &id, millis()))?;
+            let mut receipt =
+                r.db.new_transaction(&r.lifecycle, |tx| state::cancel(tx, &id, millis()))?;
             receipt.stage_authority = false;
             if let Some((active, cancel)) = r.active.lock().unwrap().as_ref() {
                 if active == &id {
@@ -488,20 +578,21 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
             {
                 bail!("验证仍在进行，尚不能清理暂存");
             }
-            let receipt =
-                r.db.transaction(|tx| state::receipt(tx, &id)?.context("更新操作不存在"))?;
-            if receipt.metadata.sha256 != expected_sha256
-                || matches!(
-                    receipt.status,
-                    state::Status::Pending | state::Status::Verifying
-                )
-            {
-                bail!("暂存摘要或操作状态已改变");
-            }
-            if matches_file(&r.stage, &id, &receipt.metadata)? {
-                r.stage.remove_file(basename(&id)?)?;
-            }
-            r.db.transaction(|tx| state::discarded(tx, &id, &expected_sha256, millis()))
+            r.db.new_transaction(&r.lifecycle, |tx| {
+                let receipt = state::receipt(tx, &id)?.context("更新操作不存在")?;
+                if receipt.metadata.sha256 != expected_sha256
+                    || matches!(
+                        receipt.status,
+                        state::Status::Pending | state::Status::Verifying
+                    )
+                {
+                    bail!("暂存摘要或操作状态已改变");
+                }
+                if matches_file(&r.stage, &id, &receipt.metadata)? {
+                    r.stage.remove_file(basename(&id)?)?;
+                }
+                state::discarded(tx, &id, &expected_sha256, millis())
+            })
         })
         .await
     }
@@ -529,27 +620,42 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
             .try_acquire_owned()
             .map_err(|_| anyhow::anyhow!("已有更新暂存正在验证，未接收第二份上传"))?;
         let runtime = self.clone();
-        tokio::spawn(async move {
+        let admission = self.lifecycle.admit()?;
+        let receive = admission.spawn(WorkerKind::BlockingCleanup, async move {
             let _permit = permit;
+            let owner = OwnedWork;
             *runtime.active.lock().unwrap() = Some((id.clone(), cancel.clone()));
-            let result = runtime.upload_inner(id, source, cancel, deadline).await;
+            let uncertain = Arc::new(AtomicBool::new(false));
+            let result = runtime
+                .upload_inner(&owner, id, source, cancel, deadline, uncertain.clone())
+                .await;
             *runtime.active.lock().unwrap() = None;
-            result
-        })
-        .await?
+            let exit = if uncertain.load(Ordering::Acquire)
+                || result.as_ref().err().is_some_and(|e| {
+                    e.is::<tokio::task::JoinError>() || e.is::<UpdateCommitUncertain>()
+                }) {
+                WorkerExit::Unknown
+            } else {
+                WorkerExit::Settled
+            };
+            (exit, result)
+        })?;
+        receive.await.context("更新工作观察已中断")?
     }
     async fn upload_inner<R: AsyncRead + Unpin + Send + 'static>(
         self: &Arc<Self>,
+        owner: &OwnedWork,
         id: String,
         source: R,
         cancel: Arc<AtomicBool>,
         deadline: Instant,
+        uncertain: Arc<AtomicBool>,
     ) -> Result<state::Receipt> {
         let op = id.clone();
         let claim = self
-            .blocking(move |r| {
+            .blocking_owned(owner, move |r| {
                 import(r.db.as_ref(), &r.witness)?;
-                r.db.transaction(|tx| {
+                r.db.new_transaction(&r.lifecycle, |tx| {
                     state::claim(tx, &op, millis())?.context("更新操作不可重放或已终止")
                 })
             })
@@ -560,8 +666,9 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
         let revision = claim.config.revision;
         let expected = claim.metadata.clone();
         let evidence = claim.evidence.clone();
+        let preflight_id = id.clone();
         let prepared = self
-            .blocking(move |r| {
+            .blocking_owned(owner, move |r| {
                 import(r.db.as_ref(), &r.witness)?;
                 let (config, floor) = r.db.transaction(|tx| {
                     Ok((
@@ -601,6 +708,15 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
                 {
                     bail!("更新暂存超过 512 MiB 配额");
                 }
+                for suffix in ["part", "verified"] {
+                    match r
+                        .stage
+                        .symlink_metadata(format!(".update-{preflight_id}.{suffix}"))
+                    {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        _ => bail!("更新暂存名称已占用或不可确认"),
+                    }
+                }
                 Ok(verified)
             })
             .await;
@@ -608,10 +724,13 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
             Ok(v) => v,
             Err(error) => {
                 let db = self.db.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let settlement = tokio::task::spawn_blocking(move || {
                     db.transaction(|tx| state::fail(tx, &claim, state::Failure::Rejected, millis()))
                 })
                 .await;
+                if !matches!(settlement, Ok(Ok(_))) {
+                    uncertain.store(true, Ordering::Release);
+                }
                 return Err(error);
             }
         };
@@ -623,15 +742,16 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
                 verified,
                 &work.stage,
                 deadline,
-                &|| stage_cancel.load(Ordering::Acquire),
+                &|| stage_cancel.load(Ordering::Acquire) || work.lifecycle.signal().is_cancelled(),
             ))
         });
         let staged = loop {
             tokio::select! {
                 result=&mut stage=>break result,
                 _=tokio::time::sleep(Duration::from_millis(100))=>{
-                    let current_id=id.clone();let valid=self.blocking(move|r|r.db.transaction(|tx|Ok(state::config(tx)?.is_some_and(|c|c.enabled&&c.revision==revision)&&state::receipt(tx,&current_id)?.is_some_and(|r|r.status==state::Status::Verifying&&r.reason.as_deref()!=Some("cancellation_requested"))))).await;
-                    if !matches!(valid,Ok(true))||Instant::now()>=deadline{cancel.store(true,Ordering::Release);}
+                    let current_id=id.clone();let valid=self.blocking_owned(owner, move|r|r.db.transaction(|tx|Ok(state::config(tx)?.is_some_and(|c|c.enabled&&c.revision==revision)&&state::receipt(tx,&current_id)?.is_some_and(|r|r.status==state::Status::Verifying&&r.reason.as_deref()!=Some("cancellation_requested"))))).await;
+                    if valid.as_ref().err().is_some_and(|error|error.is::<UpdateCommitUncertain>() || error.is::<tokio::task::JoinError>()) { uncertain.store(true,Ordering::Release); }
+                    if self.lifecycle.signal().is_cancelled()||!matches!(valid,Ok(true))||Instant::now()>=deadline{cancel.store(true,Ordering::Release);}
                 }
             }
         };
@@ -639,6 +759,9 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
             Ok(Ok(s)) => s,
             result => {
                 let worker_failed = result.is_err();
+                if worker_failed {
+                    uncertain.store(true, Ordering::Release);
+                }
                 let error = match result {
                     Ok(Err(error)) => anyhow::Error::from(error),
                     Err(_) => anyhow::anyhow!("更新文件验证工作未确认"),
@@ -652,10 +775,31 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
                 } else {
                     state::Failure::Rejected
                 };
-                let _ = tokio::task::spawn_blocking(move || {
+                let settlement = tokio::task::spawn_blocking(move || {
                     db.transaction(|tx| state::fail(tx, &claim, reason, millis()))
                 })
                 .await;
+                if !matches!(settlement, Ok(Ok(_))) {
+                    uncertain.store(true, Ordering::Release);
+                }
+                let cleanup_id = id.clone();
+                let clean = self
+                    .blocking_owned(owner, move |r| {
+                        for suffix in ["part", "verified"] {
+                            match r
+                                .stage
+                                .symlink_metadata(format!(".update-{cleanup_id}.{suffix}"))
+                            {
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                _ => return Ok(false),
+                            }
+                        }
+                        Ok(true)
+                    })
+                    .await;
+                if !matches!(clean, Ok(true)) {
+                    uncertain.store(true, Ordering::Release);
+                }
                 return Err(error);
             }
         };
@@ -663,8 +807,12 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
         // destructor also runs here on any failure, never on a Tokio worker.
         let runtime = self.clone();
         tokio::task::spawn_blocking(move || -> Result<state::Receipt> {
+            let cleanup_id = id.clone();
             let result = (|| {
-                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                if runtime.lifecycle.signal().is_cancelled()
+                    || cancel.load(Ordering::Acquire)
+                    || Instant::now() >= deadline
+                {
                     bail!("更新验证已取消或超时");
                 }
                 staged.valid_at(runtime.current_time())?;
@@ -689,21 +837,52 @@ impl<D: UpdateDatabase> UpdateRuntime<D> {
                     manifest_sha256: claim.metadata.manifest_sha256.clone(),
                     artifact_sha256: claim.metadata.sha256.clone(),
                 };
-                witness::append(&runtime.witness, &record)?;
-                let receipt = runtime.db.transaction(|tx| {
-                    if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-                        bail!("更新验证已取消或超时");
-                    }
-                    staged.valid_at(runtime.current_time())?;
-                    state::complete_verified(tx, &claim, &trusted(&record), millis())
+                witness::append(&runtime.witness, &record).inspect_err(|_| {
+                    uncertain.store(true, Ordering::Release);
                 })?;
+                #[cfg(test)]
+                if let Some(hook) = &runtime.test_before_finalize {
+                    hook();
+                }
+                let receipt = runtime
+                    .db
+                    .transaction(|tx| {
+                        if runtime.lifecycle.signal().is_cancelled()
+                            || cancel.load(Ordering::Acquire)
+                            || Instant::now() >= deadline
+                        {
+                            bail!("更新验证已取消或超时");
+                        }
+                        staged.valid_at(runtime.current_time())?;
+                        state::complete_verified(tx, &claim, &trusted(&record), millis())
+                    })
+                    .inspect_err(|error| {
+                        if error.is::<UpdateCommitUncertain>() || error.is::<rusqlite::Error>() {
+                            uncertain.store(true, Ordering::Release);
+                        }
+                    })?;
                 staged.retain();
                 Ok(receipt)
             })();
             if result.is_err() {
-                let _ = runtime
+                for suffix in ["part", "verified"] {
+                    match runtime
+                        .stage
+                        .symlink_metadata(format!(".update-{cleanup_id}.{suffix}"))
+                    {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        _ => {
+                            uncertain.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                if runtime
                     .db
-                    .transaction(|tx| state::fail(tx, &claim, state::Failure::Unknown, millis()));
+                    .transaction(|tx| state::fail(tx, &claim, state::Failure::Unknown, millis()))
+                    .is_err()
+                {
+                    uncertain.store(true, Ordering::Release);
+                }
             }
             result
         })

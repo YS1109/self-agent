@@ -233,7 +233,7 @@ def main():
                 identifier, project = run("question-restart")
                 request = wait_for(lambda: pending(identifier), description="restart waiting question")
                 before = len(Model.calls)
-                daemon.stop()
+                daemon.crash()  # Preserve crash-recovery interrupted_wait coverage.
                 daemon.start()
                 done = wait_for(lambda: terminal(identifier))
                 assert done["status"] == "failed" and done["stop_reason"] == "interrupted_wait", done

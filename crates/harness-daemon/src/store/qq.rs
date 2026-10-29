@@ -269,13 +269,15 @@ impl Store {
         });
         match result {
             Ok(processed) => {
-                if tx.commit().is_err() {
+                if let Err(error) = tx.commit() {
                     // A storage acknowledgement can fail after the commit. Check
                     // durable input identity, never redispatch or overwrite it.
                     if persistence::inbox(&self.db, &original.inbox_id)?.status == "handled" {
                         return Ok((true, None));
                     }
-                    bail!("QQ 输入提交未确认，未推进或重发指令");
+                    return Err(
+                        anyhow::Error::from(error).context("QQ 输入提交未确认，未推进或重发指令")
+                    );
                 }
                 Ok((processed.is_some(), processed.and_then(|p| p.event)))
             }

@@ -194,3 +194,11 @@ MCP 环境凭据后续切片见 protocol-v9 附节与 acceptance-mcp-credentials
 协议v15/schema v4 的更新代码位于 `reliability/update*.rs`，实际同Store适配器在 `store/updates.rs`；floor与数据目录下独立pinned witness共同保留下限，恢复不得删除/降低witness。只允许本机owner配置verification-only信任，生产下载/安装不开放。CLI updates可实际暂存惰性字节，UI仅观察。
 
 compatibility由core唯一wire类型驱动；Native `startup.rs` 保留单次进程尝试、有界metadata读取和revision状态，不能在不兼容/超时后自动替换后台。生命周期后续必须注册真正上传/metadata blocking worker并与Store admission同锁闭合，不能把HTTP observer drop当settled。本切片没有宣称drain已交付；验收和未运行项见 `acceptance-update-v1.0.md`。
+
+## 1.0 实际 drain 接手
+
+新增合同在 `protocol-v16.md`；核心是 AppState 的 `LifecycleRuntime`、同 Store 锁 admission、持续 worker monitor、真实 JoinHandle 所有权和首次/末次 quiesce。`admit_store` 只允许同步 SQL/校验；返回错误表示执行结束，不证明提交未发生，也不允许在闭包内启动未登记外部工作。
+
+HTTP 关闭必须带当前 `expected_instance`，CLI/UI 只发送一次并保留原实例观察。Vault 需真实 OS 线程 join；进程组/Job、阻塞 I/O、上传/备份和远端在途工作均不能因 observer 被丢弃而记为 Stopped。物理 Unknown 保持租约；历史 outcome_unknown 不被清理成功覆盖。
+
+接手前按 `acceptance-lifecycle-v1.0.md` 核对最新源码、固定二进制门禁、精确 SHA CI 和仍未运行项。不要把开发工作树、Linux/交叉编译、headless 夹具分别冒充已发布、Windows 执行或完整 GUI/安装验收。

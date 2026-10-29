@@ -274,3 +274,198 @@ async fn unknown_survives_restart_and_cleanup_does_not_rewrite_history() {
     assert_eq!(control.counts().sets, 1);
     clean(http.stop().await);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_rejects_new_intents_but_awaits_original_vault_settlement() {
+    use crate::reliability::lifecycle_runtime::ShutdownOutcome;
+    let (http, control) = fixture().await;
+    let config = http.config().await;
+    let gate = control.block_next_after_effect();
+    let id = new_id();
+    http.set(&config, &id).await;
+    assert!(gate.entered().await);
+    http.state.request_shutdown().unwrap();
+    let observed = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_millis(80))
+        .await;
+    assert!(observed.deadline_reached);
+    assert_ne!(observed.snapshot.outcome, Some(ShutdownOutcome::Stopped));
+    let rejected = http
+        .client
+        .post(format!("{}/api/v1/qq/commands", http.base))
+        .bearer_auth(OWNER)
+        .json(&json!({"id":new_id(),"command":{"type":"issue_pairing","ttl_seconds":60}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let new_id = new_id();
+    let rejected = http
+        .client
+        .post(format!(
+            "{}/api/v1/qq/credentials/{}",
+            http.base,
+            config["config_id"].as_str().unwrap()
+        ))
+        .bearer_auth(OWNER)
+        .json(&json!({"id":new_id,"expected_revision":config["revision"],"secret":SECRET}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(http
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .qq_credential_operation(&new_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(control.counts().sets, 1);
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let completed = http
+                .state
+                .store
+                .lock()
+                .unwrap()
+                .qq_credential_operation(&id)
+                .unwrap()
+                .is_some_and(|op| {
+                    matches!(
+                        serde_json::to_value(op).unwrap()["status"].as_str(),
+                        Some("completed" | "unknown")
+                    )
+                });
+            if completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let denied_read = http
+        .client
+        .get(format!(
+            "{}/api/v1/qq/credential-operations/{id}",
+            http.base
+        ))
+        .bearer_auth(OWNER)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_read.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let observed = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(3))
+        .await;
+    assert_eq!(observed.snapshot.outcome, Some(ShutdownOutcome::Stopped));
+    clean(http.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_synchronous_admin_transaction_does_not_poison_shutdown() {
+    let (http, _) = fixture().await;
+    let response = http
+        .client
+        .post(format!("{}/api/v1/qq/commands", http.base))
+        .bearer_auth(OWNER)
+        .json(&json!({"id":"not-uuid","command":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(http.state.lifecycle.snapshot().workers.accepting_work);
+    clean(http.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)] // Deliberately holds Store to force the shutdown admission race.
+async fn preadmitted_qq_mutation_waiting_for_store_cannot_commit_after_drain() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (http, _) = fixture().await;
+    let entered = Arc::new(AtomicBool::new(false));
+    let store = http.state.store.lock().unwrap();
+    let state = http.state.clone();
+    let ran = entered.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let worker = std::thread::spawn(move || {
+        let _runtime = runtime.enter();
+        begin(&state, |_| {
+            ran.store(true, Ordering::Release);
+            Ok(json!({"unexpected":true}))
+        })
+        .map(|(_, admission)| admission.settle())
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while http.state.lifecycle.snapshot().workers.active_admissions == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    http.state.request_shutdown().unwrap();
+    drop(store);
+    assert!(worker.join().unwrap().is_err());
+    assert!(!entered.load(Ordering::Acquire));
+    assert_eq!(
+        http.state.lifecycle.snapshot().workers.unknown_admissions,
+        0
+    );
+    clean(http.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qq_sql_intent_failure_keeps_armed_unknown_and_never_starts_os_effect() {
+    use crate::reliability::lifecycle_runtime::ShutdownOutcome;
+    let (http, control) = fixture().await;
+    let config = http.config().await;
+    let db = rusqlite::Connection::open(http.root.join("state.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER qq_fixture_reject_intent BEFORE INSERT ON qq_credential_operations BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;").unwrap();
+    let id = new_id();
+    let response = http
+        .client
+        .post(format!(
+            "{}/api/v1/qq/credentials/{}",
+            http.base,
+            config["config_id"].as_str().unwrap()
+        ))
+        .bearer_auth(OWNER)
+        .json(&json!({"id":id,"expected_revision":config["revision"],"secret":SECRET}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(control.counts().sets, 0);
+    assert!(http
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .qq_credential_operation(&id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        http.state.lifecycle.snapshot().workers.unknown_admissions,
+        1
+    );
+    http.state.request_shutdown().unwrap();
+    let observed = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(3))
+        .await;
+    assert_eq!(observed.snapshot.outcome, Some(ShutdownOutcome::Unknown));
+    drop(db);
+    let _ = http.shutdown.send(());
+    http.server.await.unwrap();
+    assert!(!http.state.shutdown_credentials().await);
+    drop(http.client);
+    drop(http.state);
+    clean(http.root);
+}

@@ -752,3 +752,53 @@ fn service_binding_has_a_distinct_scope_and_never_accepts_a_foreign_reference() 
     let other = VaultBinding::service(OWNER, "qq_client_secret", &"b".repeat(64)).unwrap();
     assert!(CredentialRef::parse(reference.as_str(), &other).is_err());
 }
+
+#[tokio::test]
+async fn shutdown_waits_for_backend_drop_and_real_thread_join() {
+    struct DropBlocked(Arc<Gate>);
+    impl Backend for DropBlocked {
+        fn set(&mut self, _: &CredentialRef, _: &SecretBytes) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        fn get(&mut self, _: &CredentialRef) -> Result<SecretBytes, BackendError> {
+            unreachable!()
+        }
+        fn delete(&mut self, _: &CredentialRef) -> Result<(), BackendError> {
+            unreachable!()
+        }
+    }
+    impl Drop for DropBlocked {
+        fn drop(&mut self) {
+            self.0.block();
+        }
+    }
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let gate = Arc::new(Gate::default());
+    let _release = Release(gate.clone());
+    let vault = Arc::new(Vault::start(DropBlocked(gate.clone()), 1).unwrap());
+    assert_eq!(
+        vault
+            .shutdown(Instant::now() + Duration::from_millis(30))
+            .await,
+        ShutdownStatus::Draining
+    );
+    gate.entered().await;
+    assert_eq!(vault.state.load(Ordering::SeqCst), STOPPED);
+    assert!(vault.worker.lock().unwrap().is_some());
+    // Concurrent observers cannot consume the only still-running thread handle.
+    let (first, second) = tokio::join!(
+        vault.shutdown(Instant::now() + Duration::from_millis(20)),
+        vault.shutdown(Instant::now() + Duration::from_millis(20))
+    );
+    assert_eq!(first, ShutdownStatus::Draining);
+    assert_eq!(second, ShutdownStatus::Draining);
+    gate.release();
+    assert_eq!(vault.shutdown(deadline()).await, ShutdownStatus::Stopped);
+    assert!(vault.worker.lock().unwrap().is_none());
+    assert_eq!(vault.shutdown(deadline()).await, ShutdownStatus::Stopped);
+}

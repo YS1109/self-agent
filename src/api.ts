@@ -1,3 +1,4 @@
+import type { LifecycleClient } from "./lifecycle-client";
 import type { UpdatesClient } from "./updates-client";
 import type {GatewayClient,GatewayCredentialClient} from "./gateway-client";
 import type { ReliabilityClient } from "./reliability-client";
@@ -35,9 +36,9 @@ export async function api<T>(
     headers:
       body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(path === "/settings/check" ? 35_000 : 20_000)]) : AbortSignal.timeout(path === "/settings/check" ? 35_000 : 20_000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(path === "/settings/check" || path === "/lifecycle/shutdown?wait_ms=30000" ? 35_000 : 20_000)]) : AbortSignal.timeout(path === "/settings/check" || path === "/lifecycle/shutdown?wait_ms=30000" ? 35_000 : 20_000),
   });
-  const data = await readBoundedJson(response, response.ok ? (path === "/snapshot?window=1" ? 12 : 16) * 1024 * 1024 : 8192, signal) as T & { error?: string };
+  const data = await readBoundedJson(response, response.ok ? (path.startsWith("/lifecycle") ? 4096 : (path === "/snapshot?window=1" ? 12 : 16) * 1024 * 1024) : 8192, signal) as T & { error?: string };
   if (!response.ok)
     throw new Error(data.error ?? `请求失败 (${response.status})`);
   return data as T;
@@ -131,4 +132,9 @@ export const gatewayCredentialClient:GatewayCredentialClient={
 export const updatesClient:UpdatesClient={
  status:signal=>api("GET","/reliability/updates",undefined,signal),
  receipt:(id,signal)=>{if(!providerUuid(id))throw new Error("验证操作UUID无效");return api("GET",`/reliability/updates/verifications/${id}`,undefined,signal);},
+};
+
+export const lifecycleClient:LifecycleClient={
+ status:signal=>api("GET","/lifecycle",undefined,signal),
+ shutdown:(instance,signal)=>{if(!providerUuid(instance))throw new Error("后台实例标识无效");return api("POST","/lifecycle/shutdown?wait_ms=30000",{expected_instance:instance},signal);},
 };

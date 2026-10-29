@@ -596,11 +596,16 @@ impl McpSession {
         self.valid = false;
         self.stdin.take();
         let status = self.process.close(control).await;
-        if let Some(task) = self.stderr_task.take() {
-            task.abort();
-            let _ = tokio::time::timeout(Duration::from_millis(100), task).await;
-        }
+        finish_stderr(self.stderr_task.take()).await;
         status
+    }
+}
+async fn finish_stderr(task: Option<JoinHandle<()>>) {
+    if let Some(task) = task {
+        task.abort();
+        // Abort only requests cancellation. Retain and await the actual
+        // pipe-reader task; a timeout must not detach it and report cleanup.
+        let _ = task.await;
     }
 }
 /// Validate only wire shape, never decode media, open URIs or infer trust.

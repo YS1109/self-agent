@@ -29,7 +29,12 @@ impl Drop for Root {
 fn open(path: &Path) -> (Arc<DataLease>, Arc<Mutex<Store>>, Arc<Runtime>) {
     let lease = DataLease::acquire(path).unwrap();
     let store = Arc::new(Mutex::new(lease.open_store().unwrap()));
-    let controller = runtime(store.clone(), lease.clone()).unwrap();
+    let controller = runtime(
+        store.clone(),
+        lease.clone(),
+        crate::reliability::lifecycle_runtime::LifecycleRuntime::new(),
+    )
+    .unwrap();
     (lease, store, controller)
 }
 fn key() -> Ed25519KeyPair {
@@ -185,7 +190,12 @@ async fn detached_upload_holds_actual_data_lease_until_files_and_receipt_settle(
     .await
     .unwrap();
     let store = Arc::new(Mutex::new(new_lease.open_store().unwrap()));
-    let controller = runtime(store, new_lease).unwrap();
+    let controller = runtime(
+        store,
+        new_lease,
+        crate::reliability::lifecycle_runtime::LifecycleRuntime::new(),
+    )
+    .unwrap();
     let receipt = controller.receipt(id).await.unwrap().unwrap();
     assert_eq!(receipt.receipt.status, state::Status::Verified);
     assert!(receipt.current_stage_verified);
@@ -210,7 +220,12 @@ async fn actual_constructor_pins_stage_and_witness_roots_and_refuses_replacement
         symlink(&outside, data.join(name)).unwrap();
     }
     assert!(
-        runtime(store.clone(), lease.clone()).is_err(),
+        runtime(
+            store.clone(),
+            lease.clone(),
+            crate::reliability::lifecycle_runtime::LifecycleRuntime::new()
+        )
+        .is_err(),
         "new roots must be opened nofollow"
     );
     let id = new_id();
@@ -330,4 +345,54 @@ async fn actual_old_backup_restore_disables_trust_and_external_witness_preserves
             .sequence,
         10
     );
+}
+
+#[tokio::test]
+async fn update_intent_waiting_for_actual_store_lock_is_rejected_after_drain() {
+    use crate::reliability::lifecycle_runtime::{
+        LifecycleRuntime, QuiesceStage, QuiescenceCheck, ShutdownBackend, ShutdownFault,
+        ShutdownOutcome,
+    };
+    struct Backend;
+    impl ShutdownBackend for Backend {
+        fn stop_external_inputs(&self) {}
+        fn quiesce(&self, _: QuiesceStage) -> std::result::Result<QuiescenceCheck, ShutdownFault> {
+            Ok(Default::default())
+        }
+    }
+    let root = Root::new();
+    let lease = DataLease::acquire(&root.0).unwrap();
+    let store = Arc::new(Mutex::new(lease.open_store().unwrap()));
+    let lifecycle = LifecycleRuntime::new();
+    let controller = runtime(store.clone(), lease, lifecycle.clone()).unwrap();
+    let held_store = store.clone();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _held = held_store.lock().unwrap();
+        let _ = entered.send(());
+        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    ready.await.unwrap();
+    let worker = controller.clone();
+    let input = trust(&key());
+    let observer = tokio::spawn(async move { worker.configure(None, input).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while lifecycle.snapshot().workers.pending_workers == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    lifecycle.request_shutdown(Arc::new(Backend)).unwrap();
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(observer.await.unwrap().is_err());
+    let drained = lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(drained.snapshot.outcome, Some(ShutdownOutcome::Stopped));
+    let mut guard = store.lock().unwrap();
+    let tx = guard.db.transaction().unwrap();
+    assert!(state::config(&tx).unwrap().is_none());
 }

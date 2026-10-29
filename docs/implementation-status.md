@@ -286,3 +286,9 @@ H5 的 task/session/result/event/diff/纯文本产物读取都按实时授权；
 CLI/bridge/开发代理已认证协商wire generation，旧或畸形peer不接收动作且不被自动替换。Native保留单次启动与退出观察，原始30秒等待和可见状态、早期错误重读、迟到只读恢复已实现；不改变之前5,000任务启动测量，也不是启动性能优化或真实GUI验收。
 
 冻结门禁、独立审查和精确CI见 [acceptance-update-v1.0.md](acceptance-update-v1.0.md)，合同见 [protocol-v15.md](protocol-v15.md)。本切片不完成后续统一worker drain、真实OS安装器、生产签名/自动更新、真实外部服务或公网部署；未登记用户生产信任根。
+
+## 1.0 实际后台停止切片（本地冻结通过，待发布/CI）
+
+AppState、调度/编排、凭据 OS 线程、MCP、阻塞读取/备份、更新上传、QQ/Gateway 已接到同一真实 worker registry；同 Store 锁关闭新 admission，保留已接受工作的结算，再完成两次 quiesce。控制 HTTP/CLI/桌面固定实例 UUID，观察超时不取消原清理、不自动重发或替换后台。
+
+源码独立审查、定向回归与完整冻结门禁分别记录于 [acceptance-lifecycle-v1.0.md](acceptance-lifecycle-v1.0.md)，协议为 [v16](protocol-v16.md)。当前完整 Rust 13/791/53/17、前端343、22个后台 smoke 与 Web 代理4组已通过；真实 Linux HTTP/CLI/SIGINT/SIGTERM 和 paused 计划取消已覆盖。跨平台实际运行、精确新 CI 仍待取得，不以前述本地或历史证据宣称此切片已发布。全路线图映射见 [验收矩阵](roadmap-acceptance-matrix.md)。

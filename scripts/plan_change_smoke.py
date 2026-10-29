@@ -226,8 +226,9 @@ def run(live=False, evidence_path=None):
                 assert change_for(daemon, stale_id)["status"] == "ready"
                 assert plan_for(daemon, plan_id) == current
                 daemon.command({"type": "discard_plan_change", "change_id": stale_id})
-                daemon.stop()
+                daemon.crash()  # Persistence recovery, not global shutdown cancellation.
                 daemon.start()
+                assert plan_for(daemon, plan_id)["status"] == "paused"
                 assert plan_for(daemon, plan_id)["layout"] == positions
                 assert change_for(daemon, change_id)["status"] == "applied"
                 assert change_for(daemon, stale_id)["status"] == "discarded"

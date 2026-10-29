@@ -306,7 +306,7 @@ def codex_smoke():
                      context(daemon, session, "codex")["state"] == "inflight", description="in-flight Codex turn")
             assert task(daemon, inflight)["status"] == "running"
             before = trace(project)
-            daemon.stop()
+            daemon.crash()  # Real interruption, not graceful SIGTERM drain.
             daemon.start()
             recovered = task(daemon, inflight)
             assert recovered["status"] == "failed" and "没有自动重放" in recovered["error"], recovered
@@ -314,7 +314,19 @@ def codex_smoke():
             time.sleep(0.25)
             assert trace(project) == before, "Daemon recovery replayed an in-flight turn"
             print("PASS Codex daemon interruption fails unknown task durably without replaying the turn")
+            assert recovered["execution_cleanup"] == "unknown", recovered
+            blocked = run(daemon, session, "CODEX_AFTER_UNKNOWN_CLEANUP", status="failed")
+            assert blocked["stop_reason"] == "workspace_cleanup_unknown", blocked
+            assert trace(project) == before, "Quarantined project launched another Codex process"
+            assert task(daemon, inflight)["execution_cleanup"] == "unknown"
+            print("PASS crash leaves original cleanup unknown and fences same-project work without automatic resolution")
 
+            # Deadline/output budgets are separate cases, not permission to
+            # reuse the crashed project's uncertain process/write authority.
+            project = root / "budget-project"
+            project.mkdir()
+            project = project.resolve()
+            session = create(daemon, project, "Codex 独立预算回归")
             for phase in ["config", "version"]:
                 marker = project / f"fixture-{phase}-stall"
                 marker.write_text("local deadline fixture")

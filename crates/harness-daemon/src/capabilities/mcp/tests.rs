@@ -978,3 +978,54 @@ mod windows {
         assert_send(McpSession::open(&cfg, &project.0, control()));
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn stderr_cancellation_waits_for_actual_task_drop_not_a_detached_timeout() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    struct Cleanup {
+        entered: Arc<AtomicBool>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.entered.store(true, Ordering::SeqCst);
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+    let entered = Arc::new(AtomicBool::new(false));
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let cleanup = Cleanup {
+        entered: entered.clone(),
+        release: blocked,
+    };
+    let task = tokio::spawn(async move {
+        let _cleanup = cleanup;
+        let _ = ready.send(());
+        std::future::pending::<()>().await;
+    });
+    started.await.unwrap();
+    let mut closing = tokio::spawn(super::finish_stderr(Some(task)));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Former 100 ms timeout would drop the JoinHandle and falsely finish here.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(180), &mut closing)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), closing)
+        .await
+        .unwrap()
+        .unwrap();
+}

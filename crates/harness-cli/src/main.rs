@@ -1,5 +1,6 @@
 mod gateway;
 mod history;
+mod lifecycle;
 mod maintenance;
 mod updates;
 use std::{
@@ -17,6 +18,8 @@ const HELP: &str = r#"Self Agent 命令行客户端
 用法：self-agent-cli [--data-dir 目录] [--conversation 来源会话] [--command-id 幂等ID] [--wait 秒] [--follow] [--controls JSON文件|-] 命令 [参数]
 
   updates [status|--help]           本机签名校验/私有暂存，绝不自动下载安装
+  daemon-status                    只读观察当前后台生命周期
+  daemon-stop --confirm            仅一次关闭请求；--wait 1至30秒观察，不自动重发
   diagnostics                      导出固定字段脱敏诊断（不读取系统密钥）
   backups                          查看备份功能与持久操作记录
   backup <目标父目录> <新名称>      创建私有备份；--wait可等待，POST不重试
@@ -1163,6 +1166,9 @@ async fn wait_for_task(
 }
 
 async fn run(options: Options) -> Result<()> {
+    if lifecycle::run(&options).await? {
+        return Ok(());
+    }
     if maintenance::run(&options).await? {
         return Ok(());
     }

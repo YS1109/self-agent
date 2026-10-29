@@ -13,7 +13,7 @@ use harness_core::{CommandEvidence, ExecutionEvent, TaskSupplement};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::Command,
     time::{timeout, Instant},
 };
 
@@ -26,13 +26,31 @@ mod config_identity;
 #[path = "codex/steering.rs"]
 mod steering;
 
+use crate::provider::process_cleanup::Child;
+pub(crate) use crate::provider::process_cleanup::CleanupUnconfirmed;
+#[cfg(windows)]
+use crate::provider::process_cleanup::{PipeReader as ChildStdout, PipeWriter as ChildStdin};
+#[cfg(not(windows))]
+use tokio::process::{ChildStdin, ChildStdout};
+
 const MAX_LINE: usize = 256 * 1024;
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const MAX_LINES: usize = 20_000;
 const MAX_RESULT: usize = 128 * 1024;
 const TURN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(all(test, unix))]
 pub(crate) async fn list_models(binary: &str) -> Result<Vec<Value>> {
+    list_models_with_control(binary, &|| false).await
+}
+
+pub(crate) async fn list_models_with_control(
+    binary: &str,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<Value>> {
+    if cancelled() {
+        bail!("Codex 模型列表读取已取消；未启动进程");
+    }
     let mut command = Command::new(binary);
     command
         .args(["app-server", "--listen", "stdio://"])
@@ -48,13 +66,22 @@ pub(crate) async fn list_models(binary: &str) -> Result<Vec<Value>> {
     }
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
+    #[cfg(not(windows))]
     let mut child = command
         .spawn()
         .map_err(|_| anyhow::anyhow!("无法获取 Codex 模型，请检查 CLI 路径和安装状态"))?;
+    #[cfg(windows)]
+    let mut child =
+        crate::provider::process_cleanup::spawn(&command, [true, true, false], cancelled, &|| {
+            Ok(())
+        })
+        .await?;
     let process_id = child.id();
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    let result = timeout(Duration::from_secs(12), async {
+    let result = tokio::select! {
+        _ = wait_cancelled(cancelled) => Err(anyhow::anyhow!("Codex 模型列表读取已取消")),
+        result = timeout(Duration::from_secs(12), async {
         send(&mut stdin, json!({"id":1,"method":"initialize","params":{
             "clientInfo":{"name":"self_agent","version":env!("CARGO_PKG_VERSION")},
             "capabilities":{"experimentalApi":false}
@@ -106,9 +133,10 @@ pub(crate) async fn list_models(binary: &str) -> Result<Vec<Value>> {
             expected += 1;
             send(&mut stdin, json!({"id":expected,"method":"model/list","params":{"limit":100,"includeHidden":false,"cursor":cursor}})).await?;
         }
-    }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("获取 Codex 模型列表超时，请重试或使用本机默认模型")));
+    }) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("获取 Codex 模型列表超时，请重试或使用本机默认模型"))),
+    };
     drop(stdin);
-    stop(&mut child, process_id).await;
+    stop(&mut child, process_id, &|| Ok(())).await?;
     result
 }
 
@@ -145,9 +173,16 @@ pub(crate) async fn probe_config_identity_with_control(
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
     let _root_guard = open_root_nofollow(&root)?;
+    #[cfg(not(windows))]
     let mut child = command
         .spawn()
         .map_err(|_| anyhow::anyhow!("无法读取 Codex 有效配置，请检查执行器安装"))?;
+    #[cfg(windows)]
+    let mut child =
+        crate::provider::process_cleanup::spawn(&command, [true, true, false], cancelled, &|| {
+            Ok(())
+        })
+        .await?;
     let pid = child.id();
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
@@ -189,7 +224,7 @@ pub(crate) async fn probe_config_identity_with_control(
     }) => result.unwrap_or_else(|_|Err(anyhow::anyhow!("读取 Codex 有效配置超时，未启动任务"))),
     };
     drop(stdin);
-    stop(&mut child, pid).await;
+    stop(&mut child, pid, &|| Ok(())).await?;
     result
 }
 
@@ -221,9 +256,16 @@ pub(crate) async fn probe_version_with_control(
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
     let _root_guard = open_root_nofollow(root)?;
+    #[cfg(not(windows))]
     let mut child = command
         .spawn()
         .map_err(|_| anyhow::anyhow!("无法检查 Codex 版本"))?;
+    #[cfg(windows)]
+    let mut child =
+        crate::provider::process_cleanup::spawn(&command, [false, true, false], cancelled, &|| {
+            Ok(())
+        })
+        .await?;
     let pid = child.id();
     let mut stdout = child.stdout.take().expect("piped stdout").take(4097);
     let result = tokio::select! {
@@ -232,7 +274,7 @@ pub(crate) async fn probe_version_with_control(
             let mut output = Vec::new();
             stdout.read_to_end(&mut output).await.map_err(|_|anyhow::anyhow!("无法读取 Codex 版本"))?;
             if output.len() > 4096 { bail!("Codex 版本响应超过安全预算"); }
-            if !child.wait().await.map_err(|_|anyhow::anyhow!("Codex 版本检查失败"))?.success() {
+            if !crate::provider::process_cleanup::observe_exit(&mut child).await.map_err(|_|anyhow::anyhow!("Codex 版本检查失败"))?.success() {
                 bail!("Codex 版本检查失败");
             }
             let version = std::str::from_utf8(&output).map_err(|_|anyhow::anyhow!("Codex 版本格式无效"))?.trim();
@@ -240,7 +282,7 @@ pub(crate) async fn probe_version_with_control(
             Ok(version.to_owned())
         }) => result.unwrap_or_else(|_|Err(anyhow::anyhow!("Codex 版本检查超时"))),
     };
-    stop(&mut child, pid).await;
+    stop(&mut child, pid, &|| Ok(())).await?;
     result
 }
 
@@ -403,6 +445,7 @@ pub(crate) async fn execute_with_continuation(
     .await
 }
 
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_with_control(
     binary: &str,
@@ -419,6 +462,44 @@ pub(crate) async fn execute_with_control(
     claim_inputs: impl Fn() -> Result<Vec<TaskSupplement>>,
     ack_inputs: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
     redaction_secrets: impl Fn(&[String]),
+) -> Result<String> {
+    execute_with_cleanup(
+        binary,
+        model,
+        root,
+        input,
+        progress,
+        cancelled,
+        evidence,
+        continuation,
+        known_secrets,
+        events,
+        lifecycle,
+        claim_inputs,
+        ack_inputs,
+        redaction_secrets,
+        || Ok(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_with_cleanup(
+    binary: &str,
+    model: &str,
+    root: &Path,
+    input: ExecutionInput<'_>,
+    progress: impl Fn(String),
+    cancelled: impl Fn() -> bool,
+    evidence: impl Fn(CommandEvidence),
+    continuation: Option<CodexContinuation>,
+    known_secrets: &[String],
+    events: impl Fn(ExecutionEvent) -> Result<()>,
+    lifecycle: impl Fn(CodexLifecycle) -> Result<()>,
+    claim_inputs: impl Fn() -> Result<Vec<TaskSupplement>>,
+    ack_inputs: impl Fn(&[String], InputAcknowledgement) -> Result<()>,
+    redaction_secrets: impl Fn(&[String]),
+    cleanup_unknown: impl Fn() -> Result<()>,
 ) -> Result<String> {
     if cancelled() {
         bail!("Codex 任务已取消");
@@ -471,9 +552,18 @@ pub(crate) async fn execute_with_control(
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
     let _root_guard = open_root_nofollow(&root)?;
+    #[cfg(not(windows))]
     let mut child = command
         .spawn()
         .map_err(|_| anyhow::anyhow!("无法启动 Codex，请检查可执行文件路径与安装状态"))?;
+    #[cfg(windows)]
+    let mut child = crate::provider::process_cleanup::spawn(
+        &command,
+        [true, true, false],
+        &cancelled,
+        &cleanup_unknown,
+    )
+    .await?;
     let process_id = child.id();
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
@@ -507,11 +597,15 @@ pub(crate) async fn execute_with_control(
                 ),
             )
             .await;
-            let _ = timeout(Duration::from_millis(300), child.wait()).await;
+            let _ = timeout(
+                Duration::from_millis(300),
+                crate::provider::process_cleanup::observe_exit(&mut child),
+            )
+            .await;
         }
     }
     drop(stdin);
-    stop(&mut child, process_id).await;
+    stop(&mut child, process_id, &cleanup_unknown).await?;
     if result.is_ok() {
         progress(format!(
             "Codex 执行完成，用时 {} 秒",
@@ -1247,35 +1341,12 @@ fn redact_evidence(text: &str) -> String {
     text
 }
 
-async fn stop(child: &mut Child, process_id: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = process_id {
-        // Kill the isolated process group, including a running shell/tool.
-        let _ = timeout(
-            Duration::from_secs(1),
-            Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{pid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status(),
-        )
-        .await;
-    }
-    #[cfg(windows)]
-    if let Some(pid) = process_id {
-        let _ = timeout(
-            Duration::from_secs(2),
-            Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status(),
-        )
-        .await;
-    }
-    let _ = child.start_kill();
-    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+async fn stop(
+    child: &mut Child,
+    process_id: Option<u32>,
+    cleanup_unknown: &impl Fn() -> Result<()>,
+) -> Result<()> {
+    crate::provider::process_cleanup::stop(child, process_id, cleanup_unknown).await
 }
 
 #[cfg(all(test, unix))]

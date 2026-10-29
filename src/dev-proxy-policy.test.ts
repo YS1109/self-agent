@@ -192,3 +192,14 @@ it("verifier desktop reads do not proxy trust, upload, cancellation or install",
  for(const path of [`${base}/trust`,`${base}/verifications`,`${base}/verifications/${id}/artifact`,`${base}/verifications/${id}/cancel`,`${base}/stages/${id}/discard`,`${base}/install`])
   for(const method of ["GET","POST","PUT","DELETE"])expect(allowDevelopmentProxy(method,path,undefined,"same-origin","application/json")).toBe(false);
 });
+
+describe("owner lifecycle proxy boundary",()=>{
+ it("only exposes exact local read and bounded observation shutdown routes",()=>{
+  const call=(method:string,path:string,origin="http://127.0.0.1:1420",site="same-origin")=>allowDevelopmentProxy(method,path,origin,site,"application/json");
+  expect(call("GET","/api/v1/lifecycle")).toBe(true);
+  expect(call("POST","/api/v1/lifecycle/shutdown?wait_ms=30000")).toBe(true);
+  for(const path of ["/api/v1/lifecycle/shutdown","/api/v1/lifecycle/shutdown?wait_ms=30001","/api/v1/lifecycle/shutdown?wait_ms=30000&other=1","/api/v1/lifecycle/shutdown/../commands"]){expect(call("POST",path)).toBe(false);}
+  expect(call("GET","/api/v1/lifecycle/shutdown?wait_ms=30000")).toBe(false);
+  expect(call("POST","/api/v1/lifecycle/shutdown?wait_ms=30000","https://evil.invalid","cross-site")).toBe(false);
+ });
+});

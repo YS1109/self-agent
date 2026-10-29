@@ -1,3 +1,5 @@
+import { LifecycleSettings } from "./components/lifecycle-settings";
+import { lifecycleClient } from "./api";
 import {GatewaySettings} from "./components/gateway-settings";
 import {EMPTY_GATEWAY} from "./gateway-client";
 import { HistoryBrowser, HistoryTaskView } from "./components/history-browser";
@@ -1365,7 +1367,7 @@ export default function App() {
       </ModalFrame>
 
       <ModalFrame error="" open={modal === "reliability"} onClose={()=>setModal(null)} title="备份与诊断" description="本机所有者维护入口；私有历史备份与固定字段诊断严格分开。" wide>
-        {modal === "reliability" && <><ReliabilitySettings client={reliabilityClient} disabled={!connected}/><UpdatesSettings client={updatesClient} disabled={!connected}/></>}
+        {modal === "reliability" && <><ReliabilitySettings client={reliabilityClient} disabled={!connected}/><UpdatesSettings client={updatesClient} disabled={!connected}/><LifecycleSettings client={lifecycleClient} disabled={!connected}/></>}
       </ModalFrame>
 
       <ModalFrame error="" open={modal === "gateway"} onClose={()=>setModal(null)} title="自托管网关 / H5" description="出站设备连接、一次性配对与会话级授权；不是本机管理 API 的公网代理。" wide>

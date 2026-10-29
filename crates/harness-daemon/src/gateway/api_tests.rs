@@ -351,3 +351,184 @@ async fn store_lock_contention_keeps_timer_running_and_disconnected_admitted_set
     assert_eq!(control.counts().sets, 1);
     clean(http.stop().await);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_keeps_original_gateway_vault_owner_and_rejects_new_reads_and_mutations() {
+    use crate::reliability::lifecycle_runtime::ShutdownOutcome;
+    let (http, control) = fixture().await;
+    let config = http.config().await;
+    let gate = control.block_next_after_effect();
+    let id = new_id();
+    http.set(&config, &id).await;
+    assert!(gate.entered().await);
+    http.state.request_shutdown().unwrap();
+    let observed = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_millis(80))
+        .await;
+    assert!(observed.deadline_reached);
+    assert_ne!(observed.snapshot.outcome, Some(ShutdownOutcome::Stopped));
+    for path in [
+        "/api/v1/gateway".to_string(),
+        format!("/api/v1/gateway/credential-operations/{id}"),
+    ] {
+        let response = http
+            .client
+            .get(format!("{}{path}", http.base))
+            .bearer_auth(OWNER)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let rejected_id = new_id();
+    let response = http
+        .client
+        .post(format!(
+            "{}/api/v1/gateway/credentials/{}",
+            http.base,
+            config["config_id"].as_str().unwrap()
+        ))
+        .bearer_auth(OWNER)
+        .json(&json!({"id":rejected_id,"expected_revision":config["revision"],"secret":SECRET}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(http
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .gateway_credential_operation(&rejected_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(control.counts().sets, 1);
+    gate.release();
+    let observed = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(observed.snapshot.outcome, Some(ShutdownOutcome::Stopped));
+    let operation = http
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .gateway_credential_operation(&id)
+        .unwrap()
+        .unwrap();
+    // Cancellation may record Unknown after the OS effect, but it must retain
+    // that one original receipt and never mistake it for unowned physical work.
+    let status = serde_json::to_value(operation).unwrap();
+    assert!(matches!(
+        status["status"].as_str(),
+        Some("completed" | "unknown")
+    ));
+    assert_eq!(control.counts().sets, 1);
+    clean(http.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)] // Intentional admission-versus-Store-lock race.
+async fn detached_gateway_store_waiter_is_retained_and_cannot_begin_after_drain() {
+    use crate::reliability::lifecycle_runtime::ShutdownOutcome;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (http, _) = fixture().await;
+    let ran = Arc::new(AtomicBool::new(false));
+    let guard = http.state.store.lock().unwrap();
+    let state = http.state.clone();
+    let did_run = ran.clone();
+    let observer = tokio::spawn(async move {
+        database(state, move |_| {
+            did_run.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while http.state.lifecycle.snapshot().workers.pending_workers < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap(); // Vault custodian + admitted database worker.
+    observer.abort();
+    let _ = observer.await;
+    http.state.request_shutdown().unwrap();
+    assert!(http.state.lifecycle.snapshot().workers.pending_workers >= 1);
+    drop(guard);
+    let observed = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(observed.snapshot.outcome, Some(ShutdownOutcome::Stopped));
+    assert!(!ran.load(Ordering::Acquire));
+    clean(http.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_gateway_admin_validation_does_not_poison_shutdown() {
+    let (http, _) = fixture().await;
+    let response = http
+        .client
+        .post(format!("{}/api/v1/gateway/commands", http.base))
+        .bearer_auth(OWNER)
+        .json(&json!({"id":"not-uuid","command":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(http.state.lifecycle.snapshot().workers.accepting_work);
+    clean(http.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_current_finalization_failure_is_unknown_not_stopped() {
+    use crate::reliability::lifecycle_runtime::ShutdownOutcome;
+    let (http, control) = fixture().await;
+    let config = http.config().await;
+    let gate = control.block_next_after_effect();
+    let id = new_id();
+    http.set(&config, &id).await;
+    assert!(gate.entered().await);
+    // This fixture injects a real SQLite transaction failure AFTER the one OS
+    // effect. The original receipt remains inflight and cannot prove cleanup.
+    let db = rusqlite::Connection::open(http.root.join("state.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER gateway_fixture_fail_finish BEFORE UPDATE ON gateway_credential_operations BEGIN SELECT RAISE(ABORT,'fixture finish failed'); END;").unwrap();
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while http.state.lifecycle.snapshot().workers.accepting_work {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    http.state.request_shutdown().unwrap();
+    let observed = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(observed.snapshot.outcome, Some(ShutdownOutcome::Unknown));
+    assert_eq!(control.counts().sets, 1);
+    let op = http
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .gateway_credential_operation(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(serde_json::to_value(op).unwrap()["status"], "inflight");
+    drop(db);
+    let _ = http.shutdown.send(());
+    http.server.await.unwrap();
+    assert!(!http.state.shutdown_credentials().await);
+    drop(http.client);
+    drop(http.state);
+    clean(http.root);
+}

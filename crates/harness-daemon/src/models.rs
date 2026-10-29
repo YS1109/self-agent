@@ -5,7 +5,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use crate::{ApiResult, AppState};
+use crate::{
+    lifecycle_error,
+    reliability::lifecycle::{AdmissionError, WorkerExit, WorkerKind},
+    ApiError, ApiResult, AppState,
+};
 
 #[derive(Default, Deserialize)]
 pub(crate) struct ModelRequest {
@@ -88,9 +92,50 @@ pub(crate) async fn discover(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ModelRequest>,
 ) -> ApiResult<Json<Value>> {
+    let (admission, ()) = state.admit_store(|_| Ok(()))?;
+    let receiver = admission
+        .spawn(WorkerKind::Probe, async move {
+            let stop = state.lifecycle.signal();
+            let process = request.executor.as_deref() == Some("codex");
+            let request = discover_owned(state, request);
+            let result = if process {
+                // Codex owns and awaits process cleanup after cancellation; never
+                // select-drop a future which still owns the original Child.
+                request.await
+            } else {
+                tokio::select! {
+                    _ = stop.cancelled() => Err(anyhow::anyhow!(AdmissionError::Draining)),
+                    result = request => result,
+                }
+            };
+            let exit = if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<crate::codex::CleanupUnconfirmed>())
+            {
+                WorkerExit::Unknown
+            } else {
+                WorkerExit::Settled
+            };
+            (exit, result.map_err(ApiError::from))
+        })
+        .map_err(lifecycle_error)?;
+    receiver.await.map_err(|_| {
+        ApiError(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "模型列表观察中断；未重发请求。".into(),
+        )
+    })?
+}
+
+async fn discover_owned(state: Arc<AppState>, request: ModelRequest) -> Result<Json<Value>> {
     let settings = state.settings.read().unwrap().clone();
     let models = match request.executor.as_deref().unwrap_or("native") {
-        "codex" => crate::codex::list_models(&settings.codex_binary).await?,
+        "codex" => {
+            let stop = state.lifecycle.signal();
+            crate::codex::list_models_with_control(&settings.codex_binary, &|| stop.is_cancelled())
+                .await?
+        }
         "native" => {
             let source = request
                 .provider_source
@@ -101,7 +146,7 @@ pub(crate) async fn discover(
                     || request.base_url.is_some()
                     || request.models_endpoint.is_some()
                 {
-                    return Err(anyhow::anyhow!("命名服务模型发现不接受地址或凭据覆盖").into());
+                    return Err(anyhow::anyhow!("命名服务模型发现不接受地址或凭据覆盖"));
                 }
                 let id = request
                     .provider_id
@@ -180,11 +225,11 @@ pub(crate) async fn discover(
                         ..settings
                     }
                 }
-                _ => return Err(anyhow::anyhow!("模型配置来源无效").into()),
+                _ => return Err(anyhow::anyhow!("模型配置来源无效")),
             };
             fetch_models_with_provider(&provider).await?
         }
-        _ => return Err(anyhow::anyhow!("模型列表执行器无效").into()),
+        _ => return Err(anyhow::anyhow!("模型列表执行器无效")),
     };
     Ok(Json(json!({"models":models})))
 }

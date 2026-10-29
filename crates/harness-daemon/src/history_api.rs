@@ -1,5 +1,9 @@
 //! Owner-only bounded reads. Historical pages never confer command authority.
-use crate::{store::history::HistoryError, AppState};
+use crate::{
+    reliability::lifecycle::{AdmissionError, WorkerExit, WorkerKind},
+    store::history::HistoryError,
+    AppState,
+};
 use axum::{
     extract::{rejection::QueryRejection, OriginalUri, Path, Query, State},
     http::StatusCode,
@@ -70,31 +74,74 @@ async fn read(state: Arc<AppState>, operation: Read) -> Response {
             "历史读取繁忙，请稍后只读重试",
         );
     };
-    let result = tokio::task::spawn_blocking(move || {
-        let _slot = slot;
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("store unavailable"))?;
-        match operation {
-            Read::Snapshot => store.windowed_snapshot(&state.history_epoch),
-            Read::LegacySnapshot => store.legacy_bounded_snapshot(),
-            Read::Task(id) => store.bounded_task_detail(&id),
-            Read::Page(kind, query) => store.history_page(
-                &state.history_epoch,
-                &kind,
-                query.session_id.as_deref(),
-                query.cursor.as_deref(),
-            ),
-            Read::Messages(id, query) => {
-                store.history_messages(&state.history_epoch, &id, query.cursor.as_deref())
-            }
+    let admission = match state.lifecycle.admit() {
+        Ok(admission) => admission,
+        Err(_) => {
+            return failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "history_unavailable",
+                "后台正在关闭，未开始新的历史读取",
+            )
         }
-    })
-    .await;
+    };
+    let observer = admission.spawn(WorkerKind::BlockingCleanup, async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let store = state
+                .store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store unavailable"))?;
+            state.lifecycle.check_locked(&store)?;
+            match operation {
+                Read::Snapshot => store.windowed_snapshot(&state.history_epoch),
+                Read::LegacySnapshot => store.legacy_bounded_snapshot(),
+                Read::Task(id) => store.bounded_task_detail(&id),
+                Read::Page(kind, query) => store.history_page(
+                    &state.history_epoch,
+                    &kind,
+                    query.session_id.as_deref(),
+                    query.cursor.as_deref(),
+                ),
+                Read::Messages(id, query) => {
+                    store.history_messages(&state.history_epoch, &id, query.cursor.as_deref())
+                }
+            }
+        })
+        .await;
+        // Even a failed/panicked read has ended its actual blocking worker here;
+        // it did not mutate or launch an external process. Keep the read slot until
+        // that join, independent of the lifetime of this HTTP observer.
+        (WorkerExit::Settled, result)
+    });
+    let result = match observer {
+        Ok(observer) => match observer.await {
+            Ok(result) => result,
+            Err(_) => {
+                return failure(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "history_unavailable",
+                    "历史读取工作状态未确认",
+                )
+            }
+        },
+        Err(_) => {
+            return failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "history_unavailable",
+                "后台正在关闭，未开始新的历史读取",
+            )
+        }
+    };
     match result {
         Ok(Ok(value)) => Json(value).into_response(),
         Ok(Err(error)) => {
+            if error.downcast_ref::<AdmissionError>().is_some() {
+                return failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "history_unavailable",
+                    "后台正在关闭，未开始新的历史读取",
+                );
+            }
             if let Some(error) = error.downcast_ref::<HistoryError>() {
                 let status = match error {
                     HistoryError::Reset => StatusCode::CONFLICT,

@@ -1,7 +1,10 @@
 //! Runtime control is a thin bridge to durable task state. It never grants
 //! permissions, replays failed tools, or treats a question answer as approval.
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -17,19 +20,25 @@ pub(crate) struct RunControl {
     pub controls: TaskControls,
     executor: String,
     started: Instant,
+    current_cleanup_unknown: AtomicBool,
     capability_credentials:
         tokio::sync::OnceCell<crate::capabilities::credentials::ResolvedTaskCredentials>,
 }
 
 impl RunControl {
     pub fn start(state: Arc<AppState>, task_id: &str, executor: &str) -> Result<Self> {
-        let controls = state.store.lock().unwrap().start_execution(task_id)?;
+        let controls = {
+            let mut store = state.store.lock().unwrap();
+            state.lifecycle.check_locked(&store)?;
+            store.start_execution(task_id)?
+        };
         Ok(Self {
             state,
             task_id: task_id.into(),
             controls,
             executor: executor.into(),
             started: Instant::now(),
+            current_cleanup_unknown: AtomicBool::new(false),
             capability_credentials: tokio::sync::OnceCell::new(),
         })
     }
@@ -73,6 +82,10 @@ impl RunControl {
     }
 
     pub fn stopped(&self) -> bool {
+        if self.state.lifecycle.signal().is_cancelled() {
+            self.stop("daemon_shutdown");
+            return true;
+        }
         // Remote tasks retain their immutable source authority; local tasks
         // are a no-op here. A reply-window expiry is not an execution revoke.
         if self
@@ -169,13 +182,20 @@ impl RunControl {
         Ok(())
     }
 
-    pub fn charge(&self, charge: Charge) -> Result<()> {
+    /// This executor is already registered by its fixed dispatcher. Hold the
+    /// authoritative Store guard from lifecycle check through the new intent.
+    fn new_store_action<T>(
+        &self,
+        action: impl FnOnce(&mut crate::store::Store) -> Result<T>,
+    ) -> Result<T> {
         self.check()?;
-        self.state
-            .store
-            .lock()
-            .unwrap()
-            .charge_execution(&self.task_id, charge)
+        let mut store = self.state.store.lock().unwrap();
+        self.state.lifecycle.check_locked(&store)?;
+        action(&mut store)
+    }
+
+    pub fn charge(&self, charge: Charge) -> Result<()> {
+        self.new_store_action(|store| store.charge_execution(&self.task_id, charge))
     }
 
     pub(crate) fn capability_state(
@@ -202,14 +222,9 @@ impl RunControl {
         tool: &str,
         digest: &str,
     ) -> Result<String> {
-        self.check()?;
-        self.state.store.lock().unwrap().begin_capability_call(
-            &self.task_id,
-            server,
-            revision,
-            tool,
-            digest,
-        )
+        self.new_store_action(|store| {
+            store.begin_capability_call(&self.task_id, server, revision, tool, digest)
+        })
     }
 
     pub(crate) fn finish_capability_call(
@@ -248,12 +263,12 @@ impl RunControl {
             bail!("任务未获得托管外部工具权限，未启动服务");
         }
         if mode == PermissionMode::Ask {
-            let request = self.state.store.lock().unwrap().create_decision_request(
+            let request = self.new_store_action(|store| store.create_decision_request(
                 &self.task_id, "approval",
                 "此操作会启动受信任的本机 MCP 程序并调用所列工具。该程序没有文件或网络沙箱；工具只读提示不构成限制。批准仅适用于本次参数和修订。",
                 Some(json!({"tool":"managed_mcp","arguments_digest":fingerprint(binding),"details":safe_action})),
                 self.controls.budget.max_runtime_seconds.min(300).into(),
-            )?;
+            ))?;
             let decided = self.wait_for_request(request).await?;
             if decided["status"] != "approved" {
                 self.stop("approval_denied");
@@ -318,14 +333,24 @@ impl RunControl {
     }
 
     pub fn set_cleanup(&self, pending: bool) -> Result<()> {
-        self.state
-            .store
-            .lock()
-            .unwrap()
-            .set_execution_cleanup(&self.task_id, pending)
+        if pending {
+            self.new_store_action(|store| store.set_execution_cleanup(&self.task_id, true))
+        } else {
+            // Original cleanup confirmation is allowed after admission closes.
+            self.state
+                .store
+                .lock()
+                .unwrap()
+                .set_execution_cleanup(&self.task_id, false)
+        }
+    }
+
+    pub(crate) fn cleanup_is_unknown(&self) -> bool {
+        self.current_cleanup_unknown.load(Ordering::SeqCst)
     }
 
     pub(crate) fn cleanup_unknown(&self) -> Result<()> {
+        self.current_cleanup_unknown.store(true, Ordering::SeqCst);
         self.state
             .store
             .lock()
@@ -373,11 +398,7 @@ impl RunControl {
             let current = self.state.store.lock().unwrap().decision_request(id)?;
             if current["status"] != "pending" {
                 return self
-                    .state
-                    .store
-                    .lock()
-                    .unwrap()
-                    .resume_decision_request(&self.task_id, id);
+                    .new_store_action(|store| store.resume_decision_request(&self.task_id, id));
             }
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -399,13 +420,15 @@ impl RunControl {
 
     pub async fn ask_question(&self, prompt: &str, timeout_seconds: u32) -> Result<String> {
         self.check()?;
-        let request = self.state.store.lock().unwrap().create_decision_request(
-            &self.task_id,
-            "question",
-            prompt,
-            None,
-            timeout_seconds.into(),
-        )?;
+        let request = self.new_store_action(|store| {
+            store.create_decision_request(
+                &self.task_id,
+                "question",
+                prompt,
+                None,
+                timeout_seconds.into(),
+            )
+        })?;
         let decided = self.wait_for_request(request).await?;
         if decided["status"] != "answered" {
             self.stop("input_expired");
@@ -462,13 +485,15 @@ impl RunControl {
                 // Include an opaque digest of all actual arguments, even where
                 // the review view intentionally omits file contents/secrets.
                 let action = json!({"tool":name,"arguments_digest":fingerprint(arguments),"details":safe_action});
-                let request = self.state.store.lock().unwrap().create_decision_request(
-                    &self.task_id,
-                    "approval",
-                    "此任务请求执行以下具体操作。批准仅适用于本次操作；拒绝会停止任务。",
-                    Some(action),
-                    self.controls.budget.max_runtime_seconds.min(300).into(),
-                )?;
+                let request = self.new_store_action(|store| {
+                    store.create_decision_request(
+                        &self.task_id,
+                        "approval",
+                        "此任务请求执行以下具体操作。批准仅适用于本次操作；拒绝会停止任务。",
+                        Some(action),
+                        self.controls.budget.max_runtime_seconds.min(300).into(),
+                    )
+                })?;
                 let decided = self.wait_for_request(request).await?;
                 if decided["status"] != "approved" {
                     self.stop(if decided["status"] == "expired" {

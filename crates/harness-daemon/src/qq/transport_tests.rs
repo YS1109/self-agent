@@ -342,7 +342,7 @@ async fn durable_ack_controls_heartbeat_sequence_and_resume() {
         .frames
         .iter()
         .any(|v| v["op"] == 1 && v["d"] == 1));
-    gateway.shutdown().await;
+    gateway.shutdown().await.unwrap();
     let mut resumed = transport
         .connect(Some(Checkpoint {
             session_id: "fixture-session".into(),
@@ -362,7 +362,7 @@ async fn durable_ack_controls_heartbeat_sequence_and_resume() {
         .iter()
         .any(|v| v["op"] == 6 && v["d"]["seq"] == 7));
     resumed.commit_ack(&checkpoint).unwrap();
-    resumed.shutdown().await;
+    resumed.shutdown().await.unwrap();
 }
 #[tokio::test]
 async fn gateway_controls_bounds_and_missed_heartbeat_fail_closed() {
@@ -390,7 +390,7 @@ async fn gateway_controls_bounds_and_missed_heartbeat_fail_closed() {
         } else {
             assert!(matches!(event, GatewayItem::Reconnect));
         }
-        gateway.shutdown().await;
+        gateway.shutdown().await.unwrap();
     }
     let fixture = Fixture::start("bad-origin").await;
     assert!(fixture.transport().connect(None).await.is_err());
@@ -429,7 +429,7 @@ async fn backlog_is_bounded_and_never_acknowledges_uncommitted_events() {
         gateway.commit_ack(&checkpoint).unwrap();
     }
     wait_frame(&fixture, |value| value["op"] == 1 && value["d"] == 3).await;
-    gateway.shutdown().await;
+    gateway.shutdown().await.unwrap();
     let fixture = Fixture::start("overflow").await;
     let mut gateway = fixture.transport().connect(None).await.unwrap();
     let GatewayItem::Dispatch { checkpoint, .. } = gateway.next().await.unwrap() else {
@@ -448,7 +448,7 @@ async fn backlog_is_bounded_and_never_acknowledges_uncommitted_events() {
         .frames
         .iter()
         .any(|value| value["op"] == 1 && value["d"].as_u64().is_some()));
-    gateway.shutdown().await;
+    gateway.shutdown().await.unwrap();
 }
 #[tokio::test]
 async fn token_expiry_and_repeated_401_are_bounded() {
@@ -488,7 +488,7 @@ async fn gateway_401_refresh_and_production_origin_allowlist() {
         panic!("expected READY")
     };
     gateway.commit_ack(&checkpoint).unwrap();
-    gateway.shutdown().await;
+    gateway.shutdown().await.unwrap();
     {
         let state = fixture.observed.lock().unwrap();
         assert_eq!((state.auths, state.gateways), (2, 2));
@@ -541,7 +541,7 @@ async fn short_expiry_has_usable_half_lifetime_and_gateway_refreshes() {
             .unwrap(),
         GatewayItem::Reconnect
     ));
-    gateway.shutdown().await;
+    gateway.shutdown().await.unwrap();
     transport.send_passive(reply()).await.unwrap();
     assert_eq!(fixture.observed.lock().unwrap().auths, 2);
 }
@@ -565,7 +565,7 @@ async fn heartbeat_ack_does_not_substitute_for_authenticated_ready() {
         .frames
         .iter()
         .any(|value| value["op"] == 1));
-    gateway.shutdown().await;
+    gateway.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -657,7 +657,7 @@ async fn resume_replays_events_before_resumed_and_commits_them_in_order() {
     wait_frame(&fixture, |value| value["op"] == 1 && value["d"] == 8).await;
     gateway.commit_ack(&checkpoint).unwrap();
     wait_frame(&fixture, |value| value["op"] == 1 && value["d"] == 9).await;
-    gateway.shutdown().await;
+    gateway.shutdown().await.unwrap();
 }
 
 #[tokio::test]

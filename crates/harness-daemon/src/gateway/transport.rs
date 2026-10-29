@@ -101,6 +101,9 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn handle(&self, request: GatewayRequest) -> GatewayResult;
     fn revoked(&self, principals: &[(String, u64)]) -> Result<Vec<String>>;
     fn connection(&self, connected: bool);
+    /// Current worker/DB ownership or durable finalization is uncertain. This
+    /// is NOT the same as a historical remote delivery OutcomeUnknown.
+    fn uncertain(&self);
 }
 
 enum Control {
@@ -138,9 +141,13 @@ async fn database<B: Backend, T: Send + 'static>(
     backend: Arc<B>,
     f: impl FnOnce(&B) -> T + Send + 'static,
 ) -> Result<T> {
-    tokio::task::spawn_blocking(move || f(backend.as_ref()))
+    let owned = backend.clone();
+    tokio::task::spawn_blocking(move || f(owned.as_ref()))
         .await
-        .map_err(|_| anyhow::anyhow!("网关本地事务工作中断"))
+        .map_err(|_| {
+            backend.uncertain();
+            anyhow::anyhow!("网关本地事务工作中断")
+        })
 }
 
 /// One generation may reconnect, but never retains or replays its prior RPC.
@@ -266,7 +273,7 @@ async fn run_once(
                 },
                 result = inflight.join_next(), if !inflight.is_empty() => {
                     let (id, result) = result.ok_or_else(|| anyhow::anyhow!("网关事务结果缺失"))?
-                        .map_err(|_| anyhow::anyhow!("网关事务工作中断"))?;
+                        .map_err(|_| {backend.uncertain();anyhow::anyhow!("网关事务工作中断")})?;
                     request_ids.remove(&id);
                     send(&mut socket, &GatewayDaemonFrame::Reply { request_id: id, result }).await?;
                 },
@@ -315,10 +322,16 @@ async fn run_once(
     }.await;
     // Do not abort DB effects on connection loss; finish the original receipt.
     drop(socket);
-    while inflight.join_next().await.is_some() {}
+    while let Some(result) = inflight.join_next().await {
+        if result.is_err() {
+            backend.uncertain();
+        }
+    }
     let _ = watch_stop_tx.send(true);
     drop(control_rx);
-    let _ = monitor.await;
+    if monitor.await.is_err() {
+        backend.uncertain();
+    }
     outcome
 }
 

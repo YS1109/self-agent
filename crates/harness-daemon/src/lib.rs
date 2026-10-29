@@ -41,7 +41,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Notify, Semaphore};
 
+use reliability::lifecycle::{AdmissionError, WorkerExit, WorkerKind};
+use reliability::lifecycle_runtime::{LifecycleRuntime, WorkAdmission};
+
 pub type ApiResult<T> = Result<T, ApiError>;
+
+pub(crate) fn lifecycle_error(_: AdmissionError) -> ApiError {
+    ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "后台正在停止或工作容量不可用；未接收新操作，请只读查询原状态。".into(),
+    )
+}
 
 #[derive(Debug)]
 pub struct ApiError(pub StatusCode, pub String);
@@ -192,6 +202,9 @@ impl Settings {
 }
 
 pub struct AppState {
+    pub(crate) lifecycle: Arc<LifecycleRuntime>,
+    pub(crate) cleanup_owner: Mutex<bool>,
+    workers_started: Mutex<bool>,
     pub(crate) vault: Arc<capabilities::vault::Vault>,
     pub store: Arc<Mutex<store::Store>>,
     pub(crate) updates: Option<Arc<store::updates::Runtime>>,
@@ -207,32 +220,26 @@ pub struct AppState {
     pub(crate) history_epoch: String,
     pub(crate) history_gate: Arc<Semaphore>,
     pub(crate) gateway_stop: tokio::sync::watch::Sender<bool>,
-    pub(crate) gateway_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) qq_stop: tokio::sync::watch::Sender<bool>,
-    pub(crate) qq_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
     pub fn open(path: &std::path::Path, token: String) -> anyhow::Result<Arc<Self>> {
-        Self::open_with_vault(
-            path,
-            token,
-            Arc::new(capabilities::vault::Vault::system(32)?),
-        )
+        Self::open_prepared(path, token, None, || {
+            Ok(Arc::new(capabilities::vault::Vault::system(32)?))
+        })
     }
 
     pub fn open_managed(
         lease: Arc<maintenance::DataLease>,
         token: String,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::open_with_vault_and_lease(
-            &lease.database_path(),
-            token,
-            Arc::new(capabilities::vault::Vault::system(32)?),
-            Some(lease.clone()),
-        )
+        Self::open_prepared(&lease.database_path(), token, Some(lease.clone()), || {
+            Ok(Arc::new(capabilities::vault::Vault::system(32)?))
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_vault(
         path: &std::path::Path,
         token: String,
@@ -240,11 +247,24 @@ impl AppState {
     ) -> anyhow::Result<Arc<Self>> {
         Self::open_with_vault_and_lease(path, token, vault, None)
     }
+
+    // Fixture injection only. Production never starts a Vault thread before
+    // fallible Store/configuration/directory preflight has succeeded.
+    #[cfg(test)]
     pub(crate) fn open_with_vault_and_lease(
         path: &std::path::Path,
         token: String,
         vault: Arc<capabilities::vault::Vault>,
         storage_lease: Option<Arc<maintenance::DataLease>>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::open_prepared(path, token, storage_lease, || Ok(vault))
+    }
+
+    fn open_prepared(
+        path: &std::path::Path,
+        token: String,
+        storage_lease: Option<Arc<maintenance::DataLease>>,
+        vault_factory: impl FnOnce() -> anyhow::Result<Arc<capabilities::vault::Vault>>,
     ) -> anyhow::Result<Arc<Self>> {
         let (events, _) = broadcast::channel(256);
         let store = if let Some(lease) = &storage_lease {
@@ -270,8 +290,9 @@ impl AppState {
         // Reject a preexisting linked probe directory instead of following it.
         project_files::ScopedProject::open(&capability_probe_root)?;
         let store = Arc::new(Mutex::new(store));
+        let lifecycle = LifecycleRuntime::new();
         let updates = storage_lease.as_ref().and_then(|lease| {
-            match store::updates::runtime(store.clone(), lease.clone()) {
+            match store::updates::runtime(store.clone(), lease.clone(), lifecycle.clone()) {
                 Ok(runtime) => Some(runtime),
                 Err(_) => {
                     tracing::warn!("更新验证私有目录不可用；普通会话继续，未启用更新");
@@ -279,7 +300,14 @@ impl AppState {
                 }
             }
         });
+        // Last fallible creation: no later initialization can return Err and
+        // silently detach this physical OS worker without its drain custodian.
+        let history_epoch = new_id();
+        let vault = vault_factory()?;
         Ok(Arc::new(Self {
+            lifecycle,
+            cleanup_owner: Mutex::new(false),
+            workers_started: Mutex::new(false),
             vault,
             store,
             updates,
@@ -292,46 +320,104 @@ impl AppState {
             capability_probe_gate: Arc::new(Semaphore::new(2)),
             storage_lease,
             backup_gate: Arc::new(Semaphore::new(2)),
-            history_epoch: new_id(),
+            history_epoch,
             history_gate: Arc::new(Semaphore::new(2)),
             gateway_stop: tokio::sync::watch::channel(false).0,
-            gateway_worker: Mutex::new(None),
             qq_stop: tokio::sync::watch::channel(false).0,
-            qq_worker: Mutex::new(None),
         }))
     }
 
-    /// Best-effort bounded draining; a blocked OS mutation remains uncertain
-    /// and its durable intent is recovered without replay on the next startup.
-    pub async fn shutdown_credentials(&self) -> bool {
-        self.gateway_stop.send_replace(true);
-        let gateway_worker = { self.gateway_worker.lock().unwrap().take() };
-        let gateway_settled = if let Some(mut worker) = gateway_worker {
-            // Do not abort an accepted SQLite worker. It keeps AppState/data
-            // lease until the original transaction settles; no RPC replay.
-            tokio::time::timeout(Duration::from_secs(2), &mut worker)
-                .await
-                .is_ok()
-        } else {
-            true
+    /// Reserve BEFORE a new durable effect, and arm under the SAME Store
+    /// guard held through the synchronous SQL-only action. No external work
+    /// may be launched inside this closure. A returned error proves only that
+    /// this synchronous execution ended, NOT that SQL rolled back: any committed
+    /// intent/audit remains preserved and is never automatically replayed. It
+    /// settles physical ownership; panic retains dirty Unknown. Success stays
+    /// armed until caller transfers
+    /// ownership into spawn or explicitly settles a replay/local completion.
+    pub(crate) fn admit_store<T>(
+        &self,
+        action: impl FnOnce(&mut store::Store) -> ApiResult<T>,
+    ) -> ApiResult<(WorkAdmission, T)> {
+        self.ensure_cleanup_owner().map_err(lifecycle_error)?;
+        let mut admission = self.lifecycle.admit().map_err(lifecycle_error)?;
+        let result = {
+            let mut store = self.store.lock().unwrap();
+            admission.begin_intent(&store).map_err(lifecycle_error)?;
+            action(&mut store)
         };
-        self.qq_stop.send_replace(true);
-        let worker = { self.qq_worker.lock().unwrap().take() };
-        if let Some(mut worker) = worker {
-            if tokio::time::timeout(Duration::from_secs(2), &mut worker)
-                .await
-                .is_err()
-            {
-                worker.abort();
-                let _ = worker.await;
+        match result {
+            Ok(value) => Ok((admission, value)),
+            Err(error) => {
+                admission.settle();
+                Err(error)
             }
         }
-        let vault_stopped = self
-            .vault
-            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+    }
+
+    /// Only local SQL/validation or a queue whose dispatcher is already owned.
+    /// Does not authorize detaching OS/process/network work in the closure.
+    pub(crate) fn store_only<T>(
+        &self,
+        action: impl FnOnce(&mut store::Store) -> ApiResult<T>,
+    ) -> ApiResult<T> {
+        let (admission, result) = self.admit_store(action)?;
+        admission.settle();
+        Ok(result)
+    }
+
+    pub(crate) fn ensure_cleanup_owner(&self) -> Result<(), AdmissionError> {
+        capabilities::lifecycle::register_shutdown(self)
+    }
+
+    pub fn request_shutdown(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.ensure_cleanup_owner()?;
+        self.lifecycle
+            .request_shutdown(Arc::new(reliability::lifecycle_backend::Backend::new(
+                self.clone(),
+            )))?;
+        Ok(())
+    }
+
+    /// Main drives this observer from startup. It does not itself belong to the
+    /// worker set being drained, and detects failures even without HTTP clients.
+    pub async fn monitor_shutdown(self: &Arc<Self>) {
+        self.lifecycle.monitor_until_draining().await;
+        // Only a missing Tokio runtime could fail here; this is already async.
+        if self.request_shutdown().is_err() {
+            tracing::error!("关闭监督器无法启动；保持数据目录所有权，未确认停止");
+        }
+    }
+
+    /// Observe until actual Stopped; Unknown deliberately retains this owner,
+    /// its Tokio runtime and DataLease instead of pretending a timeout is exit.
+    pub async fn wait_stopped(&self) {
+        loop {
+            let observed = self
+                .lifecycle
+                .observe(std::time::Instant::now() + Duration::from_secs(1))
+                .await;
+            if observed.snapshot.outcome
+                == Some(reliability::lifecycle_runtime::ShutdownOutcome::Stopped)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Compatibility for bounded fixture cleanup observers. This no longer
+    /// aborts channel workers or drops their real cleanup ownership on timeout.
+    pub async fn shutdown_credentials(self: &Arc<Self>) -> bool {
+        if self.request_shutdown().is_err() {
+            return false;
+        }
+        self.lifecycle
+            .observe(std::time::Instant::now() + Duration::from_secs(2))
             .await
-            == capabilities::vault::ShutdownStatus::Stopped;
-        gateway_settled && vault_stopped
+            .snapshot
+            .outcome
+            == Some(reliability::lifecycle_runtime::ShutdownOutcome::Stopped)
     }
 
     pub fn publish(&self, event: RunEvent) {
@@ -340,6 +426,23 @@ impl AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let lifecycle_routes = if state.ensure_cleanup_owner().is_ok() {
+        reliability::lifecycle_api::routes(
+            state.lifecycle.clone(),
+            Arc::new(reliability::lifecycle_backend::Backend::new(state.clone())),
+        )
+    } else {
+        Router::new()
+            .route(
+                "/api/v1/lifecycle",
+                get(|| async { lifecycle_error(AdmissionError::RuntimeUnavailable) }),
+            )
+            .route(
+                "/api/v1/lifecycle/shutdown",
+                post(|| async { lifecycle_error(AdmissionError::RuntimeUnavailable) }),
+            )
+    };
+    let lifecycle_reader = state.lifecycle.clone();
     let updates = if let Some(runtime) = state.updates.clone() {
         reliability::update_api::routes(runtime)
     } else {
@@ -354,10 +457,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
     };
     let private = Router::new()
+        .merge(lifecycle_routes)
         .merge(updates)
-        .merge(compatibility_api::routes(Arc::new(|| {
-            harness_core::compatibility::LifecycleState::Running
-        })))
+        .merge(compatibility_api::routes(Arc::new(
+            move || match lifecycle_reader.snapshot().state {
+                reliability::lifecycle::LifecycleState::Running => {
+                    harness_core::compatibility::LifecycleState::Running
+                }
+                reliability::lifecycle::LifecycleState::Draining => {
+                    harness_core::compatibility::LifecycleState::Draining
+                }
+                reliability::lifecycle::LifecycleState::Stopped => {
+                    harness_core::compatibility::LifecycleState::Stopped
+                }
+            },
+        )))
         .merge(history_api::routes())
         .merge(capabilities::credential_api::routes())
         .merge(reliability::api::routes())
@@ -484,70 +598,59 @@ async fn resolve_cleanup(
             "必须确认相关进程已经停止".into(),
         ));
     }
-    let result = state
-        .store
-        .lock()
-        .unwrap()
-        .resolve_execution_cleanup(&task_id, &request.expected_updated_at)?;
+    let result = state.store_only(|store| {
+        Ok(store.resolve_execution_cleanup(&task_id, &request.expected_updated_at)?)
+    })?;
     state.wake.notify_waiters();
     Ok(Json(result))
 }
 
-async fn settings(State(state): State<Arc<AppState>>) -> Json<Value> {
-    {
-        let settings = state.settings.read().unwrap().clone();
-        Json(capabilities::provider_runtime::public_settings(
-            &state, &settings,
-        ))
-    }
+async fn settings(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    let (admission, ()) = state.admit_store(|_| Ok(()))?;
+    let receiver = admission
+        .spawn(WorkerKind::BlockingCleanup, async move {
+            let settings = state.settings.read().unwrap().clone();
+            // local_codex public metadata can read config.toml. Retain and await
+            // that original filesystem worker even if the HTTP observer vanishes.
+            let result = tokio::task::spawn_blocking(move || {
+                capabilities::provider_runtime::public_settings(&state, &settings)
+            })
+            .await
+            .map(Json)
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "设置读取未完成；请查询后台状态。".into(),
+                )
+            });
+            (WorkerExit::Settled, result)
+        })
+        .map_err(lifecycle_error)?;
+    receiver
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "设置读取观察中断。".into()))?
 }
 
-async fn codex_status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    use tokio::io::AsyncReadExt;
-
+async fn codex_status(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
     let binary = state.settings.read().unwrap().codex_binary.clone();
-    let mut command = tokio::process::Command::new(&binary);
-    command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    prepend_binary_directory(&mut command, &binary);
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let probe = async {
-        let mut child = command.spawn().ok()?;
-        let mut output = Vec::new();
-        child
-            .stdout
-            .take()?
-            .take(129)
-            .read_to_end(&mut output)
-            .await
-            .ok()?;
-        if output.len() > 128 || !child.wait().await.ok()?.success() {
-            return None;
-        }
-        let text = String::from_utf8(output).ok()?;
-        let version = text.trim().strip_prefix("codex-cli ")?;
-        if version.is_empty()
-            || !version
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || ".-_+".contains(character))
-        {
-            return None;
-        }
-        Some(version.to_owned())
-    };
-    let version = tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .ok()
-        .flatten();
-    Json(json!({
-        "available": version.is_some(), "version":version,
-        "message": if version.is_some() {"已找到本机 Codex CLI；登录状态和模型可用性在执行时检查"} else {"无法运行 Codex CLI，请检查可执行文件路径；此检测不会请求模型"}
-    }))
+    let (admission, ()) = state.admit_store(|_| Ok(()))?;
+    let receiver = admission.spawn(WorkerKind::Probe, async move {
+        let stop = state.lifecycle.signal();
+        let result = codex::probe_version_with_control(&binary, &state.capability_probe_root, &|| stop.is_cancelled()).await;
+        let exit = if result.as_ref().err().is_some_and(|e| e.is::<codex::CleanupUnconfirmed>()) { WorkerExit::Unknown } else { WorkerExit::Settled };
+        let version = result.ok().and_then(|text| {
+            let version = text.trim().strip_prefix("codex-cli ")?;
+            (!version.is_empty() && version.len() <= 128 && version.chars().all(|c| c.is_ascii_alphanumeric() || ".-_+".contains(c))).then(||version.to_owned())
+        });
+        (exit, Json(json!({"available":version.is_some(), "version":version,
+            "message":if version.is_some(){"已找到本机 Codex CLI；登录状态和模型可用性在执行时检查"}else{"Codex CLI 检查未确认；未调用模型，进程清理状态由后台单独记录"}})))
+    }).map_err(lifecycle_error)?;
+    receiver.await.map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "执行器检查未确认，请查询后台状态。".into(),
+        )
+    })
 }
 
 fn prepend_binary_directory(command: &mut tokio::process::Command, binary: &str) {
@@ -570,12 +673,15 @@ async fn update_settings(
     Json(patch): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let mut settings = state.settings.write().unwrap();
-    let updated = patch_settings(&settings, &patch)?;
-    state.store.lock().unwrap().save_settings(&updated)?;
+    let (admission, updated) = state.admit_store(|store| {
+        let updated = patch_settings(&settings, &patch)?;
+        store.save_settings(&updated)?;
+        Ok(updated)
+    })?;
     *settings = updated;
-    Ok(Json(capabilities::provider_runtime::public_settings(
-        &state, &settings,
-    )))
+    let public = capabilities::provider_runtime::public_settings(&state, &settings);
+    admission.settle();
+    Ok(Json(public))
 }
 
 fn patch_settings(settings: &Settings, patch: &Value) -> anyhow::Result<Settings> {
@@ -707,20 +813,64 @@ fn merge_control_patch(target: &mut Value, patch: &Value) -> anyhow::Result<()> 
     Ok(())
 }
 
-async fn local_codex_provider() -> ApiResult<Json<Value>> {
-    let settings = Settings {
-        provider_source: "local_codex".into(),
-        model: String::new(),
-        ..Settings::default()
-    };
-    configuration::resolve(&settings)?;
-    Ok(Json(settings.public()))
+async fn local_codex_provider(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    let (admission, ()) = state.admit_store(|_| Ok(()))?;
+    let receiver = admission
+        .spawn(WorkerKind::BlockingCleanup, async move {
+            let result = tokio::task::spawn_blocking(|| -> anyhow::Result<Value> {
+                let settings = Settings {
+                    provider_source: "local_codex".into(),
+                    model: String::new(),
+                    ..Settings::default()
+                };
+                configuration::resolve(&settings)?;
+                Ok(settings.public())
+            })
+            .await;
+            // A completed blocking join (including a panic) no longer owns a live
+            // filesystem read. It is a failed read, not physical cleanup Unknown.
+            let result = result
+                .map_err(|_| {
+                    ApiError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "本机配置读取未完成。".into(),
+                    )
+                })
+                .and_then(|value| value.map(Json).map_err(ApiError::from));
+            (WorkerExit::Settled, result)
+        })
+        .map_err(lifecycle_error)?;
+    receiver.await.map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "本机配置读取观察中断。".into(),
+        )
+    })?
 }
 
 async fn check_settings(
     State(state): State<Arc<AppState>>,
     Json(patch): Json<Value>,
 ) -> ApiResult<Json<Value>> {
+    let (admission, ()) = state.admit_store(|_| Ok(()))?;
+    let receiver = admission
+        .spawn(WorkerKind::Probe, async move {
+            let stop = state.lifecycle.signal();
+            let result = tokio::select! {
+                _ = stop.cancelled() => Err(lifecycle_error(AdmissionError::Draining)),
+                value = check_settings_owned(state, patch) => value,
+            };
+            // This path contains read-only HTTP/configuration work, not a process;
+            // an abandoned Vault read stays owned by the global Vault custodian.
+            (WorkerExit::Settled, result)
+        })
+        .map_err(lifecycle_error)?;
+    receiver
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "模型检查观察中断。".into()))?
+}
+
+async fn check_settings_owned(state: Arc<AppState>, patch: Value) -> ApiResult<Json<Value>> {
     let settings = state.settings.read().unwrap().clone();
     let draft = patch_settings(&settings, &patch)?;
     if draft.provider_source == "named" {
@@ -750,7 +900,7 @@ async fn command(
     Json(envelope): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let settings = state.settings.read().unwrap().clone();
-    let (receipt, event) = state.store.lock().unwrap().command(envelope, &settings)?;
+    let (receipt, event) = state.store_only(|store| Ok(store.command(envelope, &settings)?))?;
     if let Some(event) = event {
         state.publish(event);
     }
@@ -809,8 +959,10 @@ async fn events(
                 .into_response()
         }
     };
+    let stop = state.lifecycle.signal();
     let stream = async_stream::stream! {
         loop {
+            if stop.is_cancelled() { break; }
             let batch = { state.store.lock().unwrap().events_after(cursor) };
             match batch {
                 Ok(batch) if !batch.is_empty() => {
@@ -831,6 +983,7 @@ async fn events(
                 }
             }
             tokio::select! {
+                _ = stop.cancelled() => break,
                 result = receiver.recv() => {
                     if matches!(result, Err(broadcast::error::RecvError::Closed)) { break; }
                     // Lagged notifications are harmless: replay resumes from SQLite.
@@ -845,52 +998,122 @@ async fn events(
         .into_response()
 }
 
-pub fn spawn_workers(state: Arc<AppState>) {
-    qq::daemon::spawn(state.clone());
-    gateway::daemon::spawn(state.clone());
-    coordinator::spawn(state.clone());
+pub fn spawn_workers(state: Arc<AppState>) -> anyhow::Result<()> {
+    state.ensure_cleanup_owner()?;
+    let mut started = state.workers_started.lock().unwrap();
+    if *started {
+        return Ok(());
+    }
+    // Set before spawning: a partially failed startup is drained, never retried
+    // into duplicate fixed dispatchers. Main retains the state on any failure.
+    *started = true;
+    qq::daemon::spawn(state.clone())?;
+    gateway::daemon::spawn(state.clone())?;
+    coordinator::spawn(state.clone())?;
     for _ in 0..2 {
-        let state = state.clone();
-        tokio::spawn(async move {
+        let owned = state.clone();
+        state.lifecycle.spawn(WorkerKind::Task, async move {
+            let stop = owned.lifecycle.signal();
             loop {
-                let task = state.store.lock().unwrap().claim_task();
+                let task = {
+                    let mut store = owned.store.lock().unwrap();
+                    if owned.lifecycle.check_locked(&store).is_err() {
+                        return WorkerExit::Settled;
+                    }
+                    store.claim_task()
+                };
                 match task {
-                    Ok(Some(task)) => run_task(state.clone(), task).await,
+                    Ok(Some(task)) => {
+                        if run_task(owned.clone(), task).await == WorkerExit::Unknown {
+                            return WorkerExit::Unknown;
+                        }
+                    }
                     Ok(None) => {
                         tokio::select! {
-                            _ = state.wake.notified() => {},
+                            _ = stop.cancelled() => return WorkerExit::Settled,
+                            _ = owned.wake.notified() => {},
                             _ = tokio::time::sleep(Duration::from_millis(300)) => {},
                         }
                     }
-                    Err(error) => {
-                        tracing::error!(%error, "无法领取任务");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    Err(_) => {
+                        // No automatic re-claim after an uncertain transaction.
+                        tracing::error!("无法确认任务领取；停止新工作并保留原记录");
+                        return WorkerExit::Unknown;
                     }
                 }
             }
-        });
+        })?;
     }
-    tokio::spawn(async move {
+    let owned = state.clone();
+    state.lifecycle.spawn(WorkerKind::Callback, async move {
+        let stop = owned.lifecycle.signal();
         loop {
-            let result = state.store.lock().unwrap().deliver_one();
+            let result = {
+                let mut store = owned.store.lock().unwrap();
+                if owned.lifecycle.check_locked(&store).is_err() {
+                    return WorkerExit::Settled;
+                }
+                store.deliver_one()
+            };
             match result {
-                Ok(Some(event)) => state.publish(event),
+                Ok(Some(event)) => owned.publish(event),
                 Ok(None) => {}
-                Err(error) => tracing::error!(%error, "回调投递失败"),
+                Err(_) => {
+                    tracing::error!("无法确认本机回调事务；停止新工作并保留原记录");
+                    return WorkerExit::Unknown;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::select! {
+                _ = stop.cancelled() => return WorkerExit::Settled,
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {},
+            }
         }
-    });
+    })?;
+    Ok(())
 }
 
-async fn run_task(state: Arc<AppState>, task: Value) {
+// Retain current task cleanup evidence across every early-return branch. The
+// historical quarantine of OTHER tasks is never interpreted as a live worker.
+async fn run_task(state: Arc<AppState>, task: Value) -> WorkerExit {
+    let task_id = task["id"].as_str().map(str::to_owned);
+    let mut control = None;
+    let mut durable_settled = true;
+    run_task_inner(state.clone(), task, &mut control, &mut durable_settled).await;
+    if !durable_settled
+        || control
+            .as_ref()
+            .is_some_and(|c: &Arc<execution_control::RunControl>| c.cleanup_is_unknown())
+    {
+        return WorkerExit::Unknown;
+    }
+    match task_id {
+        Some(id)
+            if state
+                .store
+                .lock()
+                .unwrap()
+                .execution_cleanup_settled(&id)
+                .unwrap_or(false) =>
+        {
+            WorkerExit::Settled
+        }
+        _ => WorkerExit::Unknown,
+    }
+}
+
+async fn run_task_inner(
+    state: Arc<AppState>,
+    task: Value,
+    retained_control: &mut Option<Arc<execution_control::RunControl>>,
+    durable_settled: &mut bool,
+) {
     let task_id = task["id"].as_str().unwrap().to_string();
     let session_id = task["session_id"].as_str().unwrap().to_string();
     let root = state.store.lock().unwrap().project_path(&session_id);
     let root = match root {
         Ok(root) => PathBuf::from(root),
         Err(error) => {
-            finish(&state, &task_id, Err(error));
+            *durable_settled &= finish(&state, &task_id, Err(error));
             return;
         }
     };
@@ -911,6 +1134,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 if !store.task_may_start(&task_id).unwrap_or(false) {
                     if let Err(error) = store.defer_task(&task_id) {
                         tracing::error!(%error, %task_id, "无法恢复等待项目锁的任务");
+                        *durable_settled = false;
                     }
                     return;
                 }
@@ -932,7 +1156,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             .lock()
             .unwrap()
             .set_stop_reason(&task_id, "workspace_cleanup_unknown");
-        finish(&state,&task_id,Err(anyhow::anyhow!("同项目存在尚未确认清理的进程或写入；已隔离后续执行，请先由本机所有者检查并明确解除隔离")));
+        *durable_settled &= finish(&state,&task_id,Err(anyhow::anyhow!("同项目存在尚未确认清理的进程或写入；已隔离后续执行，请先由本机所有者检查并明确解除隔离")));
         return;
     }
     let may_start = state
@@ -944,6 +1168,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
     if !may_start {
         if let Err(error) = state.store.lock().unwrap().defer_task(&task_id) {
             tracing::error!(%error, %task_id, "无法恢复未执行任务的排队状态");
+            *durable_settled = false;
         }
         drop(permit);
         return;
@@ -964,7 +1189,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             Ok(Some(agent)) => agent,
             Ok(None) => profiles::AgentProfile::default(),
             Err(_) => {
-                finish(
+                *durable_settled &= finish(
                     &state,
                     &task_id,
                     Err(anyhow::anyhow!("任务角色快照格式无效")),
@@ -979,10 +1204,11 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             match execution_control::RunControl::start(state.clone(), &task_id, &agent.executor) {
                 Ok(control) => Arc::new(control),
                 Err(error) => {
-                    finish(&state, &task_id, Err(error));
+                    *durable_settled &= finish(&state, &task_id, Err(error));
                     return;
                 }
             };
+        *retained_control = Some(control.clone());
         let mut settings = match capabilities::provider_runtime::task_settings(
             &state,
             &task_id,
@@ -994,14 +1220,14 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         {
             Ok(settings) => settings,
             Err(error) => {
-                finish(&state, &task_id, Err(error));
+                *durable_settled &= finish(&state, &task_id, Err(error));
                 return;
             }
         };
         match control.prepare_capability_credentials().await {
             Ok(secrets) => settings.redaction_secrets.extend(secrets),
             Err(error) => {
-                finish(&state, &task_id, Err(error));
+                *durable_settled &= finish(&state, &task_id, Err(error));
                 return;
             }
         }
@@ -1013,7 +1239,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         let context = match context {
             Ok(context) => context,
             Err(error) => {
-                finish(&state, &task_id, Err(error));
+                *durable_settled &= finish(&state, &task_id, Err(error));
                 return;
             }
         };
@@ -1022,7 +1248,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             match result {
                 Ok(history) => history,
                 Err(error) => {
-                    finish(&state, &task_id, Err(error));
+                    *durable_settled &= finish(&state, &task_id, Err(error));
                     return;
                 }
             }
@@ -1051,7 +1277,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         let capability_state = match control.capability_state() {
             Ok(value) => value,
             Err(error) => {
-                finish(&state, &task_id, Err(error));
+                *durable_settled &= finish(&state, &task_id, Err(error));
                 return;
             }
         };
@@ -1059,7 +1285,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             &capability_state,
             &continuation::known_secrets(&settings),
         ) {
-            finish(&state, &task_id, Err(error));
+            *durable_settled &= finish(&state, &task_id, Err(error));
             return;
         }
         let mut objective = objective;
@@ -1088,7 +1314,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         let project = match project_files::ScopedProject::open(&root) {
             Ok(project) => project,
             Err(error) => {
-                finish(&state, &task_id, Err(error));
+                *durable_settled &= finish(&state, &task_id, Err(error));
                 return;
             }
         };
@@ -1096,7 +1322,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             && std::env::var("HARNESS_ALLOW_COMMANDS").as_deref() != Ok("1")
         {
             control.stop("permission_denied");
-            finish(
+            *durable_settled &= finish(
                 &state,
                 &task_id,
                 Err(anyhow::anyhow!(
@@ -1136,11 +1362,9 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         let state_for_inputs = state.clone();
         let task_for_inputs = task_id.clone();
         let claim_inputs = move || {
-            state_for_inputs
-                .store
-                .lock()
-                .unwrap()
-                .claim_inputs(&task_for_inputs)
+            let mut store = state_for_inputs.store.lock().unwrap();
+            state_for_inputs.lifecycle.check_locked(&store)?;
+            store.claim_inputs(&task_for_inputs)
         };
         let state_for_ack = state.clone();
         let task_for_ack = task_id.clone();
@@ -1161,18 +1385,26 @@ async fn run_task(state: Arc<AppState>, task: Value) {
         // unavailable report, not a missing report that looks unfinished.
         let began_changes = state.store.lock().unwrap().begin_changes(&task_id);
         if let Err(error) = began_changes {
-            finish(&state, &task_id, Err(error));
+            *durable_settled &= finish(&state, &task_id, Err(error));
             return;
         }
         if control.read_files_allowed() {
             let initial_secrets = continuation::known_secrets(&settings);
             *report_secrets.lock().unwrap() = initial_secrets.clone();
             let capture_root = root.clone();
-            match tokio::task::spawn_blocking(move || {
+            if let Err(error) = control.set_cleanup(true) {
+                *durable_settled &= finish(&state, &task_id, Err(error));
+                return;
+            }
+            let captured = tokio::task::spawn_blocking(move || {
                 changes::capture(&capture_root, &initial_secrets)
             })
-            .await
-            {
+            .await;
+            if let Err(error) = control.set_cleanup(false) {
+                *durable_settled &= finish(&state, &task_id, Err(error));
+                return;
+            }
+            match captured {
                 Ok(Ok(baseline)) => change_baseline = Some(baseline),
                 _ => {
                     publish_changes(
@@ -1180,7 +1412,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                         &task_id,
                         json!({"state":"unavailable","reason":"无法安全采集项目基线；未启动执行器写入。"}),
                     );
-                    finish(
+                    *durable_settled &= finish(
                         &state,
                         &task_id,
                         Err(anyhow::anyhow!("无法安全采集项目基线，任务未开始写入")),
@@ -1253,6 +1485,8 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                 }
                 "codex" => {
                     async {
+                        control.set_cleanup(true)?;
+                        let result = async {
                         let main = task["task_kind"] == "main";
                         let continuation = if main {
                             let (config, expected_config) = continuation::codex_identity(
@@ -1283,7 +1517,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                         let state_for_lifecycle = state.clone();
                         let task_for_lifecycle = task_id.clone();
                         let known_secrets = continuation::known_secrets(&settings);
-                        let result = codex::execute_with_control(
+                        let result = codex::execute_with_cleanup(
                             &settings.codex_binary,
                             &agent.model,
                             &root,
@@ -1307,6 +1541,7 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                             claim_inputs,
                             ack_inputs,
                             |secrets| report_secrets.lock().unwrap().extend_from_slice(secrets),
+                            || control.cleanup_unknown(),
                         )
                         .await;
                         let flushed = output.flush();
@@ -1314,20 +1549,34 @@ async fn run_task(state: Arc<AppState>, task: Value) {
                             .and_then(|text| flushed.map(|()| text))
                             .map(|text| redact_secret(&text, &settings.api_key))
                             .map_err(|error| {
-                                anyhow::anyhow!(redact_secret(
-                                    &error.to_string(),
-                                    &settings.api_key
-                                ))
+                                if error.is::<codex::CleanupUnconfirmed>() { error } else {
+                                    anyhow::anyhow!(redact_secret(&error.to_string(), &settings.api_key))
+                                }
                             })
-                    }
-                    .await
+                        }.await;
+                        if result.as_ref().err().is_some_and(|error| error.is::<codex::CleanupUnconfirmed>()) {
+                            let _ = control.cleanup_unknown();
+                        }
+                        if !control.cleanup_is_unknown() {
+                            // Includes ordinary rejected validation/model replies,
+                            // but never erases an unconfirmed process-tree cleanup.
+                            control.set_cleanup(false)?;
+                        }
+                        result
+                    }.await
                 }
                 _ => Err(anyhow::anyhow!("任务角色使用了不支持的执行器")),
             }
         }
     };
     if let Some(baseline) = change_baseline {
-        if !state
+        if state.lifecycle.signal().is_cancelled() {
+            publish_changes(
+                &state,
+                &task_id,
+                json!({"state":"unavailable","reason":"后台正在关闭；不再启动新的项目扫描，原有执行证据保留。"}),
+            );
+        } else if !state
             .store
             .lock()
             .unwrap()
@@ -1368,8 +1617,19 @@ async fn run_task(state: Arc<AppState>, task: Value) {
             }
         }
     }
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<codex::CleanupUnconfirmed>())
+    {
+        if let Some(control) = retained_control {
+            let _ = control.cleanup_unknown();
+        } else {
+            *durable_settled = false;
+        }
+    }
     drop(permit);
-    finish(&state, &task_id, result);
+    *durable_settled &= finish(&state, &task_id, result);
 }
 
 fn publish_changes(state: &AppState, task_id: &str, report: Value) {
@@ -1388,16 +1648,39 @@ fn redact_secret(text: &str, secret: &str) -> String {
     }
 }
 
-fn finish(state: &AppState, task_id: &str, result: anyhow::Result<String>) {
-    match state.store.lock().unwrap().finish(task_id, result) {
-        Ok(Some(event)) => state.publish(event),
-        Ok(None) => {}
-        Err(error) => tracing::error!(%error, %task_id, "无法保存任务结果"),
+fn finish(state: &AppState, task_id: &str, result: anyhow::Result<String>) -> bool {
+    let completed = (|| -> anyhow::Result<Vec<RunEvent>> {
+        let mut store = state.store.lock().unwrap();
+        let mut events = Vec::new();
+        if state.lifecycle.check_locked(&store).is_err() {
+            // A late result may arrive before the supervisor's first Store
+            // turn. Cancel plans/tasks before finish can advance dependencies.
+            events.extend(store.quiesce_for_shutdown()?.events);
+        }
+        if let Some(event) = store.finish(task_id, result)? {
+            events.push(event);
+        }
+        Ok(events)
+    })();
+    match completed {
+        Ok(events) => {
+            for event in events {
+                state.publish(event);
+            }
+        }
+        Err(_) => {
+            tracing::error!("无法保存任务结果；未自动重放");
+            return false;
+        }
     }
     state.wake.notify_waiters();
+    true
 }
 
 fn cancelled(state: &AppState, task_id: &str) -> bool {
+    if state.lifecycle.signal().is_cancelled() {
+        return true;
+    }
     state
         .store
         .lock()
@@ -1732,7 +2015,7 @@ mod tests {
             .unwrap()
             .0;
         let task_id = task["task_id"].as_str().unwrap();
-        spawn_workers(state.clone());
+        spawn_workers(state.clone()).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             state.store.lock().unwrap().snapshot().unwrap()["tasks"][0]["status"],
@@ -1760,3 +2043,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "reliability/lifecycle_integration_tests.rs"]
+mod lifecycle_integration_tests;

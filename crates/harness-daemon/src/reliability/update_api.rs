@@ -33,6 +33,13 @@ impl IntoResponse for Invalid {
 fn invalid(_: impl std::fmt::Display) -> Invalid {
     Invalid(StatusCode::BAD_REQUEST)
 }
+fn runtime_error(error: anyhow::Error) -> Invalid {
+    if error.is::<super::lifecycle::AdmissionError>() {
+        Invalid(StatusCode::SERVICE_UNAVAILABLE)
+    } else {
+        invalid(error)
+    }
+}
 type Result<T> = std::result::Result<T, Invalid>;
 
 pub(crate) fn routes<D: UpdateDatabase, S: Clone + Send + Sync + 'static>(
@@ -67,7 +74,7 @@ pub(crate) fn routes<D: UpdateDatabase, S: Clone + Send + Sync + 'static>(
 async fn status<D: UpdateDatabase>(
     State(r): State<Arc<UpdateRuntime<D>>>,
 ) -> Result<Json<RuntimeStatus>> {
-    r.status().await.map(Json).map_err(invalid)
+    r.status().await.map(Json).map_err(runtime_error)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,7 +129,7 @@ async fn configure<D: UpdateDatabase>(
     )
     .await
     .map(Json)
-    .map_err(invalid)
+    .map_err(runtime_error)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,7 +155,7 @@ async fn begin<D: UpdateDatabase>(
     )
     .await
     .map(Json)
-    .map_err(invalid)
+    .map_err(runtime_error)
 }
 async fn receipt<D: UpdateDatabase>(
     State(r): State<Arc<UpdateRuntime<D>>>,
@@ -157,7 +164,7 @@ async fn receipt<D: UpdateDatabase>(
     uuid(&id)?;
     r.receipt(id)
         .await
-        .map_err(invalid)?
+        .map_err(runtime_error)?
         .map(Json)
         .ok_or(Invalid(StatusCode::NOT_FOUND))
 }
@@ -166,7 +173,7 @@ async fn cancel<D: UpdateDatabase>(
     Path(id): Path<String>,
 ) -> Result<Json<state::Receipt>> {
     uuid(&id)?;
-    r.cancel(id).await.map(Json).map_err(invalid)
+    r.cancel(id).await.map(Json).map_err(runtime_error)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -183,7 +190,7 @@ async fn discard<D: UpdateDatabase>(
     r.discard(id, b.expected_sha256)
         .await
         .map(Json)
-        .map_err(invalid)
+        .map_err(runtime_error)
 }
 /// Pulls at most the verifier's requested chunk; never buffers the whole upload.
 /// The signed byte count is rechecked by the staging primitive including EOF.
@@ -245,7 +252,7 @@ async fn upload<D: UpdateDatabase>(
     let original = r
         .receipt(id.clone())
         .await
-        .map_err(invalid)?
+        .map_err(runtime_error)?
         .ok_or(Invalid(StatusCode::NOT_FOUND))?;
     if original.receipt.metadata.bytes != size || original.receipt.status != state::Status::Pending
     {
@@ -261,7 +268,7 @@ async fn upload<D: UpdateDatabase>(
     )
     .await
     .map(Json)
-    .map_err(invalid)
+    .map_err(runtime_error)
 }
 
 #[cfg(test)]

@@ -13,12 +13,22 @@ pub(crate) const READY_BUDGET: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub(crate) struct Startup {
     attempt: Option<(Instant, Arc<AtomicBool>)>,
+    observed_peer: bool,
 }
 impl Startup {
+    /// Attaching to an existing verified peer also consumes automatic launch
+    /// authority: a later owner shutdown must not cause replacement by this UI.
+    pub(crate) fn observed_peer(&mut self) {
+        self.observed_peer = true;
+    }
+
     pub(crate) fn start_once(
         &mut self,
         launch: impl FnOnce() -> Result<Arc<AtomicBool>, String>,
     ) -> Result<bool, String> {
+        if self.observed_peer {
+            return Err("已连接过的后台当前不可用或已由本机所有者关闭；不会自动重启。请由所有者明确启动后台后再只读刷新。".into());
+        }
         if self.attempt.is_some() {
             return Ok(false);
         }
@@ -262,6 +272,23 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn observed_existing_peer_consumes_autostart_without_creating_an_attempt() {
+        let mut state = Startup::default();
+        state.observed_peer();
+        for _ in 0..3 {
+            assert!(state
+                .start_once(|| panic!("owner shutdown must not relaunch"))
+                .unwrap_err()
+                .contains("不会自动重启"));
+        }
+        assert!(state.attempt.is_none());
+        // No mutation or reset is needed to discover an explicitly restarted
+        // peer: Bridge always performs its bounded read-only probe first.
+        state.observed_peer();
+        assert!(state.attempt.is_none());
+    }
+
     #[tokio::test]
     async fn failed_launch_and_responding_incompatible_peer_never_trigger_replacement() {
         let mut state = Startup::default();

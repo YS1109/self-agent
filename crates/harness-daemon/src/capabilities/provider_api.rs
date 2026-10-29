@@ -6,6 +6,7 @@ use super::{
     vault::{FreshCredential, SecretBytes, VaultCancellation, VaultCertainty},
 };
 use crate::{
+    reliability::lifecycle::{WorkerExit, WorkerKind},
     store::providers::{CredentialOutcome, CredentialWorkKind},
     ApiError, ApiResult, AppState,
 };
@@ -65,16 +66,49 @@ pub(crate) async fn command(
     State(state): State<Arc<AppState>>,
     Json(envelope): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    let settings = state.settings.read().unwrap().clone();
-    let settings = crate::configuration::resolve(&settings).unwrap_or(settings);
-    let secrets = crate::continuation::known_secrets(&settings);
+    command_with_resolver(state, envelope, |settings| {
+        crate::configuration::resolve(&settings).unwrap_or(settings)
+    })
+    .await
+}
+
+async fn command_with_resolver(
+    state: Arc<AppState>,
+    envelope: Value,
+    resolve: impl FnOnce(crate::Settings) -> crate::Settings + Send + 'static,
+) -> ApiResult<Json<Value>> {
     state
-        .store
-        .lock()
-        .unwrap()
-        .provider_command(&envelope, &secrets)
-        .map(Json)
-        .map_err(invalid)
+        .ensure_cleanup_owner()
+        .map_err(crate::lifecycle_error)?;
+    let admission = state.lifecycle.admit().map_err(crate::lifecycle_error)?;
+    let observer = admission
+        .spawn(WorkerKind::BlockingCleanup, async move {
+            let result = tokio::task::spawn_blocking(move || -> ApiResult<Value> {
+                let settings = state.settings.read().unwrap().clone();
+                // Local Codex configuration is real filesystem work, not harmless
+                // metadata prevalidation. This owner remains registered through it.
+                if state.lifecycle.signal().is_cancelled() {
+                    return Err(crate::lifecycle_error(
+                        crate::reliability::lifecycle::AdmissionError::Draining,
+                    ));
+                }
+                let settings = resolve(settings);
+                let secrets = crate::continuation::known_secrets(&settings);
+                let mut store = state.store.lock().unwrap();
+                state
+                    .lifecycle
+                    .check_locked(&store)
+                    .map_err(crate::lifecycle_error)?;
+                store.provider_command(&envelope, &secrets).map_err(invalid)
+            })
+            .await;
+            match result {
+                Ok(result) => (WorkerExit::Settled, result),
+                Err(_) => (WorkerExit::Unknown, Err(invalid("worker"))),
+            }
+        })
+        .map_err(crate::lifecycle_error)?;
+    observer.await.map_err(|_| invalid("worker"))?.map(Json)
 }
 
 #[derive(Deserialize)]
@@ -133,22 +167,25 @@ pub(crate) async fn set_credential(
         .map_err(invalid)?;
     let binding = providers::credential_binding(&provider_id, &checked).map_err(invalid)?;
     let fresh = FreshCredential::new(&binding, secret);
-    let receipt = state
-        .store
-        .lock()
-        .unwrap()
-        .begin_provider_credential_set(
-            &request.id,
-            &provider_id,
-            request.expected_revision,
-            fresh.reference(),
-        )
-        .map_err(invalid)?;
+    let (admission, receipt) = state.admit_store(|store| {
+        store
+            .begin_provider_credential_set(
+                &request.id,
+                &provider_id,
+                request.expected_revision,
+                fresh.reference(),
+            )
+            .map_err(invalid)
+    })?;
     if receipt["replayed"] != true {
         let state = state.clone();
-        tokio::spawn(async move {
-            mutate(state, request.id, Some(fresh)).await;
-        });
+        admission
+            .spawn(WorkerKind::Credential, async move {
+                (mutate(state, request.id, Some(fresh)).await, ())
+            })
+            .map_err(crate::lifecycle_error)?;
+    } else {
+        admission.settle();
     }
     Ok(Json(receipt))
 }
@@ -158,17 +195,20 @@ pub(crate) async fn delete_credential(
     Path(provider_id): Path<String>,
     Json(request): Json<DeleteRequest>,
 ) -> ApiResult<Json<Value>> {
-    let receipt = state
-        .store
-        .lock()
-        .unwrap()
-        .begin_provider_credential_delete(&request.id, &provider_id, request.expected_revision)
-        .map_err(invalid)?;
+    let (admission, receipt) = state.admit_store(|store| {
+        store
+            .begin_provider_credential_delete(&request.id, &provider_id, request.expected_revision)
+            .map_err(invalid)
+    })?;
     if receipt["replayed"] != true {
         let state = state.clone();
-        tokio::spawn(async move {
-            mutate(state, request.id, None).await;
-        });
+        admission
+            .spawn(WorkerKind::Credential, async move {
+                (mutate(state, request.id, None).await, ())
+            })
+            .map_err(crate::lifecycle_error)?;
+    } else {
+        admission.settle();
     }
     Ok(Json(receipt))
 }
@@ -178,28 +218,48 @@ pub(crate) async fn cleanup(
     Path(target): Path<String>,
     Json(request): Json<CleanupRequest>,
 ) -> ApiResult<Json<Value>> {
-    let receipt = state
-        .store
-        .lock()
-        .unwrap()
-        .begin_credential_cleanup(&request.id, &target)
-        .map_err(invalid)?;
+    let (admission, receipt) = state.admit_store(|store| {
+        store
+            .begin_credential_cleanup(&request.id, &target)
+            .map_err(invalid)
+    })?;
     if receipt["replayed"] != true {
         let state = state.clone();
-        tokio::spawn(async move {
-            mutate(state, request.id, None).await;
-        });
+        admission
+            .spawn(WorkerKind::Credential, async move {
+                (mutate(state, request.id, None).await, ())
+            })
+            .map_err(crate::lifecycle_error)?;
+    } else {
+        admission.settle();
     }
     Ok(Json(receipt))
 }
 
-async fn mutate(state: Arc<AppState>, id: String, fresh: Option<FreshCredential>) {
-    let work = match state.store.lock().unwrap().claim_credential_operation(&id) {
-        Ok(Some(work)) => work,
-        _ => return,
+async fn mutate(state: Arc<AppState>, id: String, fresh: Option<FreshCredential>) -> WorkerExit {
+    let work = {
+        let mut store = state.store.lock().unwrap();
+        let stopping = state.lifecycle.check_locked(&store).is_err();
+        let work = match store.claim_credential_operation(&id) {
+            Ok(Some(work)) => work,
+            Ok(None) => return WorkerExit::Settled,
+            Err(_) => return WorkerExit::Unknown,
+        };
+        if stopping {
+            // This is settlement of the original accepted intent, not a new
+            // external admission: no vault request was attempted by this worker.
+            return settled(store.finish_credential_operation(&id, CredentialOutcome::Rejected));
+        }
+        work
     };
     if work.operation_id != id || uuid::Uuid::parse_str(&work.owner_id).is_err() {
-        return;
+        return settled(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .finish_credential_operation(&id, CredentialOutcome::Rejected),
+        );
     }
     let cancel = VaultCancellation::default();
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -217,12 +277,13 @@ async fn mutate(state: Arc<AppState>, id: String, fresh: Option<FreshCredential>
                 .await
         }
         _ => {
-            let _ = state
-                .store
-                .lock()
-                .unwrap()
-                .finish_credential_operation(&id, CredentialOutcome::Rejected);
-            return;
+            return settled(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .finish_credential_operation(&id, CredentialOutcome::Rejected),
+            );
         }
     };
     let outcome = match result {
@@ -230,11 +291,23 @@ async fn mutate(state: Arc<AppState>, id: String, fresh: Option<FreshCredential>
         Err(error) if error.certainty == VaultCertainty::Unknown => CredentialOutcome::Unknown,
         Err(_) => CredentialOutcome::Rejected,
     };
-    let _ = state
-        .store
-        .lock()
-        .unwrap()
-        .finish_credential_operation(&id, outcome);
+    // Vault certainty is an audited result, not physical-thread cleanup. The
+    // separately tracked vault shutdown custodian waits for its real OS worker.
+    settled(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .finish_credential_operation(&id, outcome),
+    )
+}
+
+fn settled<T>(result: anyhow::Result<T>) -> WorkerExit {
+    if result.is_ok() {
+        WorkerExit::Settled
+    } else {
+        WorkerExit::Unknown
+    }
 }
 
 #[cfg(test)]

@@ -260,3 +260,67 @@ async fn history_admission_is_bounded_and_errors_never_expose_underlying_records
     assert!(!response.text().await.unwrap().contains("fixture-private"));
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn disconnected_history_observer_keeps_blocking_owner_until_actual_drain() {
+    use std::time::{Duration, Instant};
+    let fixture = Fixture::open(1).await;
+    let store = fixture.state.store.clone();
+    let (entered, held) = std::sync::mpsc::channel();
+    let (release, proceed) = std::sync::mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        let _store = store.lock().unwrap();
+        entered.send(()).unwrap();
+        let _ = proceed.recv_timeout(Duration::from_secs(5));
+    });
+    held.recv_timeout(Duration::from_secs(2)).unwrap();
+    let url = format!("{}/api/v1/history/tasks", fixture.url);
+    let observer = tokio::spawn(async move {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(url)
+            .bearer_auth("fixture-owner")
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.state.history_gate.available_permits() == 2 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    observer.abort();
+    let _ = observer.await;
+    fixture.state.request_shutdown().unwrap();
+    let pending = fixture
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_millis(40))
+        .await;
+    assert!(pending.deadline_reached);
+    assert_eq!(
+        pending.snapshot.state,
+        crate::reliability::lifecycle::LifecycleState::Draining
+    );
+    assert_eq!(fixture.state.history_gate.available_permits(), 1);
+    release.send(()).unwrap();
+    blocker.join().unwrap();
+    let stopped = fixture
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        stopped.snapshot.outcome,
+        Some(crate::reliability::lifecycle_runtime::ShutdownOutcome::Stopped)
+    );
+    assert_eq!(fixture.state.history_gate.available_permits(), 2);
+    assert_eq!(
+        fixture.get("/api/v1/history/tasks").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    fixture.close().await;
+}

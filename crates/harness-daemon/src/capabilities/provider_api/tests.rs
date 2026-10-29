@@ -398,3 +398,133 @@ async fn owner_authorization_is_required_before_accepting_secret_material() {
     assert_private(&http, &root, &[]).await;
     http.stop().await;
 }
+
+#[tokio::test]
+async fn actual_owner_shutdown_retains_blocked_vault_and_rejects_new_intents() {
+    let root = Root::new();
+    let (vault, control) = test_support::memory(8).unwrap();
+    let http = Http::open(&root, vault).await;
+    let provider = http.provider().await;
+    let gate = control.block_next_after_effect();
+    let operation = new_id();
+    http.set(&provider, &operation, 1, KEY).await;
+    assert!(gate.entered().await);
+    let response = http
+        .client
+        .post(format!("{}/api/v1/lifecycle/shutdown", http.base))
+        .bearer_auth(TOKEN)
+        .json(&json!({"expected_instance":http.state.lifecycle.snapshot().instance_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    drop(response); // Observer loss is not cancellation of the original custodian.
+    let pending = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_millis(40))
+        .await;
+    assert!(pending.deadline_reached);
+    assert_eq!(
+        pending.snapshot.state,
+        crate::reliability::lifecycle::LifecycleState::Draining
+    );
+    assert!(pending.snapshot.workers.pending_workers >= 2);
+    for (path, body) in [
+        (
+            "/api/v1/providers/commands".to_owned(),
+            json!({"id":new_id(),"command":{"type":"save_provider","definition":{"name":"late","base_url":"https://late.invalid/v1","model":"fixture"}}}),
+        ),
+        (
+            format!("/api/v1/providers/{provider}/credential-delete"),
+            json!({"id":new_id(),"expected_revision":1}),
+        ),
+        (
+            "/api/v1/capabilities/commands".to_owned(),
+            json!({"id":new_id(),"command":{"type":"import_skill","name":"late fixture","source_path":"/never/read/SKILL.md"}}),
+        ),
+    ] {
+        let response = http
+            .client
+            .post(format!("{}{path}", http.base))
+            .bearer_auth(TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "late mutation must be gated: {path}"
+        );
+        absent(&response.text().await.unwrap());
+    }
+    assert_eq!(control.counts().sets, 1);
+    assert_eq!(control.counts().deletes, 0);
+    gate.release();
+    http.wait_operation(&operation, "completed").await;
+    let settled = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert!(!settled.deadline_reached);
+    assert_eq!(
+        settled.snapshot.outcome,
+        Some(crate::reliability::lifecycle_runtime::ShutdownOutcome::Stopped)
+    );
+    assert_eq!(control.counts().sets, 1);
+    http.stop().await;
+}
+
+#[tokio::test]
+async fn configuration_read_is_owned_before_provider_command_store_admission() {
+    let root = Root::new();
+    let (vault, control) = test_support::memory(8).unwrap();
+    let http = Http::open(&root, vault).await;
+    let state = http.state.clone();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let observer = tokio::spawn(super::command_with_resolver(
+        state,
+        json!({"id":new_id(),"command":{"type":"save_provider","definition":{"name":"not committed","base_url":"https://read-gate.invalid/v1","model":"fixture"}}}),
+        move |settings| {
+            let _ = entered.send(());
+            let _ = blocked.recv_timeout(Duration::from_secs(5));
+            settings
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(2), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    observer.abort();
+    let _ = observer.await;
+    http.state.request_shutdown().unwrap();
+    let pending = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_millis(40))
+        .await;
+    assert!(pending.deadline_reached);
+    assert_eq!(
+        pending.snapshot.state,
+        crate::reliability::lifecycle::LifecycleState::Draining
+    );
+    release.send(()).unwrap();
+    let stopped = http
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        stopped.snapshot.outcome,
+        Some(crate::reliability::lifecycle_runtime::ShutdownOutcome::Stopped)
+    );
+    assert!(http.registry().await["providers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(control.counts().sets, 0);
+    http.stop().await;
+}

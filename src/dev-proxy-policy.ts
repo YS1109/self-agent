@@ -11,6 +11,8 @@ export function historyProxyPath(path: string): boolean {
 }
 
 const routes: Record<string, string> = {
+  "GET /api/v1/lifecycle": "GET",
+  "POST /api/v1/lifecycle/shutdown?wait_ms=30000": "POST",
   "GET /api/v1/snapshot?window=1": "GET",
   "GET /api/v1/reliability": "GET",
   "GET /api/v1/reliability/updates": "GET",

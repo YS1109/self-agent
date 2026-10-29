@@ -434,3 +434,33 @@ async fn actual_owner_router_authenticates_update_handshake_and_rejects_generati
     assert_eq!(status["automatic_update_enabled"], false);
     assert_eq!(status["installed"], false);
 }
+
+#[tokio::test]
+async fn actual_shutdown_rejects_new_backup_without_directory_or_receipt() {
+    let f = Fixture::open().await;
+    f.state.request_shutdown().unwrap();
+    let id = new_id();
+    assert_eq!(
+        f.post(&id, "not-created-after-shutdown").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(!f.root.join("not-created-after-shutdown").exists());
+    assert!(f
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .backup_receipt(&id)
+        .unwrap()
+        .is_none());
+    let observed = f
+        .state
+        .lifecycle
+        .observe(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        observed.snapshot.outcome,
+        Some(crate::reliability::lifecycle_runtime::ShutdownOutcome::Stopped)
+    );
+    f.close().await;
+}

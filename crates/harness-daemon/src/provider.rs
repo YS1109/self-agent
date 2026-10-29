@@ -23,6 +23,8 @@ use crate::{
 #[path = "provider_redaction.rs"]
 mod provider_redaction;
 pub(crate) use provider_redaction::SecretMatcher;
+#[path = "provider/process_cleanup.rs"]
+pub(crate) mod process_cleanup;
 #[path = "provider_stream.rs"]
 mod provider_stream;
 
@@ -261,7 +263,13 @@ pub(crate) async fn execute_with_runtime(
     .await;
     result
         .map(|text| redact_all(&settings, &text))
-        .map_err(|error: anyhow::Error| anyhow!(redact_all(&settings, &error.to_string())))
+        .map_err(|error: anyhow::Error| {
+            if error.is::<process_cleanup::CleanupUnconfirmed>() {
+                error
+            } else {
+                anyhow!(redact_all(&settings, &error.to_string()))
+            }
+        })
 }
 
 fn valid_summary(memory: &NativeSummary, history: &[Value]) -> bool {
@@ -569,50 +577,49 @@ async fn execute_inner(
                                     control.charge(Charge::Mutation)?;
                                 }
                             }
-                            if matches!(name, "run_command" | "write_file") {
-                                if name == "write_file" {
-                                    if let Some(control) = runtime {
-                                        control.set_cleanup(true)?;
-                                    }
-                                }
-                                // Blocking writes cannot be aborted. Await completion while
-                                // the caller retains the project lease, even after cancellation.
-                                let result = tool(
-                                    root,
-                                    &project,
-                                    name,
-                                    arguments,
-                                    shell_enabled,
-                                    &known_secrets,
-                                    &cancelled,
-                                )
-                                .await;
-                                if name == "write_file" {
-                                    if let Some(control) = runtime {
-                                        control.set_cleanup(false)?;
-                                    }
-                                }
-                                result
-                            } else {
-                                interruptible(
-                                    tool(
-                                        root,
-                                        &project,
-                                        name,
-                                        arguments,
-                                        shell_enabled,
-                                        &known_secrets,
-                                        &cancelled,
-                                    ),
-                                    &cancelled,
-                                )
-                                .await
+                            // All original filesystem workers stay owned through cancellation.
+                            // Dropping a read/scan future would detach its spawn_blocking thread
+                            // just as surely as dropping a write would.
+                            if let Some(control) = runtime {
+                                control.set_cleanup(true)?;
                             }
+                            let result = tool(
+                                root,
+                                &project,
+                                name,
+                                arguments,
+                                shell_enabled,
+                                &known_secrets,
+                                &cancelled,
+                                runtime,
+                            )
+                            .await;
+                            if let Some(control) = runtime {
+                                if !result.as_ref().is_err_and(|error| {
+                                    error.is::<process_cleanup::CleanupUnconfirmed>()
+                                }) {
+                                    control.set_cleanup(false)?;
+                                }
+                            }
+                            result
                         }
                     }
                 }
                 Err(_) => Err(anyhow!("工具调用参数不是有效 JSON")),
             };
+            if result
+                .as_ref()
+                .is_err_and(|error| error.is::<process_cleanup::CleanupUnconfirmed>())
+            {
+                if name == "run_command" {
+                    if let Ok(arguments) = serde_json::from_str::<Value>(arguments) {
+                        retain_uncertain_command_evidence(
+                            settings, &result, &arguments, runtime, &evidence,
+                        );
+                    }
+                }
+                return Err(process_cleanup::CleanupUnconfirmed.into());
+            }
             let mut command_record = if name == "run_command" {
                 match (&result, serde_json::from_str::<Value>(arguments)) {
                     (Ok(value), Ok(arguments)) => command_evidence(settings, value, &arguments),
@@ -725,6 +732,7 @@ async fn run_verification_batch(
             call_id: call_id.clone(),
             name: "run_command".into(),
         })?;
+        control.set_cleanup(true)?;
         let result = tool(
             root,
             project,
@@ -733,8 +741,23 @@ async fn run_verification_batch(
             shell_enabled,
             known_secrets,
             cancelled,
+            Some(control),
         )
         .await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<process_cleanup::CleanupUnconfirmed>())
+        {
+            retain_uncertain_command_evidence(
+                settings,
+                &result,
+                &arguments,
+                Some(control),
+                evidence,
+            );
+            return Err(process_cleanup::CleanupUnconfirmed.into());
+        }
+        control.set_cleanup(false)?;
         let mut command_record = result
             .as_ref()
             .ok()
@@ -1241,6 +1264,52 @@ fn bounded_redacted(settings: &Settings, text: &str) -> String {
     text
 }
 
+/// Private audit context. Formatting it never exposes captured output; only the
+/// normal bounded/redacted command-evidence path may publish the observation.
+struct ObservedCommand(Value);
+impl std::fmt::Debug for ObservedCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObservedCommand")
+    }
+}
+impl std::fmt::Display for ObservedCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("命令根进程已有观察结果；进程树清理未确认")
+    }
+}
+fn retain_uncertain_command_evidence(
+    settings: &Settings,
+    result: &Result<Value>,
+    arguments: &Value,
+    runtime: Option<&RunControl>,
+    evidence: &impl Fn(CommandEvidence),
+) {
+    let Some(observed) = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<ObservedCommand>())
+    else {
+        return;
+    };
+    if let Some(mut record) = command_evidence(settings, &observed.0, arguments) {
+        record.output = bounded_redacted(
+            settings,
+            &format!(
+                "[仅记录命令根进程的退出与输出；进程树清理未确认]\n{}",
+                record.output
+            ),
+        );
+        if runtime.is_some_and(|control| {
+            control
+                .charge(Charge::OutputBytes(record.output.len() as u64))
+                .is_err()
+        }) {
+            record.output.clear();
+        }
+        evidence(record);
+    }
+}
+
 async fn interruptible<T>(
     future: impl std::future::Future<Output = Result<T>>,
     cancelled: &impl Fn() -> bool,
@@ -1332,6 +1401,7 @@ pub fn scoped_path(root: &Path, requested: &str, writing: bool) -> Result<PathBu
     Ok(parent.join(joined.file_name().context("缺少文件名")?))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tool(
     root: &Path,
     project: &ScopedProject,
@@ -1340,23 +1410,23 @@ async fn tool(
     shell: bool,
     known_secrets: &[String],
     cancelled: &impl Fn() -> bool,
+    runtime: Option<&RunControl>,
 ) -> Result<Value> {
+    if cancelled() {
+        bail!("任务已取消；未启动工具");
+    }
     match name {
         "read_file" => {
             let path = argument(&arguments, "path")?.to_owned();
             let project = project.try_clone()?;
-            let content = tokio::task::spawn_blocking(move || project.read(&path))
-                .await
-                .context("项目文件读取任务未完成")??;
+            let content = owned_file_work(move || project.read(&path), cancelled).await?;
             Ok(json!({"content":content}))
         }
         "write_file" => {
             let path = argument(&arguments, "path")?.to_owned();
             let content = argument(&arguments, "content")?.to_owned();
             let project = project.try_clone()?;
-            let bytes = tokio::task::spawn_blocking(move || project.write(&path, &content))
-                .await
-                .context("项目文件写入任务未完成")??;
+            let bytes = owned_file_work(move || project.write(&path, &content), cancelled).await?;
             Ok(json!({"written":true,"bytes":bytes}))
         }
         "list_files" | "search_files" => {
@@ -1368,11 +1438,11 @@ async fn tool(
             };
             let project = project.try_clone()?;
             let known_secrets = known_secrets.to_vec();
-            tokio::task::spawn_blocking(move || {
-                project.scan(&path, query.as_deref(), &known_secrets)
-            })
+            owned_file_work(
+                move || project.scan(&path, query.as_deref(), &known_secrets),
+                cancelled,
+            )
             .await
-            .context("项目文件搜索任务未完成")?
         }
         "run_command" if shell => {
             let command = argument(&arguments, "command")?;
@@ -1393,23 +1463,29 @@ async fn tool(
                 process.as_std_mut().process_group(0);
                 process
             };
-            let mut child = process
+            process
                 .current_dir(root)
                 .env_remove("HARNESS_API_KEY")
                 .env_remove("OPENAI_API_KEY")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .context("无法启动命令")?;
+                .kill_on_drop(true);
+            #[cfg(not(windows))]
+            let mut child = process.spawn().context("无法启动命令")?;
+            #[cfg(windows)]
+            let mut child =
+                process_cleanup::spawn(&process, [false, true, true], cancelled, &|| {
+                    runtime.map_or(Ok(()), RunControl::cleanup_unknown)
+                })
+                .await?;
             let mut tree = CommandTree(child.id());
             let stdout = child.stdout.take().unwrap();
             let stderr = child.stderr.take().unwrap();
             let outcome = {
                 let run = async {
                     let (status, stdout, stderr) = tokio::try_join!(
-                        child.wait(),
+                        process_cleanup::observe_exit(&mut child),
                         capture(stdout, known_secrets),
                         capture(stderr, known_secrets),
                     )?;
@@ -1430,73 +1506,54 @@ async fn tool(
                     }
                 }
             };
-            stop_command_tree(&mut child, &mut tree).await;
-            outcome
+            let cleanup = stop_command_tree(&mut child, &mut tree, &|| {
+                runtime.map_or(Ok(()), RunControl::cleanup_unknown)
+            })
+            .await;
+            match (cleanup, outcome) {
+                (Err(error), Ok(value)) => Err(error.context(ObservedCommand(value))),
+                (Err(error), Err(_)) => Err(error),
+                (Ok(()), outcome) => outcome,
+            }
         }
         _ => bail!("工具不存在或未启用"),
     }
 }
 
-/// Dropping an interrupted tool must not leave a child writing after the task
-/// has stopped. This also reaps detached descendants after a successful shell.
-struct CommandTree(Option<u32>);
-async fn stop_command_tree(child: &mut tokio::process::Child, tree: &mut CommandTree) {
-    if let Some(pid) = tree.0 {
-        #[cfg(unix)]
-        let mut command = {
-            let mut command = tokio::process::Command::new("/bin/kill");
-            command.args(["-KILL", "--", &format!("-{pid}")]);
-            command
-        };
-        #[cfg(windows)]
-        let mut command = {
-            let mut command = tokio::process::Command::new("taskkill");
-            command.args(["/PID", &pid.to_string(), "/T", "/F"]);
-            command
-        };
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .status(),
-        )
-        .await;
+/// Cancellation does not cancel a blocking filesystem operation. Its original
+/// JoinHandle is always awaited while the caller retains the project lease.
+async fn owned_file_work<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+    cancelled: &impl Fn() -> bool,
+) -> Result<T> {
+    if cancelled() {
+        bail!("任务已取消；未启动文件操作");
     }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    tree.0 = None;
+    let result = tokio::task::spawn_blocking(work)
+        .await
+        .context("项目文件工作线程已结束但未返回结果")?;
+    if cancelled() {
+        bail!("任务已取消；原文件操作已结束");
+    }
+    result
 }
 
+/// Emergency Drop signalling is best effort only, never confirmation. Normal
+/// completion/cancellation awaits stop_command_tree before releasing the lease.
+struct CommandTree(Option<u32>);
+async fn stop_command_tree(
+    child: &mut process_cleanup::Child,
+    tree: &mut CommandTree,
+    cleanup_unknown: &impl Fn() -> Result<()>,
+) -> Result<()> {
+    // Transfer the numeric signal authority before stop can reap. If an
+    // observer callback panics later, Drop must not signal a recycled PGID.
+    let group = tree.0.take();
+    process_cleanup::stop(child, group, cleanup_unknown).await
+}
 impl Drop for CommandTree {
     fn drop(&mut self) {
-        let Some(pid) = self.0 else {
-            return;
-        };
-        #[cfg(unix)]
-        let mut command = {
-            let mut command = std::process::Command::new("/bin/kill");
-            command.args(["-KILL", "--", &format!("-{pid}")]);
-            command
-        };
-        #[cfg(windows)]
-        let mut command = {
-            let mut command = std::process::Command::new("taskkill");
-            command.args(["/PID", &pid.to_string(), "/T", "/F"]);
-            command
-        };
-        let _ = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map(|mut child| {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                })
-            });
+        process_cleanup::emergency_group_kill(self.0);
     }
 }
 
@@ -1585,6 +1642,127 @@ mod tests {
     // system symlink. Production execution must still reject later swaps.
     fn fixture_temp_dir() -> PathBuf {
         std::env::temp_dir().canonicalize().unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_original_read_and_scan_workers() {
+        for operation in ["read_file", "list_files", "search_files"] {
+            let root = fixture_temp_dir().join(format!("owned-read-{}", harness_core::new_id()));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("note.txt"), "fixture search text").unwrap();
+            let project = ScopedProject::open(&root).unwrap();
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let done = finished.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let is_cancelled = || cancelled.load(std::sync::atomic::Ordering::SeqCst);
+            let work = owned_file_work(
+                move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let result = match operation {
+                        "read_file" => project.read("note.txt").map(|text| json!({"content":text})),
+                        "list_files" => project.scan(".", None, &[]),
+                        _ => project.scan(".", Some("fixture"), &[]),
+                    };
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    result
+                },
+                &is_cancelled,
+            );
+            tokio::pin!(work);
+            tokio::select! {
+                entered = entered_rx => entered.unwrap(),
+                _ = &mut work => panic!("worker completed before release"),
+            }
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(tokio::time::timeout(Duration::from_millis(50), &mut work)
+                .await
+                .is_err());
+            assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+            release_tx.send(()).unwrap();
+            assert!(work
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("原文件操作已结束"));
+            assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_file_worker_is_not_started_and_joined_errors_are_not_cleanup_unknown() {
+        let error = owned_file_work(|| -> Result<()> { panic!("must not start") }, &|| true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("未启动"));
+        let error = owned_file_work(
+            || -> Result<()> { anyhow::bail!("fixture read failed") },
+            &|| false,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.is::<process_cleanup::CleanupUnconfirmed>());
+        let error = owned_file_work(
+            || -> Result<()> { panic!("fixture joined worker panic") },
+            &|| false,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.is::<process_cleanup::CleanupUnconfirmed>());
+    }
+
+    #[test]
+    fn unknown_cleanup_preserves_safe_observed_root_evidence_without_formatting_private_context() {
+        let settings = Settings {
+            api_key: "fixture-private-command-key".into(),
+            ..Settings::default()
+        };
+        let error = anyhow::Error::new(process_cleanup::CleanupUnconfirmed).context(ObservedCommand(
+            json!({"exit_code":7,"stdout":format!("fixture-private-command-key{}", "界".repeat(20000)),"stderr":"actual failure"})
+        ));
+        assert!(error.is::<process_cleanup::CleanupUnconfirmed>());
+        assert!(!format!("{error:?}").contains("fixture-private-command-key"));
+        let records = Mutex::new(Vec::new());
+        retain_uncertain_command_evidence(
+            &settings,
+            &Err(error),
+            &json!({"command":"echo fixture-private-command-key"}),
+            None,
+            &|record| records.lock().unwrap().push(record),
+        );
+        let records = records.into_inner().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].exit_code, 7);
+        assert!(records[0].output.starts_with("[仅记录命令根进程"));
+        assert!(records[0].output.len() <= 16 * 1024);
+        assert!(!records[0].output.contains("fixture-private-command-key"));
+        assert!(!records[0].command.contains("fixture-private-command-key"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_command_cancellation_confirms_owned_root_cleanup() {
+        let root = fixture_temp_dir();
+        let project = ScopedProject::open(&root).unwrap();
+        let started = tokio::time::Instant::now();
+        let error = tool(
+            &root,
+            &project,
+            "run_command",
+            json!({"command":"exec sleep 30"}),
+            true,
+            &[],
+            &|| started.elapsed() >= Duration::from_millis(40),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("回收命令进程树"));
+        assert!(!error.is::<process_cleanup::CleanupUnconfirmed>());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     fn stream_chunk(delta: Value, finish: Value) -> String {
@@ -2951,6 +3129,7 @@ mod tests {
             true,
             &["private-test-key".into()],
             &|| false,
+            None,
         )
         .await
         .unwrap();
@@ -3060,6 +3239,7 @@ mod tests {
             false,
             &[secret.into()],
             &|| false,
+            None,
         )
         .await
         .unwrap();

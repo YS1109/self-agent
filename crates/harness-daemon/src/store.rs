@@ -19,6 +19,7 @@ mod decisions;
 pub(crate) mod execution;
 pub(crate) mod gateway;
 pub(crate) mod history;
+pub(crate) mod lifecycle;
 pub(crate) mod providers;
 pub(crate) mod qq;
 pub(crate) mod reliability;
