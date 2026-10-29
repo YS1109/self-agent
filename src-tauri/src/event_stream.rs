@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 const MAX_FRAME: usize = 512 * 1024;
-const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
+const MAX_SNAPSHOT: usize = 12 * 1024 * 1024;
 const MAX_PENDING: usize = 64;
 const MAX_PENDING_KIB: usize = 32 * 1024;
 
@@ -316,7 +316,7 @@ async fn metadata(path: &Path) -> Result<DaemonInfo, String> {
 
 async fn snapshot(client: &Client, info: &DaemonInfo) -> Result<Value, String> {
     let url = validate_base_url(&info.base_url)?
-        .join("api/v1/snapshot")
+        .join("api/v1/snapshot?window=1")
         .map_err(|_| "本机接口路径无效")?;
     let mut response = client
         .get(url)
@@ -328,10 +328,16 @@ async fn snapshot(client: &Client, info: &DaemonInfo) -> Result<Value, String> {
     if !response.status().is_success() {
         return Err("后台快照暂不可用".into());
     }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SNAPSHOT as u64)
+    {
+        return Err("后台快照超过12 MiB限制".into());
+    }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| "后台快照读取中断")? {
         if bytes.len() + chunk.len() > MAX_SNAPSHOT {
-            return Err("后台快照超过16 MiB限制".into());
+            return Err("后台快照超过12 MiB限制".into());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -729,7 +735,7 @@ mod tests {
                         .await;
                     }
                     1 | 3 => {
-                        assert!(request.starts_with("GET /api/v1/snapshot "));
+                        assert!(request.starts_with("GET /api/v1/snapshot?window=1 "));
                         serve_response(
                             &mut socket,
                             "200 OK",
@@ -817,7 +823,7 @@ mod tests {
             serve_response(&mut socket, "200 OK", "text/event-stream", &frame(1)).await;
             let (mut socket, _) = second.accept().await.unwrap();
             let request = read_request(&mut socket).await;
-            assert!(request.starts_with("GET /api/v1/snapshot "));
+            assert!(request.starts_with("GET /api/v1/snapshot?window=1 "));
             assert!(request
                 .to_ascii_lowercase()
                 .contains("authorization: bearer new-fixture"));
@@ -852,5 +858,44 @@ mod tests {
         assert!(!serialized.contains("old-fixture") && !serialized.contains("new-fixture"));
         drop(messages);
         tokio::fs::remove_file(path).await.unwrap();
+    }
+    #[tokio::test]
+    async fn snapshot_recovery_refuses_over_12_mib_before_body_or_json() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let info: DaemonInfo = serde_json::from_value(json!({
+            "base_url": format!("http://{}", listener.local_addr().unwrap()),
+            "token": "fixture-private", "pid": 1
+        }))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("GET /api/v1/snapshot?window=1 "));
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        12 * 1024 * 1024 + 1
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            // No body: accepting the header would otherwise block until timeout.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), snapshot(&client, &info))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error, "后台快照超过12 MiB限制");
+        server.abort();
+        let _ = server.await;
     }
 }

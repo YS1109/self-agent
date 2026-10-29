@@ -199,3 +199,109 @@ python3 scripts/history_benchmark.py \
 ## 不在本次证据范围
 
 release/优化构建、真实模型等待与工具执行、真实多年用户数据分布、GUI 渲染/虚拟列表、Windows/macOS RSS、安装升级、网络延迟及公网网关。任何容量结论只适用于记录的消息/任务体积和本次候选，不能把任务数量直接换算成普适用户上限。
+
+## 第二阶段对照：reviewed v14 有界历史候选（未提交）
+
+### 固定身份与同 seed 验证
+
+正式结果时间为 **2026-10-29 01:26:10–01:28:38 UTC**；来源是 `6f497bae825d71fa2ec5a1c4b5c4a659258c9e1b` **加未提交的 reviewed v14**（含显式 window、current_cursor、权威错误码与 CLI 等待超时最后观察值修复），不是该 base 提交本身或已发布版本。
+
+- 固定 daemon SHA-256：`31a68022aa5dc01b0babe849bbedbe6abcd77799b22addcc51d6fc53f2099c16`。
+- 固定 CLI SHA-256：`90baca16f344eadb004978b57f4de97401b5f24678cd8a9fe4d75a5c7cfa3e1f`。
+- 使用 `history-final-frozen/target/debug/` 的独立固定文件，没有构建/使用正在变动的主 target。环境仍为上述 Linux debug/shared cloud，未做 release、其他 OS 或冷缓存对照。
+- 原 1e7d 的 1,000 / 5,000 两份 seed 字节副本迁移至 schema 3，源 seed SHA 与前节一致；迁移前后、全部只读测量/备份/重启后的 sessions/tasks/messages/commands/events 数量及逻辑内容 SHA 全部一致。两组源 seed 最后再次验证未改变。
+- schema 1→3 的首次启动（各 n=1）分别为 **5,255.7 / 12,476.3 ms**；迁移后数据库仍为 **29,708,288 / 59,641,856 bytes**，不是更短的数据集。
+
+### 口径：窗口不冒充全量，分页另作完整性验证
+
+新增 `--bounded-history` 才请求 `/api/v1/snapshot?window=1`。逐次验证 `history.version=1`、epoch UUID、真实 total/returned/omitted/has_more 和消息 offset，并在 JSON 解析前限制实际响应字节：**window 12 MiB、page 2 MiB、task detail 8 MiB**。原无 query `/snapshot` 单列观察：本次两组各 3/3 明确返回 413 `record_too_large`，未把部分窗口谎称为完整数据。这是预期兼容拒绝，不计成新客户端容量失败；原先的 16 MiB baseline 失败仍保留。
+
+旧模式不启用该 flag，继续要求完整快照数量；没有降低旧标准或覆写前两阶段原始结果。本阶段默认页面确实只含一部分记录，不能拿窗口缩小后的字节/耗时宣称“同样完整内容传输更快”。
+
+| 实际响应/窗口内容 | 1,000 任务 | 5,000 任务 |
+| --- | ---: | ---: |
+| snapshot wire bytes | 913,091 | 2,577,762 |
+| 窗口任务 returned / total | 80 / 1,000 | 80 / 5,000 |
+| 窗口会话 returned / total | 1 / 1 | 59 / 100 |
+| 窗口事件 returned / retained | 80 / 20,000 | 80 / 20,000 |
+| 选取的窗口外 task detail bytes | 18,883 | 5,807 |
+| tasks 页最大 wire bytes | 811,948 | 443,301 |
+| messages 页最大 wire bytes | 220,471 | 117,899 |
+
+5,000 组会话窗口还列出 21 条 `unavailable: record_too_large`（集合分配预算不足）；这**不是**证明这些单条历史真的超过分页上限，剩余遗漏通过 total/omitted 显示。所有 100 个会话的消息随后都成功完整分页读取。页面中的小型合成记录若 unavailable 会直接让本 runner 失败，不以它替代内容验证。
+
+### 实测延迟（ms，P50 / P95）
+
+除单列说明外，请求/启动各 n=3、备份/inspect 各 n=2。每个 HTTP/SSE/CLI 请求的预算仍为 30 秒；全部成功样本与失败人口分开保留，未丢弃较慢样本。
+
+| 操作 | v14：1,000 任务 | v14：5,000 任务 |
+| --- | ---: | ---: |
+| 温热重复启动 → health | 1,218.0 / 1,657.0 | 6,836.4 / 7,153.3 |
+| HTTP 有界窗口（不是完整历史） | 517.1 / 523.0 | 1,467.8 / 1,637.6 |
+| HTTP 固定诊断 | 26.8 / 31.4 | 428.3 / 593.3 |
+| HTTP 单任务 detail（窗口外） | 111.1 / 226.3 | 149.4 / 149.9 |
+| HTTP tasks 第一页 | 213.9 / 243.5 | 103.7 / 135.1 |
+| CLI status 有界窗口 | 466.3 / 469.0 | 868.8 / 871.0 |
+| CLI status 单任务（窗口外） | 164.6 / 168.3 | 115.3 / 165.9 |
+| CLI 完成态 follow（窗口外） | 214.9 / 216.0 | 168.3 / 222.1 |
+| CLI history tasks 单页 | 316.3 / 365.6 | 220.8 / 268.7 |
+| CLI diagnostics | 64.4 / 65.3 | 116.9 / 117.3 |
+| SSE 128 条回放 | 18.3 / 19.3 | 10.2 / 27.8 |
+| SSE 完整 20,000 条回放 | 1,044.7 / 1,344.1 | 1,351.4 / 1,568.8 |
+| 在线备份完成（n=2） | 1,374.8 / 1,878.5 | 1,936.9 / 3,279.1 |
+| CLI backup-inspect（n=2） | 1,173.8 / 1,782.8 | 3,275.6 / 3,882.3 |
+| 旧无 query snapshot：预期 413 | 10.4 / 14.8 | 19.7 / 28.8 |
+
+### 全历史分页验证（每类完整遍历 n=1，不是单请求 P95）
+
+任务和消息分别核对完整 ID 集、跨页去重、稳定 anchor/total、消息 offset 连续，以及原 seed **每个字段值精确相等**（包括完整 result、stream_output、content；共享类型新增默认字段允许存在）。窗口/detail 内已返回的事件也核对原字段，只有 `RunEvent.data:null` 按已声明的 serde Option 语义允许省略，非 null payload 仍严格比较；脚本自测会拒绝截断。**完整 20k SSE 的独立门禁是连续 sequence/id 与数量验证，不是全部 payload 的逐字段 oracle。**任务选择从实际窗口之外的原 seed ID 集获得，不假定某个 ID 恰好位于窗口内。
+
+| 遍历 | 1,000 任务组 | 5,000 任务组 |
+| --- | ---: | ---: |
+| 所有 tasks | 1,000 条 / 13 页 / 2,491.9 ms | 5,000 条 / 63 页 / 7,246.1 ms |
+| 所有 messages | 2,000 条 / 25 页 / 3,149.6 ms | 10,000 条 / 200 页 / 4,710.0 ms |
+
+完整遍历总耗时包含 Python 的原 seed 校验与集合检查；逐页 HTTP 时间另记于 `page_requests`，不可将两者混合。每一页仍有 30 秒请求预算，整个多请求遍历另受每组 600 秒截止约束。Python 校验器持有 ID 集和至多一个会话的消息，**这不是 GUI、后台或进程树内存有界的证据**。只读 CLI history 各 3 次均仅返回一页，保留 total/has_more；没有自动积累所有历史。
+
+### 资源与仍未解决的启动边界
+
+| Linux daemon 资源 | 1,000 任务 | 5,000 任务 |
+| --- | ---: | ---: |
+| 空闲 CPU（单核=100%） | 2.00% | 3.49% |
+| 空闲窗口结束 RSS bytes | 46,026,752 | 32,432,128 |
+| 主测量进程生命周期 HWM bytes | 181,362,688 | 241,729,536 |
+
+HWM 比 v3 对照的 474,009,600 / 778,694,656 bytes 低，但本阶段操作集合不同、环境共享，不能当作严格单变量内存优化实验或固定内存上界；备份 CLI/恢复进程与 GUI 内存未计入。
+
+**启动仍有风险，不能称全部性能问题解决。** 5,000 组温热启动原始样本为 **7,153.3 / 6,836.4 / 5,701.6 ms**，其中 2/3 超过本候选 Native bridge 的 6 秒 `ensure_daemon` 等待值。这里由源代码截止值与 headless 实测作出桌面启动体验风险推断，**不是已运行 GUI 并复现其失败**；本脚本的 30 秒启动门禁全部通过。共享环境波动明显，也没有证明启动比 v3 更快；5,000 组 HTTP diagnostics P95 从 v3 的 86.3 ms 变为本轮 593.3 ms，同样保留较慢观察，不宣称所有指标更快或由本改动单因导致。全部记录为 completed-only，不能由低空闲 CPU/回放改善推断活动主任务领取成本恒定。
+
+### 通过 / 失败 / 未运行
+
+- **通过**：最终两组均 exit 0；6 次温热启动；6 次窗口、6 次单任务 HTTP、6 次任务第一页 HTTP；全部 6,000 个任务与 12,000 条消息的四次完整分页遍历；CLI status、窗口外 status/follow、history 单页、诊断各 6 次；6 次 128 回放、6 次完整 20k 回放；4 次备份/inspect、2 次真实业务类型恢复；两组重启后任务/消息旧游标共 4 次 409，新 epoch 改变；5,000 组被裁剪 SSE 游标仍 409；源 seed 和不可变历史摘要均不变。
+- **保留失败/限制**：原 baseline/v3 全部失败样本不变；旧 no-query snapshot 的 6 次 413 明确列出；桌面 6 秒启动等待风险未消除。首次 runner 自身错误及旧 CLI 候选数据保留但不混入本最终表。
+- **未运行**：本轮 GUI/WebView 测量、release、采样 profiler/严格消融、其他 OS RSS/性能、活动任务压力与真实模型；不把 parent 的独立联合测试当作本性能脚本测过的项目。
+
+### 原始证据、重跑与清理
+
+最终目录：`/workspace/scratch/ed5e723b0697/history-benchmark-v14-bounded/measured-final-cli/`。
+
+- `results.json` SHA-256：`d98a208808888a94119cc4093ca12a7bc23223acfe48021ff27ad54048afc79c`。
+- 归档/current `history_benchmark.py` SHA-256：`c272b76c045f809a8de85c10606823507fe31c1575ece31be36718d744d42dee`。
+- `final-binary-source.json`、`final-cli-run.log` 位于其父目录；每组 `progress.json`/daemon.log 和原始逐项样本保留，两组 daemon.lock 已验证释放。
+- `measured-reused-seeds/` 首次尝试因 runner 对终态 null 字段省略过严，以及 urllib HTTPError socket wrapper 层级错误而失败；已补确定性自测，未降低字节/时间上限。原 results SHA 为 `1598385e39214dd6c6ad2438dc64a70aaf882f9bcc36f4e02abccd9acf0f4322`，附 `runner-failure.json`，不作为产品失败或最终统计。
+- `measured-reused-seeds-final/` 是旧 CLI `88cdca0a…` 的完整通过候选，结果 SHA 为 `3ff8d4e4cf30397b759610095c82cb7d00fd968492f4e9958b5ce968284ac068`。其后独立 headless smoke 发现 --wait 超时输出问题，故使用新独立 CLI `90baca16…` 完整重测；旧样本加 `superseded-candidate.json`，没有混 hash。成功备份/restore 影像验证后立即删除；两轮已结束的重复 DB/seed 副本在核验锁释放与历史 hash 后清理，仅保留本轮数据及全部原始日志/结果；原四份 1e7d seed 不动。
+
+```sh
+python3 scripts/history_benchmark.py --bounded-history \
+  --daemon /absolute/history-final-frozen/target/debug/harness-daemon \
+  --cli /absolute/history-final-frozen/target/debug/self-agent-cli \
+  --source-commit '6f497bae + uncommitted reviewed v14 + CLI wait fix' \
+  --artifact-dir /absolute/new-private-bounded-results \
+  --seed-results /absolute/original/measured-20261028/results.json \
+  --seed-results /absolute/original/continued-20261028/results.json \
+  --profile long_session --profile large_history \
+  --samples 3 --startup-samples 3 --backup-samples 2 \
+  --timeout 30 --case-timeout 600 --keep-data
+```
+
+脚本 self-test、Python 编译与空白检查均通过。所有 SQLite 临时连接显式关闭并保留事务提交，避免 Windows self-test 清理时持有文件句柄；此处自测通过不等于已测 Windows 性能。

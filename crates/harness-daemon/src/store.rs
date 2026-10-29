@@ -18,6 +18,7 @@ mod continuation;
 mod decisions;
 pub(crate) mod execution;
 pub(crate) mod gateway;
+pub(crate) mod history;
 pub(crate) mod providers;
 pub(crate) mod qq;
 pub(crate) mod reliability;
@@ -1655,12 +1656,7 @@ fn task_active(task: &Value) -> bool {
 fn task_plan_dispatchable(db: &Connection, task: &Value) -> Result<bool> {
     if task["task_kind"] == "main" {
         let sequence = task["main_sequence"].as_u64().unwrap_or(0);
-        if rows(db, "tasks")?.iter().any(|other| {
-            other["task_kind"] == "main"
-                && other["session_id"] == task["session_id"]
-                && other["main_sequence"].as_u64().unwrap_or(0) < sequence
-                && task_active(other)
-        }) {
+        if scheduling::has_active_main_predecessor(db, text(task, "session_id")?, sequence)? {
             return Ok(false);
         }
     }

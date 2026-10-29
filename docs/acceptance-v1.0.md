@@ -59,3 +59,29 @@
 `03322fedc395c3b4d9e191dc4211c86e96261b44` 的 push `40795769321` / PR `40795775886` 均为 **5/6**：三平台 Desktop、Ubuntu/macOS Rust 成功；Windows Rust 的测试、Clippy、构建与 18 个 smoke 均通过，但最后 Python benchmark 自测清理 `copy.sqlite` 因未关闭连接报 WinError 32，整项仍失败。
 
 窄修复仅给四处 SQLite context 增加 `closing`，保留内部事务上下文的提交/回滚语义，不改运行产品、性能数据、断言或门限。本地 self-test、Python 编译及 tracked connection 检查通过（8 个连接全部显式关闭）；parent 只读窄审查通过。没有重跑无变更的 Rust/前端套件，Windows 实际结果等待此修复提交的精确 CI，不用本地结果冒充。
+
+## v14 有界历史：审查与实际联合回归
+
+独立源码审查的旧客户端伪窗口、遗漏元数据、远程动作目标回退、授权表单隐藏会话、404 路由缺失误报不存在、返回首面丢固定上界六类问题已修复，并有各自回归。Store 定向 **16**、真实 owner HTTP **3**、CLI **47** 通过；最新 Native 实际 history/event 模块及桥路由提取 **17** 通过，不是完整 Tauri/GUI。候选前端排除未接线更新/兼容模块后 **315**（38 文件）通过；Web 构建、实际 Vite 代理 **3 组**通过。
+
+新的固定 daemon/CLI 通过真实大历史 **3 组**联合 smoke：旧全量明确 413，窗口/分页/detail 各自守住字节预算；离窗任务 status/follow 保留原结果；全记录及消息按固定上界读取且不重复；超大记录显式 unavailable；重启旧游标拒绝且不重放。由真实响应生成的 fixture 再经当前 TypeScript parser 验证，含 `current_cursor` 和空请求窗口遗漏 metadata，没有手造 wire 替代。
+
+以上是定向与联合证据。候选全 Rust/Clippy/构建/19 个后台 smoke、原 1,000 / 5,000 seed 性能复测及新提交 CI 尚需单独追加，未完成前不记全量成功。真实 GUI、OS vault、真实模型/QQ、实际安装发布仍未运行。
+
+修复提交 `6f497bae825d71fa2ec5a1c4b5c4a659258c9e1b` 的 push `40798776743` / PR `40798784130` 已各 **6/6 成功**，包含原 Windows 自测失败步骤；这是 v3 基线修复的实际平台结果，不验证后续 v14 工作树。
+
+### v14 最终候选门禁
+
+独立归档候选排除未接线 lifecycle/update/compat：core **9** / daemon **623** / CLI **48** / gateway **17** 全量通过；fmt、全 targets Clippy `-D warnings`、daemon/CLI 构建通过。前端候选 **315/315**（38 文件）、TypeScript、Web 与 mobile 构建通过；既有 Web >500 kB chunk 警告保留。候选直接复用已安装的同 lockfile 工具执行，未把 pnpm 自动安装入口失败计为测试通过。
+
+最新固定二进制 **19 个后台 smoke 全部通过**；原生桥提取 **17**、实际 Web 代理 **3 组**和真实 wire 联合 parser 通过。首轮旧 headless smoke 检出 CLI --wait 到期丢失最后观察的回归；修复后 GET/sleep 共用总截止，超时返回最后权威状态或仅原任务 ID，新增 TCP 超时回归与完整 19 项重跑通过，未降低原断言。混合工作树曾因尚未接线的 update example 缺依赖导致 Clippy 失败；该未来 example 移出自动发现路径后，本候选全门禁重新通过，不借用失败结果。
+
+同 seed 正式性能与新提交精确 CI 另列；此处没有真实 GUI/全 Tauri 本地构建、OS vault、外部服务或安装发布通过声明。
+
+### v14 正式同 seed 容量复测
+
+原 1,000 / 5,000 completed-only seed、固定调试二进制、HTTP/CLI/SSE 30 秒预算下，正式两组均通过（exit 0）；原 seed SHA 与逻辑内容不变。窗口为 **913,091 / 2,577,762 bytes**，完整任务分别 **13/63 页**、消息 **25/200 页**，全 ID/offset 与原字段校验通过；离窗 status/follow 各组各 **3/3**，完整20k有序回放各 **3/3**，4次备份/inspect与2次独立恢复验证通过。原全量接口明确413仍保留，不能说全量40.6MB变小。
+
+5,000组HWM为 **241,729,536 bytes**；CPU/时延样本、n=1全遍历和原始哈希见 performance-v1.0，不外推普适容量。**剩余实测风险**：5,000组3次温启动约7.153/6.836/5.702秒，2次超过当前 Native bridge 6秒等待；将由后续真实 readiness/启动体验切片修复，不靠本30秒benchmark通过掩盖。诊断并非全面变快，GUI/安装与跨OS性能仍未测。
+
+正式结果 SHA-256：`d98a208808888a94119cc4093ca12a7bc23223acfe48021ff27ad54048afc79c`。精确完整哈希以 performance-v1.0 和实际归档结果为准，新提交 CI 发布后继续跟踪。

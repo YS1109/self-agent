@@ -15,6 +15,9 @@ function suggestedControls():TaskControls {const controls=normalizeExecutionCont
 export function QqBindingCard({binding,sessions,executor,disabled,onSubmit}:{binding:QqBinding;sessions:{id:string;title:string}[];executor:"native"|"codex";disabled:boolean;onSubmit:(command:QqCommand)=>Promise<unknown>}){
  const [selected,setSelected]=useState<string[]>([]),[permissions,setPermissions]=useState<QqPermissions>({...EMPTY_QQ_PERMISSIONS}),[controls,setControls]=useState<TaskControls>(suggestedControls),[days,setDays]=useState(1),[confirmed,setConfirmed]=useState(false),[revoke,setRevoke]=useState(false);
  useEffect(()=>{setSelected([]);setPermissions({...EMPTY_QQ_PERMISSIONS});setControls(suggestedControls());setConfirmed(false);setRevoke(false);},[binding.principal_id,binding.revision]);
+ const missingSelected=selected.filter(id=>!sessions.some(session=>session.id===id));
+ const selectionKey=selected.join("\0"),missingKey=missingSelected.join("\0");
+ useEffect(()=>setConfirmed(false),[selectionKey,missingKey]);
  const now=Date.now(),expired=binding.expires_at_ms<=now,group=binding.identity.kind==="group";
  const inputAfter=binding.input_after_ms||binding.updated_at_ms+30000;
  const grant:QqGrant={session_ids:selected,permissions,controls,expires_at_ms:now+days*86400000};
@@ -24,15 +27,17 @@ export function QqBindingCard({binding,sessions,executor,disabled,onSubmit}:{bin
  <dl><dt>应用 AppID</dt><dd>{binding.identity.app_id}</dd><dt>用户 OpenID</dt><dd>{binding.identity.sender_open_id}</dd><dt>{group?"群 OpenID":"单聊目标"}</dt><dd>{binding.identity.target_id}</dd><dt>修订</dt><dd>{binding.revision}</dd></dl>
  <p className="help-text">OpenID 仅在对应应用和对话范围内解释，不是 QQ 号；显示名或群管理员身份不会获得本地权限。</p>
  {binding.status==="pending"&&!expired&&<>
+ {selected.length>0&&<section aria-label="已选固定会话范围"><strong>已选会话（固定 ID）</strong>{selected.map(id=><p key={id}><code>{id}</code> · {sessions.find(session=>session.id===id)?.title??"未载入当前窗口"}<button disabled={disabled} onClick={()=>setSelected(ids=>ids.filter(value=>value!==id))}>明确移除此选择</button></p>)}</section>}
+ {missingSelected.length>0&&<p role="alert">已选会话有 {missingSelected.length} 项未载入当前窗口；未删除或改选。确认已清除，必须重新载入或显式移除这些选择后再核对授权。</p>}
  <fieldset disabled={disabled}><legend>明确选择会话（最多 32 个）</legend>{sessions.map(session=><label key={session.id} className="qq-check"><input type="checkbox" checked={selected.includes(session.id)} onChange={e=>setSelected(e.target.checked?[...selected,session.id]:selected.filter(id=>id!==session.id))}/>{session.title} <small>{session.id}</small></label>)}</fieldset>
  <fieldset disabled={disabled}><legend>远端允许的操作（默认全部拒绝）</legend>{(Object.keys(ACTIONS) as (keyof QqPermissions)[]).filter(key=>group||key!=="share_group_results").map(key=><label key={key} className="qq-check"><input type="checkbox" checked={permissions[key]} onChange={e=>setPermissions({...permissions,[key]:e.target.checked})}/>{ACTIONS[key]}</label>)}</fieldset>
  {group&&<p className="execution-warning">群内回复会被其他成员看到。即使只绑定一名成员，也不能把群聊当成该成员的私人收件箱。</p>}
  <label>授权有效期（1–30 天）<input type="number" min={1} max={30} step={1} value={days} disabled={disabled} onChange={e=>setDays(Number(e.target.value))}/></label>
  <ExecutionSettings value={controls} onChange={setControls} executor={executor} disabled={disabled} scope="role"/>
  <p className="help-text">这些限制只会收紧本机策略。Codex 不支持的逐工具限制不会被自动清空；动作审批仍必须在本机完成。</p>
- <label className="qq-check"><input type="checkbox" checked={confirmed} disabled={disabled} onChange={e=>setConfirmed(e.target.checked)}/>我已核对 AppID、用户、具体对话和以上范围</label>
+ <label className="qq-check"><input type="checkbox" checked={confirmed} disabled={disabled||missingSelected.length>0} onChange={e=>setConfirmed(e.target.checked)}/>我已核对 AppID、用户、具体对话和以上范围</label>
  {error&&<p className="help-text">{error}</p>}
- <Button disabled={disabled||!confirmed||Boolean(error)} onClick={()=>void onSubmit(command)}>确认此身份与范围</Button>
+ <Button disabled={disabled||!confirmed||Boolean(error)||missingSelected.length>0} onClick={()=>{if(disabled||!confirmed||error||missingSelected.length)return;setConfirmed(false);void onSubmit(command);}}>确认此身份与范围</Button>
  </>}
  {binding.status==="active"&&!expired&&now<=inputAfter&&<p className="execution-warning">绑定已确认，正在等待安全接收窗口。仅接受平台时间晚于 {clockLabel(inputAfter)} 的新消息；对齐时钟下约等待 30 秒。等待期间发送的旧消息不会在之后自动执行，届时请发新消息。</p>}
  {binding.status==="active"&&!expired&&<p className="help-text">已授权 {binding.grant?.session_ids.length??0} 个初始会话，有效至 {new Date(binding.expires_at_ms).toLocaleString()}。修改范围请先撤销并重新配对。</p>}

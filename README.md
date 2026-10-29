@@ -229,3 +229,7 @@ docs/                     产品计划和当前协议
 独立 `harness-gateway` 仅保存设备认证目录；daemon 保持本机管理端口并主动建立认证 WSS。H5 只获得本机确认的会话/动作/任务限制，不能代理管理令牌、批准工具操作或下载任意工作区文件。任务与回执仍在 daemon SQLite，离线不排队、未知结果不自动重发；网关重启后浏览器必须重新配对。
 
 构建 H5：`pnpm build:mobile`；网关运行与用户自备 nginx HTTPS 示例见 [网关说明](crates/harness-gateway/README.md) 和 `deploy/nginx-gateway.conf.example`。桌面设置与 `self-agent-cli gateway` 管理配对/撤权和独立系统凭据意图。当前仅完成本地协议夹具检查，最终门禁与未运行项见 [0.10 验收](docs/acceptance-v0.10.md)；没有实际公网部署、证书或真实凭据测试。
+
+## 有界历史读取（开发分支）
+
+当前工作区窗口与历史页见 [协议 v14](docs/protocol-v14.md)：保留完整历史记录，显式标明遗漏；CLI 单任务查询不再下载全量快照，分页返回固定上界与重启重置信息。原无 query 快照保持全量语义，超预算明确拒绝。实际同 seed 性能与未验证边界见 [性能记录](docs/performance-v1.0.md) 和 [1.0 验收](docs/acceptance-v1.0.md)，不代表生产发布或真实 GUI 已完成。

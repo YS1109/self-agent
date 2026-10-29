@@ -13,3 +13,5 @@
 - 0.10 自托管网关/H5 合同见 `docs/protocol-v11.md`，联合门禁与未验证范围见 `docs/acceptance-v0.10.md`。远端仅经白名单 RPC 与本机作用域授权；不得复用 owner bearer、自动重发未知命令、提供任意路径下载或把观察结果误记为已投递。gateway schema 由显式 v2 ledger 管理，恢复必须撤销其配置/配对/凭据与回执权威。
 
 - 有索引调度与 schema v3 见 `docs/protocol-v13.md`，长历史真实失败和同 seed 对照见 `docs/performance-v1.0.md`；分页尚未接线前，不能把空闲 CPU/回放改善当成大快照容量通过。
+
+- 有界工作区/历史读取见 `docs/protocol-v14.md`。新客户端显式 `snapshot?window=1`，不得把局部数组当全集、离窗 ID 当不存在或自动换成其它动作目标；返回/刷新首页复用 `current_cursor`，只有明确重新读取首页才建立新上界。旧无 query 快照保留全量语义或显式失败。

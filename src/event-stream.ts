@@ -1,5 +1,6 @@
 import type { RunEvent, Snapshot } from "./types";
 import { validCursor } from "./event-state";
+import { readBoundedJson } from "./bounded-json";
 
 export type StreamMessage =
   | { type: "event"; event: RunEvent; delivery_id?: number }
@@ -85,9 +86,9 @@ async function browserStream(after: number, signal: AbortSignal, deliver: (messa
     if (!signal.aborted && state !== next) { state = next; deliver({ type: "status", state: next, message }); }
   };
   const restore = async () => {
-    const response = await fetch("/api/v1/snapshot", { signal, cache: "no-store" });
+    const response = await fetch("/api/v1/snapshot?window=1", { signal, cache: "no-store" });
     if (!response.ok) throw new Error("无法恢复后台快照");
-    const snapshot = await response.json() as Snapshot;
+    const snapshot = await readBoundedJson(response, 12 * 1024 * 1024, signal) as Snapshot;
     if (!validCursor(snapshot.event_cursor)) throw new Error("后台快照不支持事件游标");
     if (signal.aborted) return;
     deliver({ type: "snapshot", snapshot, reset: snapshot.event_cursor < cursor });

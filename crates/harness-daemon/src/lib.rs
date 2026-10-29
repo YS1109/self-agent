@@ -7,6 +7,7 @@ mod continuation;
 mod coordinator;
 mod execution_control;
 mod gateway;
+mod history_api;
 pub mod maintenance;
 mod model_config;
 mod models;
@@ -201,6 +202,8 @@ pub struct AppState {
     pub capability_probe_gate: Arc<Semaphore>,
     pub(crate) storage_lease: Option<Arc<maintenance::DataLease>>,
     pub(crate) backup_gate: Arc<Semaphore>,
+    pub(crate) history_epoch: String,
+    pub(crate) history_gate: Arc<Semaphore>,
     pub(crate) gateway_stop: tokio::sync::watch::Sender<bool>,
     pub(crate) gateway_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) qq_stop: tokio::sync::watch::Sender<bool>,
@@ -276,6 +279,8 @@ impl AppState {
             capability_probe_gate: Arc::new(Semaphore::new(2)),
             storage_lease,
             backup_gate: Arc::new(Semaphore::new(2)),
+            history_epoch: new_id(),
+            history_gate: Arc::new(Semaphore::new(2)),
             gateway_stop: tokio::sync::watch::channel(false).0,
             gateway_worker: Mutex::new(None),
             qq_stop: tokio::sync::watch::channel(false).0,
@@ -323,7 +328,7 @@ impl AppState {
 
 pub fn router(state: Arc<AppState>) -> Router {
     let private = Router::new()
-        .route("/api/v1/snapshot", get(snapshot))
+        .merge(history_api::routes())
         .merge(capabilities::credential_api::routes())
         .merge(reliability::api::routes())
         .merge(gateway::api::routes())
@@ -454,11 +459,6 @@ async fn resolve_cleanup(
         .unwrap()
         .resolve_execution_cleanup(&task_id, &request.expected_updated_at)?;
     state.wake.notify_waiters();
-    Ok(Json(result))
-}
-
-async fn snapshot(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
-    let result = state.store.lock().unwrap().snapshot()?;
     Ok(Json(result))
 }
 

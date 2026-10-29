@@ -1,3 +1,5 @@
+#[path = "history.rs"]
+mod history;
 use crate::event_stream::{self, Sink, Subscriptions};
 use harness_core::{data_dir, DaemonInfo};
 use reqwest::{Client, Method, Url};
@@ -161,7 +163,16 @@ pub async fn api_request(
     body: Option<Value>,
 ) -> Result<Value, String> {
     let method = validate_route(&method, &path)?;
-    let info = bridge.ensure_daemon(&app).await?;
+    let bounded = (method == Method::GET)
+        .then(|| history::limit(&path))
+        .flatten();
+    let info = bridge.ensure_daemon(&app).await.map_err(|error| {
+        if bounded.is_some() {
+            "HISTORY_UNAVAILABLE".into()
+        } else {
+            error
+        }
+    })?;
     let base = validate_base_url(&info.base_url)?;
     let url = base
         .join(&path)
@@ -174,24 +185,15 @@ pub async fn api_request(
         request = request.json(&body);
     }
     // A failed mutation is never retried here: callers reuse their command ID.
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("无法连接本机后台服务：{error}"))?;
-    let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|_| "后台服务返回的数据格式无效".to_string())?;
-    if status.is_success() {
-        Ok(value)
-    } else {
-        Err(value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("后台服务拒绝了此请求")
-            .to_string())
-    }
+    let response = request.send().await.map_err(|_| {
+        if bounded.is_some() {
+            "HISTORY_UNAVAILABLE"
+        } else {
+            "无法连接本机后台服务"
+        }
+        .to_owned()
+    })?;
+    history::response(response, bounded).await
 }
 
 async fn read_daemon_info() -> Result<DaemonInfo, String> {
@@ -337,6 +339,9 @@ fn reliability_route(method: &str, path: &str) -> bool {
 }
 
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
+    if method == "GET" && history::limit(path).is_some() {
+        return Ok(Method::GET);
+    }
     if reliability_route(method, path) {
         return Ok(if method == "GET" {
             Method::GET
@@ -484,8 +489,32 @@ mod tests {
     }
 
     #[test]
+    fn history_routes_are_owner_get_only() {
+        for path in [
+            "/api/v1/tasks/t",
+            "/api/v1/history/tasks?session_id=s&cursor=c",
+            "/api/v1/history/sessions/s/messages?cursor=c",
+        ] {
+            assert!(validate_route("GET", path).is_ok());
+            for method in ["POST", "PUT", "DELETE", "PATCH"] {
+                assert!(validate_route(method, path).is_err());
+            }
+        }
+        for path in [
+            "/api/v1/history/tasks?cursor=a&cursor=b",
+            "/api/v1/tasks/a%2fb",
+            "/api/v1/history/tasks?owner=providers",
+            "/api/v1/history/qq",
+        ] {
+            assert!(validate_route("GET", path).is_err());
+        }
+    }
+
+    #[test]
     fn bridge_accepts_only_known_method_and_route_pairs() {
         assert!(validate_route("GET", "/api/v1/snapshot").is_ok());
+        assert!(validate_route("GET", "/api/v1/snapshot?window=1").is_ok());
+        assert!(validate_route("GET", "/api/v1/snapshot?window=2").is_err());
         let id = "94a846e4-7ac2-46d7-ac1d-fde573fd6e12";
         assert!(validate_route("GET", "/api/v1/providers").is_ok());
         assert!(validate_route("POST", "/api/v1/providers/commands").is_ok());

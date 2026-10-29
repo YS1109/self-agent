@@ -70,6 +70,25 @@ pub(super) fn queued_tasks(db: &Connection) -> Result<Vec<Value>> {
     collect(db, QUEUED_TASKS)
 }
 
+pub(super) fn has_active_main_predecessor(
+    db: &Connection,
+    session_id: &str,
+    sequence: u64,
+) -> Result<bool> {
+    // Filter on the trusted status index before decoding. Keep sequence
+    // comparisons in serde/u64 rather than SQLite floating-point conversion,
+    // preserving exact legacy values even above 2^53.
+    let mut statement = db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.status') IN ('queued','running','waiting_input','paused') AND json_extract(body,'$.task_kind')='main' AND json_extract(body,'$.session_id')=?1")?;
+    let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
+    for body in rows {
+        let task: Value = serde_json::from_str(&body?)?;
+        if task["main_sequence"].as_u64().unwrap_or(0) < sequence {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn pending_jobs(db: &Connection) -> Result<Vec<Value>> {
     collect(db, "SELECT body FROM coordinator_jobs WHERE json_extract(body,'$.status')='pending' ORDER BY json_extract(body,'$.created_at'),rowid")
 }
@@ -138,6 +157,29 @@ mod tests {
         assert!(statement.get_status(StatementStatus::VmStep) < 100);
         assert!(queued_tasks(&db).unwrap().is_empty());
     }
+    #[test]
+    fn serial_predecessor_ignores_history_and_preserves_exact_large_sequences() {
+        let db = fixture();
+        let put_task = |id: &str, status: &str, session: &str, sequence: u64| {
+            let body = json!({"id":id,"status":status,"task_kind":"main","session_id":session,"main_sequence":sequence,"created_at":"same"});
+            db.execute(
+                "INSERT OR REPLACE INTO tasks(id,body) VALUES(?1,?2)",
+                params![id, body.to_string()],
+            )
+            .unwrap();
+        };
+        for n in 0..5000 {
+            put_task(&n.to_string(), "completed", "current", 0);
+        }
+        put_task("other", "running", "other", 0);
+        assert!(!has_active_main_predecessor(&db, "current", u64::MAX).unwrap());
+        put_task("same", "waiting_input", "current", u64::MAX - 1);
+        assert!(!has_active_main_predecessor(&db, "current", u64::MAX - 1).unwrap());
+        assert!(has_active_main_predecessor(&db, "current", u64::MAX).unwrap());
+        put_task("same", "failed", "current", u64::MAX - 1);
+        assert!(!has_active_main_predecessor(&db, "current", u64::MAX).unwrap());
+    }
+
     #[test]
     fn selection_order_and_terminal_filters_match_scheduler_semantics() {
         let db = fixture();

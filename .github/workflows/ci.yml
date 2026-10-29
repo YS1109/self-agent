@@ -46,6 +46,7 @@ jobs:
       - run: python scripts/qq_smoke.py
       - run: python scripts/gateway_smoke.py
       - run: python scripts/reliability_smoke.py
+      - run: python scripts/history_smoke.py
       - run: python scripts/history_benchmark.py --self-test
 
   desktop:

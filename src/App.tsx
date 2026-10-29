@@ -1,5 +1,7 @@
 import {GatewaySettings} from "./components/gateway-settings";
 import {EMPTY_GATEWAY} from "./gateway-client";
+import { HistoryBrowser, HistoryTaskView } from "./components/history-browser";
+import type { HistoryKind } from "./history-client";
 import { ReliabilitySettings } from "./components/reliability-settings";
 import {QqSettings} from "./components/qq-settings";
 import {EMPTY_QQ} from "./qq-client";
@@ -52,7 +54,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient, qqClient, qqCredentialClient, gatewayClient, gatewayCredentialClient, reliabilityClient } from "./api";
+import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient, qqClient, qqCredentialClient, gatewayClient, gatewayCredentialClient, reliabilityClient, historyClient } from "./api";
 import { useDaemonSnapshot } from "./use-daemon-snapshot";
 import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
 import { TaskSupplements, ContinueTask } from "./components/task-controls";
@@ -77,7 +79,7 @@ import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./la
 import { Button } from "./components/ui/button";
 import { Select } from "./components/ui/select";
 import { agentModelLabel } from "./agent-model";
-import { discardCleanPlanDraft, hasUnsavedPlanDraft, selectedSessionPlan, updatePlanLayouts, type PlanDraft, type PlanLayoutDraft } from "./plan-state";
+import { discardCleanPlanDraft, hasUnsavedPlanDraft, updatePlanLayouts, type PlanDraft, type PlanLayoutDraft } from "./plan-state";
 import {
   activeTask,
   DESKTOP_SOURCE,
@@ -91,7 +93,7 @@ import {
 } from "./types";
 
 type Panel = "plan" | "changes" | "artifacts" | "task";
-type Modal = "new" | "settings" | "remote" | "capabilities" | "providers" | "qq" | "gateway" | "reliability" | null;
+type Modal = "new" | "settings" | "remote" | "capabilities" | "providers" | "qq" | "gateway" | "reliability" | "history" | null;
 const time = (value: string) =>
   new Date(value).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -211,12 +213,14 @@ function EmptyPanel({
 }
 
 export default function App() {
-  const { snapshot, connected, checked, connectionError, eventStatus, refresh } = useDaemonSnapshot();
+  const { snapshot, connected, checked, connectionError, eventStatus, recovering, refresh } = useDaemonSnapshot();
   const registry = snapshot.managed_capabilities ?? EMPTY_CAPABILITIES;
   const providers = snapshot.named_providers ?? EMPTY_PROVIDERS;
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState<Modal>(null);
+  const [historyKind, setHistoryKind] = useState<HistoryKind>("sessions");
+  const openHistory = (kind: HistoryKind) => { setHistoryKind(kind); setModal("history"); };
   const [sidebar, setSidebar] = useState(() => window.innerWidth > 760);
   const [panel, setPanel] = useState<Panel | null>(null);
   const [activity, setActivity] = useState(false);
@@ -262,20 +266,28 @@ export default function App() {
   const [remoteReceipt, setRemoteReceipt] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const followScroll = useRef(true);
-  const sessionId = snapshot.selections.find((s) =>
-    sameSource(s.source, DESKTOP_SOURCE),
-  )?.session_id;
+  const desktopSelection = snapshot.selections.find(s => sameSource(s.source, DESKTOP_SOURCE));
+  const selectionUnknown = !desktopSelection && !!snapshot.history?.collections.selections?.has_more;
+  const previousSelection = useRef<{ epoch?: string; id?: string }>({});
+  if (previousSelection.current.epoch !== snapshot.history?.anchor) previousSelection.current = { epoch: snapshot.history?.anchor };
+  if (desktopSelection) previousSelection.current.id = desktopSelection.session_id;
+  else if (!selectionUnknown) previousSelection.current.id = undefined;
+  const sessionId = desktopSelection?.session_id ?? (selectionUnknown ? previousSelection.current.id : undefined);
   const currentSessionId = useRef(sessionId);
   currentSessionId.current = sessionId;
-  const session = snapshot.sessions.find((s) => s.id === sessionId);
+  const session = selectionUnknown ? undefined : snapshot.sessions.find((s) => s.id === sessionId);
+  const messageWindow = sessionId ? snapshot.history?.session_messages[sessionId] : undefined;
+  const incomplete = Object.values(snapshot.history?.collections ?? {}).some(meta => meta.has_more);
+  const pendingUnloaded = snapshot.history?.collections.execution_requests?.pending ?? 0;
   const tasks = snapshot.tasks.filter((t) => t.session_id === sessionId);
   const plans = (snapshot.plans ?? []).filter((p) => p.session_id === sessionId);
-  const selectedPlan = selectedSessionPlan(snapshot.plans, sessionId, planIds);
+  const explicitPlanId = sessionId ? planIds[sessionId] : undefined;
+  const selectedPlan = explicitPlanId ? plans.find(plan => plan.id === explicitPlanId) : plans[0];
   const planId = selectedPlan?.id;
   const selectPlan = (id: string) => {
     if (sessionId) setPlanIds((current) => ({ ...current, [sessionId]: id }));
   };
-  const selectedTask = tasks.find((t) => t.id === taskId) ?? tasks[0];
+  const selectedTask = taskId ? tasks.find((t) => t.id === taskId) : tasks[0];
   const running = snapshot.tasks.filter(
     (t) => t.task_kind !== "plan" && ["queued", "running"].includes(t.status),
   );
@@ -292,12 +304,18 @@ export default function App() {
   const events = snapshot.events.filter(
     (e) => !sessionId || e.session_id === sessionId,
   );
-  const remoteSelection =
-    snapshot.selections.find((s) => sameSource(s.source, remoteSource))
-      ?.session_id ?? "";
-  const remoteKey = `${remoteSource.channel_id}:${remoteSource.actor_id}:${remoteSource.conversation_id}:${remoteSelection}`;
-  const remotePlans = snapshot.plans.filter((item) => item.session_id === remoteSelection);
-  const remotePlan = remotePlans.find((item) => item.id === remotePlanIds[remoteKey]) ?? remotePlans[0];
+  const remoteSourceKey = `${remoteSource.channel_id}:${remoteSource.actor_id}:${remoteSource.conversation_id}`;
+  const remoteSelectionRow = snapshot.selections.find(s => sameSource(s.source, remoteSource));
+  const remoteSelectionUnknown = !remoteSelectionRow && !!snapshot.history?.collections.selections?.has_more;
+  const previousRemoteSelections = useRef<{ epoch?: string; ids: Record<string, string> }>({ ids: {} });
+  if (previousRemoteSelections.current.epoch !== snapshot.history?.anchor) previousRemoteSelections.current = { epoch: snapshot.history?.anchor, ids: {} };
+  if (remoteSelectionRow) previousRemoteSelections.current.ids[remoteSourceKey] = remoteSelectionRow.session_id;
+  else if (!remoteSelectionUnknown) delete previousRemoteSelections.current.ids[remoteSourceKey];
+  const remoteSelection = remoteSelectionRow?.session_id ?? (remoteSelectionUnknown ? previousRemoteSelections.current.ids[remoteSourceKey] ?? "" : "");
+  const remoteKey = `${remoteSourceKey}:${remoteSelection}`;
+  const remotePlans = snapshot.plans.filter(item => item.session_id === remoteSelection);
+  const explicitRemotePlanId = remotePlanIds[remoteKey];
+  const remotePlan = remoteSelectionUnknown ? undefined : explicitRemotePlanId ? remotePlans.find(item => item.id === explicitRemotePlanId) : remotePlans[0];
   const remoteMode = inputModes[remoteKey] ?? "goal";
   const currentRemoteText = remoteDrafts[remoteKey] ?? "";
   const changeable = (status?: string) => !!status && ["draft", "running", "paused", "reviewing", "waiting_input"].includes(status);
@@ -468,7 +486,7 @@ export default function App() {
     }
   }
   async function remoteSend(run: boolean) {
-    if (!currentRemoteText.trim() || !remoteSelection) return;
+    if (!currentRemoteText.trim() || !remoteSelection || remoteSelectionUnknown) return;
     if (!run && remoteMode === "change" && (!remotePlan || !changeable(remotePlan.status))) return;
     const key = remoteKey;
     const receipt = await command(
@@ -534,8 +552,9 @@ export default function App() {
         </Button>
         <div className="sidebar-section">
           <span>工作空间</span>
-          <span className="count-label">{snapshot.sessions.length}</span>
+          <span className="count-label">{snapshot.sessions.length}{snapshot.history && ` / ${snapshot.history.collections.sessions?.total ?? snapshot.sessions.length}`}</span>
         </div>
+        <Button variant="ghost" onClick={() => openHistory("sessions")}>浏览完整历史（分页）</Button>
         <nav className="session-list">
           {groups.map((path) => (
             <div className="project-group" key={path}>
@@ -642,7 +661,7 @@ export default function App() {
             )}
             <span className="breadcrumb">工作空间</span>
             <ChevronRight size={12} />
-            <strong>{session?.title ?? "新的开始"}</strong>
+            <strong>{session?.title ?? (sessionId || selectionUnknown ? "所选会话尚未载入" : "新的开始")}</strong>
             {session && (
               <span className="project-chip">
                 <Folder size={12} />
@@ -689,13 +708,18 @@ export default function App() {
             </button>
           </div>
         )}
+        {recovering && <p className="help-text" role="status">实时窗口已达到缓存预算，正在获取权威快照；未继续拼接缺失的回复增量。</p>}
+        {incomplete && <section className="help-text" aria-label="历史窗口提示"><p>这里只显示有界最近窗口，不是完整历史。已载入任务 {snapshot.tasks.length} / {snapshot.history?.collections.tasks?.total ?? snapshot.tasks.length}；未载入的活动任务 {snapshot.history?.collections.tasks?.pending ?? 0}。</p><Button size="small" variant="ghost" onClick={() => openHistory("tasks")}>分页查看任务历史</Button></section>}
+        {pendingUnloaded > 0 && <p role="status">还有 {pendingUnloaded} 条待处理问题或授权未载入，不能视为没有待批准。<button onClick={() => openHistory("execution_requests")}>只读查看问题与授权历史</button></p>}
         <div className="main-content">
           <div className="conversation">
             <div className="conversation-scroll" ref={scrollRef} onScroll={() => {
               const area = scrollRef.current;
               if (area) followScroll.current = area.scrollHeight - area.scrollTop - area.clientHeight < 100;
             }}>
-              {!session ? (
+              {!session && (sessionId || selectionUnknown) ? (
+                <section className="conversation-empty"><h2>{selectionUnknown ? "当前会话选择未载入" : "所选会话未载入当前窗口"}</h2><p>没有切换到其他会话，也不把窗口缺失解释为会话不存在。请显式选择历史会话或刷新。</p>{sessionId && <code>{sessionId}</code>}<Button onClick={() => openHistory("sessions")}>浏览并选择会话</Button><Button variant="ghost" onClick={() => void refresh()}>只读刷新</Button></section>
+              ) : !session ? (
                 <section className="welcome">
                   <div className="welcome-emblem">
                     <Waypoints size={36} strokeWidth={1.3} />
@@ -764,7 +788,8 @@ export default function App() {
                       · 主智能体 会话
                     </span>
                   </div>
-                  {!session.messages.length && !tasks.length && (
+                  {messageWindow && (messageWindow.has_more_before || !!messageWindow.unavailable?.length) && <section className="help-text" aria-label="消息窗口提示"><p>当前载入 {session.messages.length} / {messageWindow.total} 条消息，起始位置 {messageWindow.offset}；更早或超限内容未载入，不表示历史丢失。</p><Button size="small" variant="ghost" onClick={() => openHistory("messages")}>分页查看更早消息</Button></section>}
+                  {!session.messages.length && !tasks.length && !(messageWindow?.total || snapshot.history?.collections.tasks?.has_more) && (
                     <div className="conversation-empty">
                       <Sparkles size={20} />
                       <p>准备好了，告诉我你的目标。</p>
@@ -974,7 +999,7 @@ export default function App() {
                   <X size={15} />
                 </button>
               </div>
-              {panel === "plan" ? (
+              {panel === "plan" && explicitPlanId && !selectedPlan ? <div className="task-detail"><p>已选择的计划 {explicitPlanId} 未载入当前窗口；未切换或覆盖其草稿。</p><Button onClick={() => openHistory("plans")}>只读浏览计划历史</Button></div> : panel === "plan" ? (
                 <PlanPanel
                   plans={plans} selectedId={planId} onSelect={selectPlan}
                   connected={connected} busy={busy} onCommand={command}
@@ -982,6 +1007,8 @@ export default function App() {
                   drafts={planDrafts} setDrafts={setPlanDrafts}
                   layouts={planLayouts} setLayouts={setPlanLayouts}
                 />
+              ) : taskId && !selectedTask ? (
+                <div className="task-detail"><p>已选任务未载入当前窗口；仍使用固定目标 {taskId}，不会静默切换其他任务。</p><HistoryTaskView key={`${snapshot.history?.anchor ?? "legacy"}:${taskId}`} client={historyClient} id={taskId} onClose={() => setPanel(null)} onCommand={command} disabled={busy || !connected} /></div>
               ) : panel === "changes" ? (
                 selectedTask ? <TaskChanges key={selectedTask.id} task={selectedTask} connected={connected} /> : <EmptyPanel icon={<FileCode2 />} title="代码更改" detail="选择一个任务后读取其只读改动报告。" />
               ) : panel === "artifacts" ? (
@@ -1139,6 +1166,7 @@ export default function App() {
                 <X size={14} />
               </Button>
             </div>
+            <p className="help-text">本地最近事件窗口（最多300条、2 MiB），不是完整执行历史；任务详情可读取后台保留记录。</p>
             <div className="activity-lines">
               {events.length ? (
                 events.slice(-80).map((event) => (
@@ -1150,7 +1178,7 @@ export default function App() {
                 ))
               ) : (
                 <div className="activity-empty">
-                  尚无执行记录。任务启动后会在这里显示真实事件。
+                  当前事件窗口没有可展示记录，不代表完整历史没有执行记录。
                 </div>
               )}
             </div>
@@ -1182,6 +1210,9 @@ export default function App() {
         </footer>
       </main>
 
+      <ModalFrame open={modal === "history"} onClose={() => setModal(null)} title="历史浏览" description="只读分页与固定任务详情；不把旧消息合并进实时对话。" wide>
+        {modal === "history" && <HistoryBrowser open client={historyClient} sessionId={sessionId} epoch={snapshot.history?.anchor} initialKind={historyKind} onClose={() => setModal(null)} onCommand={command} disabled={busy || !connected} onSelectSession={async id => { const receipt = await command({ type: "select_session", session_id: id }); if (receipt) setTaskId(undefined); else throw new Error("选择未确认"); }} />}
+      </ModalFrame>
       <ModalFrame
         error={notice}
         open={modal === "new"}
@@ -1442,18 +1473,20 @@ export default function App() {
                     remoteSource,
                   )
                 }
-                options={[{ value: "", label: "请选择会话" }, ...snapshot.sessions.map((item) => ({ value: item.id, label: item.title }))]}
+                options={[{ value: "", label: remoteSelectionUnknown ? "后台选择尚未载入" : "请选择会话" }, ...(remoteSelection && (remoteSelectionUnknown || !snapshot.sessions.some(item => item.id === remoteSelection)) ? [{value:remoteSelection,label:`${remoteSelectionUnknown ? "上次选择待确认" : "已选会话未载入"} · ${remoteSelection}`,disabled:true}] : []), ...snapshot.sessions.filter(item => !(remoteSelectionUnknown && item.id === remoteSelection)).map((item) => ({ value: item.id, label: item.title }))]}
               />
             </label>
             <p className="help-text">
-              独立于桌面会话选择。任务保存派发时的回传位置。
+              独立于桌面会话选择。任务保存派发时的回传位置。下拉框只列当前窗口，不代表完整会话列表。
             </p>
+            {remoteSelectionUnknown && <p role="status">此远程入口的会话选择尚未载入；保留上次目标与草稿，未切换其他会话。请只读刷新或显式重新选择会话；暂不发送。</p>}
+            {explicitRemotePlanId && !remotePlan && <p role="status">所选计划 {explicitRemotePlanId} 未载入当前窗口；保留原目标和草稿，不会自动改成其他计划。暂不补充或暂停，请刷新或显式选择目标。</p>}
             <div className="instruction-scope remote-instruction-scope">
-              <label>指令用途<Select aria-label="远程指令用途" value={remoteMode} onValueChange={(value) => setInputModes((current) => ({ ...current, [remoteKey]: value as "goal" | "change" }))}
+              <label>指令用途<Select aria-label="远程指令用途" value={remoteMode} onValueChange={(value) => { setInputModes((current) => ({ ...current, [remoteKey]: value as "goal" | "change" })); if (value === "change" && remotePlan && !explicitRemotePlanId) setRemotePlanIds(current => ({...current,[remoteKey]:remotePlan.id})); }}
                 options={[{ value: "goal", label: "新目标" }, { value: "change", label: "补充当前计划" }]}
               /></label>
-              <label>目标计划<Select aria-label="远程目标计划" value={remotePlan?.id ?? ""} onValueChange={(value) => setRemotePlanIds((current) => ({ ...current, [remoteKey]: value }))}
-                options={remotePlans.length ? remotePlans.map((item) => ({ value: item.id, label: `${item.title} · v${item.revision}` })) : [{ value: "", label: "暂无计划" }]}
+              <label>目标计划<Select aria-label="远程目标计划" value={explicitRemotePlanId ?? remotePlan?.id ?? ""} disabled={remoteSelectionUnknown} onValueChange={(value) => setRemotePlanIds((current) => ({ ...current, [remoteKey]: value }))}
+                options={[...(explicitRemotePlanId && !remotePlans.some(item => item.id === explicitRemotePlanId) ? [{value:explicitRemotePlanId,label:`未载入计划 ${explicitRemotePlanId}`,disabled:true}] : []), ...(remotePlans.length ? remotePlans.map((item) => ({ value: item.id, label: `${item.title} · v${item.revision}` })) : [{ value: "", label: remoteSelectionUnknown || snapshot.history?.collections.plans?.has_more ? "计划尚未载入" : "暂无计划" }])]}
               /></label>
             </div>
             {remotePlan && <div className="remote-plan-progress">
@@ -1468,7 +1501,7 @@ export default function App() {
               className="remote-input"
               aria-label="远程指令内容"
               value={currentRemoteText}
-              onChange={(e) => setRemoteDrafts((current) => ({ ...current, [remoteKey]: e.target.value }))}
+              onChange={(e) => { setRemoteDrafts((current) => ({ ...current, [remoteKey]: e.target.value })); if (remoteMode === "change" && remotePlan && !explicitRemotePlanId) setRemotePlanIds(current => ({...current,[remoteKey]:remotePlan.id})); }}
               placeholder={remoteMode === "change" ? "补充对此计划的要求，生成调整建议后审阅应用…" : "模拟手机或通讯工具发来的新目标…"}
               rows={4}
             />
@@ -1476,7 +1509,7 @@ export default function App() {
               <Button
                 size="small"
                 disabled={
-                  !connected || busy || !remoteSelection || !currentRemoteText.trim() || (remoteMode === "change" && !changeable(remotePlan?.status))
+                  !connected || busy || remoteSelectionUnknown || !remoteSelection || !currentRemoteText.trim() || (remoteMode === "change" && !changeable(remotePlan?.status))
                 }
                 onClick={() => void remoteSend(false)}
               >
@@ -1487,7 +1520,7 @@ export default function App() {
                 variant="secondary"
                 size="small"
                 disabled={
-                  !connected || busy || !remoteSelection || !currentRemoteText.trim() || remoteMode === "change"
+                  !connected || busy || remoteSelectionUnknown || !remoteSelection || !currentRemoteText.trim() || remoteMode === "change"
                 }
                 onClick={() => void remoteSend(true)}
               >
@@ -1569,8 +1602,8 @@ export default function App() {
               ) : (
                 <EmptyPanel
                   icon={<Radio />}
-                  title="等待第一条回传"
-                  detail="从此入口派发任务，完成后查看后台实际投递结果。"
+                  title={snapshot.history?.collections.deliveries?.has_more ? "当前窗口未载入此入口的回传" : "等待第一条回传"}
+                  detail="这里只显示当前窗口；请从历史浏览读取更多回传记录，不把未载入解释为未投递。"
                 />
               )}
             </div>

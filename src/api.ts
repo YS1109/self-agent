@@ -5,6 +5,8 @@ import {mcpSlotError,type McpCredentialClient} from "./mcp-credentials-client";
 import { providerUuid, type ProvidersClient } from "./providers-client";
 import type { Command, Receipt, SourceContext } from "./types";
 import type { CapabilityClient } from "./capabilities-client";
+import { readBoundedJson } from "./bounded-json";
+import { createHistoryClient, HistoryError, historyPagePath, historyTaskPath, parseHistoryPage, parseHistoryTask, type HistoryClient } from "./history-client";
 
 export async function api<T>(
   method: string,
@@ -16,11 +18,13 @@ export async function api<T>(
   if ("__TAURI_INTERNALS__" in window) {
     const { invoke } = await import("@tauri-apps/api/core");
     signal?.throwIfAborted();
-    const result = await invoke<T>("api_request", {
-      method,
-      path: `/api/v1${path}`,
-      body: body ?? null,
-    });
+    let result: T;
+    try {
+      result = await invoke<T>("api_request", { method, path: `/api/v1${path}`, body: body ?? null });
+    } catch (reason) {
+      if (path === "/snapshot?window=1") throw new Error(reason === "HISTORY_RECORD_TOO_LARGE" ? "后台快照超过12 MiB限制，未采用不完整数据" : "后台快照读取未确认，请稍后只读刷新");
+      throw reason;
+    }
     // Cancelling this observer cannot retract an accepted backend command.
     signal?.throwIfAborted();
     return result;
@@ -32,11 +36,30 @@ export async function api<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(path === "/settings/check" ? 35_000 : 20_000)]) : AbortSignal.timeout(path === "/settings/check" ? 35_000 : 20_000),
   });
-  const data = await response.json();
+  const data = await readBoundedJson(response, response.ok ? (path === "/snapshot?window=1" ? 12 : 16) * 1024 * 1024 : 8192, signal) as T & { error?: string };
   if (!response.ok)
     throw new Error(data.error ?? `请求失败 (${response.status})`);
   return data as T;
 }
+
+const browserHistory = createHistoryClient((path, init) => fetch(path, init));
+async function nativeHistory(path: string, signal: AbortSignal): Promise<unknown> {
+  signal.throwIfAborted();
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    signal.throwIfAborted();
+    const result = await invoke("api_request", { method: "GET", path, body: null });
+    signal.throwIfAborted(); return result;
+  } catch (reason) {
+    if (signal.aborted) throw new HistoryError("aborted");
+    const codes = { HISTORY_RESET: "history_reset", HISTORY_RECORD_TOO_LARGE: "record_too_large", HISTORY_NOT_FOUND: "not_found" } as const;
+    throw new HistoryError(typeof reason === "string" && Object.hasOwn(codes, reason) ? codes[reason as keyof typeof codes] : "unavailable");
+  }
+}
+export const historyClient: HistoryClient = {
+  async page(query, signal) { return "__TAURI_INTERNALS__" in window ? parseHistoryPage(await nativeHistory(historyPagePath(query), signal), query) : browserHistory.page(query, signal); },
+  async task(id, signal) { return "__TAURI_INTERNALS__" in window ? parseHistoryTask(await nativeHistory(historyTaskPath(id), signal), id) : browserHistory.task(id, signal); },
+};
 export function dispatch(source: SourceContext, command: Command) {
   return api<Receipt>("POST", "/commands", {
     command_id: crypto.randomUUID(),

@@ -19,7 +19,7 @@ describe("development proxy boundary", () => {
     expect(
       allowDevelopmentProxy(
         "GET",
-        "/api/v1/snapshot",
+        "/api/v1/snapshot?window=1",
         undefined,
         "same-origin",
         undefined,
@@ -165,4 +165,18 @@ it("limits gateway methods and canonical routes without broad credential proxy",
  const id="11111111-1111-4111-8111-111111111111";
  for(const [method,path] of [["GET","/api/v1/gateway"],["POST","/api/v1/gateway/commands"],["GET",`/api/v1/gateway/commands/${id}`],["GET",`/api/v1/gateway/credential-operations/${id}`],["POST",`/api/v1/gateway/credentials/${id}`],["DELETE",`/api/v1/gateway/credentials/${id}`],["POST",`/api/v1/gateway/credentials/cleanup/${id}`]]){expect(allowDevelopmentProxy(method,path,undefined,"same-origin","application/json")).toBe(true);expect(allowDevelopmentProxy(method,path+"?owner=provider",undefined,"same-origin","application/json")).toBe(false);expect(allowDevelopmentProxy(method,path,"https://evil.invalid","cross-site","application/json")).toBe(false);}
  for(const method of ["GET","PUT","PATCH"]){expect(allowDevelopmentProxy(method,`/api/v1/gateway/credentials/${id}`,undefined,"same-origin","application/json")).toBe(false);}expect(allowDevelopmentProxy("DELETE",`/api/v1/gateway/credentials/${id}`,undefined,"same-origin","text/plain")).toBe(false);
+});
+
+it("owner history only allows precise bounded GET paths and canonical queries", () => {
+  for (const path of ["/api/v1/tasks/old-ID_1", "/api/v1/history/tasks", "/api/v1/history/tasks?session_id=old-id&cursor=abcdef", "/api/v1/history/sessions?cursor=abcdef", "/api/v1/history/sessions/old-id/messages?cursor=abcdef", "/api/v1/history/execution_requests?session_id=session"]) {
+    expect(allowDevelopmentProxy("GET", path, undefined, "same-origin", undefined)).toBe(true);
+    for (const method of ["POST", "PUT", "DELETE"]) expect(allowDevelopmentProxy(method, path, undefined, "same-origin", "application/json")).toBe(false);
+    expect(allowDevelopmentProxy("GET", path, "https://outside.invalid", "cross-site", undefined)).toBe(false);
+  }
+  for (const path of ["/api/v1/tasks/../snapshot", "/api/v1/tasks/a%2Fb", "/api/v1/history/tasks?cursor=a&session_id=b", "/api/v1/history/tasks?session_id=x&session_id=y", "/api/v1/history/tasks?cursor=a&cursor=b", "/api/v1/history/tasks?limit=1000", "/api/v1/history/tasks?cursor=a%26b", "/api/v1/history/tasks?cursor=", `/api/v1/history/tasks?cursor=${"a".repeat(2049)}`, "/api/v1/history/sessions/x/messages?session_id=y", "/api/v1/history/events", "/api/v1/history/tasks#x"]) expect(allowDevelopmentProxy("GET", path, undefined, "same-origin", undefined)).toBe(false);
+});
+
+it("windowed snapshot requires exact explicit opt-in, never broad query permission", () => {
+  expect(allowDevelopmentProxy("GET", "/api/v1/snapshot?window=1", undefined, "same-origin", undefined)).toBe(true);
+  for (const path of ["/api/v1/snapshot", "/api/v1/snapshot?window=0", "/api/v1/snapshot?window=01", "/api/v1/snapshot?window=%31", "/api/v1/snapshot?window=1&window=1", "/api/v1/snapshot?window=1&all=1"]) expect(allowDevelopmentProxy("GET", path, undefined, "same-origin", undefined)).toBe(false);
 });

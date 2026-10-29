@@ -1,4 +1,5 @@
 mod gateway;
+mod history;
 mod maintenance;
 use std::{
     io::{Read, Write},
@@ -25,7 +26,9 @@ const HELP: &str = r#"Self Agent 命令行客户端
   select <会话ID>                   选择此命令来源的默认会话
   run <会话ID> <内容|->             主智能体直接执行；- 从标准输入读取
   send <会话ID> <内容|->            远程编排：生成计划或讨论
-  status [任务ID]                   查询完整状态或单个任务
+  status [任务ID]                   查询有界状态窗口或单个完整任务
+  history <类别> [--session ID] [--cursor 游标]  只读一页历史，保留计数/缺口
+  history messages <会话ID> [--cursor 游标]     只读一页会话消息
   cancel <任务ID>                   取消任务
   steer <任务ID> <内容|->           补充指定任务（接收不代表已应用）
   continue <任务ID> [内容|-]        从终态主任务创建新的继续任务
@@ -63,6 +66,8 @@ const HELP: &str = r#"Self Agent 命令行客户端
 --wait 适用于返回任务ID的命令及follow；终态失败或超时会返回非零退出码。
 --follow 用于run、steer、continue、answer、approve、deny或返回任务ID的command，逐行输出JSON收据、事件和任务快照。
 follow先输出当前快照再跟随新事件；自动重连，恢复快照带reset:true。
+status 无ID是有界窗口，不代表全部历史；history 不自动累积，409需清除游标。
+历史类别：sessions/tasks/plans/plan_changes/deliveries/execution_requests。
 跟随默认等待3600秒，可用--wait覆盖；超时不会取消后台任务。
 跟随按任务终态退出；execution_cleanup为pending/unknown时仍需检查在途文件操作，
 不能把终态当作副作用已停止。task_snapshot会附带cleanup_notice，之后可用status查询。
@@ -214,16 +219,54 @@ impl Client {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let mut response = request.send().await.context("无法连接本机后台服务")?;
+        let bounded = (method == "GET").then(|| history::limit(path)).flatten();
+        let mut response = request.send().await.map_err(|error| {
+            if bounded.is_some() {
+                anyhow::Error::from(history::ReadError::Unavailable)
+            } else {
+                anyhow::Error::new(error).context("无法连接本机后台服务")
+            }
+        })?;
         let status = response.status();
+        if bounded.is_some() && !status.is_success() {
+            // Only a bounded explicit protocol code is authoritative. An old
+            // daemon route 404 must not mean the requested task is absent.
+            return Err(history::response_failure(response).await.into());
+        }
+        let limit = bounded.unwrap_or(16 * 1024 * 1024);
+        let too_large = || {
+            if bounded.is_some() {
+                anyhow::Error::from(history::ReadError::TooLarge)
+            } else {
+                anyhow::anyhow!("后台响应超过16 MiB限制")
+            }
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(too_large());
+        }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.context("无法读取后台响应")? {
-            if bytes.len() + chunk.len() > 16 * 1024 * 1024 {
-                bail!("后台响应超过16 MiB限制");
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            if bounded.is_some() {
+                anyhow::Error::from(history::ReadError::Unavailable)
+            } else {
+                anyhow::Error::new(error).context("无法读取后台响应")
+            }
+        })? {
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                return Err(too_large());
             }
             bytes.extend_from_slice(&chunk);
         }
-        let value: Value = serde_json::from_slice(&bytes).context("后台返回无效JSON")?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            if bounded.is_some() {
+                anyhow::Error::from(history::ReadError::Unavailable)
+            } else {
+                anyhow::Error::new(error).context("后台返回无效JSON")
+            }
+        })?;
         if !status.is_success() {
             bail!("{}", value["error"].as_str().unwrap_or("后台请求失败"));
         }
@@ -298,6 +341,7 @@ fn command(options: &Options) -> Result<Option<Value>> {
         }
         "sessions"
         | "status"
+        | "history"
         | "settings"
         | "models"
         | "follow"
@@ -618,13 +662,6 @@ fn provider_request(options: &Options) -> Result<Option<(String, String, Option<
     }
 }
 
-fn task<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value> {
-    snapshot["tasks"]
-        .as_array()
-        .and_then(|tasks| tasks.iter().find(|task| task["id"] == id))
-        .context("未找到指定任务")
-}
-
 fn validate_follow(options: &Options, command: Option<&Value>) -> Result<()> {
     if !options.follow || options.command == "follow" {
         return Ok(());
@@ -899,15 +936,16 @@ async fn follow_loop(
         }
         rejected_auth = false;
         if status == reqwest::StatusCode::CONFLICT {
-            let snapshot = match client.request("GET", "/api/v1/snapshot", None).await {
+            let snapshot = match history::detail(&client, task_id).await {
                 Ok(snapshot) => snapshot,
+                Err(error) if history::permanent(&error) => return Err(error),
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
             };
             cursor = snapshot_cursor(&snapshot)?;
-            let current = task(&snapshot, task_id)?;
+            let current = &snapshot["task"];
             print_task_snapshot(output, current, cursor, true)?;
             if is_terminal(current) {
                 return terminal_result(current);
@@ -957,11 +995,12 @@ async fn follow_loop(
                         if !accept_event(output, frame, task_id, &mut cursor)? {
                             continue;
                         }
-                        let snapshot = match client.request("GET", "/api/v1/snapshot", None).await {
+                        let snapshot = match history::detail(&client, task_id).await {
                             Ok(snapshot) => snapshot,
+                            Err(error) if history::permanent(&error) => return Err(error),
                             Err(_) => break 'stream,
                         };
-                        let current = task(&snapshot, task_id)?;
+                        let current = &snapshot["task"];
                         print_task_snapshot(output, current, snapshot_cursor(&snapshot)?, false)?;
                         if !is_terminal(current) {
                             bail!("后台终态事件与任务快照不一致");
@@ -972,8 +1011,13 @@ async fn follow_loop(
                 _ = poll.tick() => {
                     // A snapshot is the authoritative fallback if a terminal
                     // event was pruned or the live stream became idle.
-                    if let Ok(snapshot) = client.request("GET", "/api/v1/snapshot", None).await {
-                        let current = task(&snapshot, task_id)?;
+                    let snapshot = match history::detail(&client, task_id).await {
+                        Ok(value) => Some(value),
+                        Err(error) if history::permanent(&error) => return Err(error),
+                        Err(_) => None,
+                    };
+                    if let Some(snapshot) = snapshot {
+                        let current = &snapshot["task"];
                         if is_terminal(current) {
                             print_task_snapshot(output, current, snapshot_cursor(&snapshot)?, true)?;
                             return terminal_result(current);
@@ -983,15 +1027,16 @@ async fn follow_loop(
             }
         }
         if reset {
-            let snapshot = match client.request("GET", "/api/v1/snapshot", None).await {
+            let snapshot = match history::detail(&client, task_id).await {
                 Ok(snapshot) => snapshot,
+                Err(error) if history::permanent(&error) => return Err(error),
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
             };
             cursor = snapshot_cursor(&snapshot)?;
-            let current = task(&snapshot, task_id)?;
+            let current = &snapshot["task"];
             print_task_snapshot(output, current, cursor, true)?;
             if is_terminal(current) {
                 return terminal_result(current);
@@ -1001,6 +1046,41 @@ async fn follow_loop(
         // commands and tools are never replayed. Resume at the last printed ID.
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn wait_for_task(
+    client: &Client,
+    id: &str,
+    duration: Duration,
+    output: &mut impl Write,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut last = None;
+    loop {
+        match tokio::time::timeout_at(deadline, history::detail(client, id)).await {
+            Ok(result) => {
+                let snapshot = result?;
+                let current = snapshot["task"].clone();
+                if is_terminal(&current) {
+                    writeln!(output, "{}", serde_json::to_string_pretty(&current)?)?;
+                    return terminal_result(&current);
+                }
+                last = Some(current);
+            }
+            Err(_) => break,
+        }
+        if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(200)))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    // Preserve the last authoritative observation without pretending it is a
+    // fresh terminal state. If no read completed, retain only the original ID.
+    let observed = last.unwrap_or_else(|| json!({"task_id":id,"observation":"timeout"}));
+    writeln!(output, "{}", serde_json::to_string_pretty(&observed)?)?;
+    bail!("等待超时；后台任务继续运行，可使用status或cancel；输出仅为最后观察或原任务ID")
 }
 
 async fn run(options: Options) -> Result<()> {
@@ -1024,7 +1104,20 @@ async fn run(options: Options) -> Result<()> {
     let changes_path = (options.command == "changes")
         .then(|| changes_route(&options))
         .transpose()?;
+    let history_path = (options.command == "history")
+        .then(|| history::route(&options))
+        .transpose()?;
+    if matches!(options.command.as_str(), "status" | "requests" | "follow") {
+        if let Some(id) = options.args.first() {
+            history::task_path(id)?;
+        }
+    }
     let client = Client::open(&options.directory)?;
+    if let Some(path) = history_path {
+        let response = client.request("GET", &path, None).await?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
     if let Some((method, path, body)) = gateway_request {
         if method != "GET" {
             eprintln!(
@@ -1096,28 +1189,27 @@ async fn run(options: Options) -> Result<()> {
     }
     if options.command == "follow" {
         arity(&options, 1, 1)?;
-        let snapshot = client.request("GET", "/api/v1/snapshot", None).await?;
         let mut output = std::io::stdout().lock();
-        let cursor = snapshot_cursor(&snapshot)?;
-        let current = task(&snapshot, &options.args[0])?;
-        print_task_snapshot(&mut output, current, cursor, true)?;
-        if is_terminal(current) {
-            return terminal_result(current);
-        }
-        return follow_task(
-            &options.directory,
-            &options.args[0],
-            cursor,
-            options.wait.unwrap_or(3600),
-            &mut output,
-        )
-        .await;
+        return tokio::time::timeout(Duration::from_secs(options.wait.unwrap_or(3600)), async {
+            let snapshot = history::detail(&client, &options.args[0]).await?;
+            let cursor = snapshot_cursor(&snapshot)?;
+            let current = &snapshot["task"];
+            print_task_snapshot(&mut output, current, cursor, true)?;
+            if is_terminal(current) {
+                return terminal_result(current);
+            }
+            follow_loop(&options.directory, &options.args[0], cursor, &mut output).await
+        })
+        .await
+        .context("跟随超时；后台任务继续运行，可使用status、follow或cancel")?;
     }
     // Establish the cursor before submitting: even a very fast task cannot race
     // ahead of our subscription. The POST is never retried by follow mode.
     let cursor = if options.follow {
         Some(snapshot_cursor(
-            &client.request("GET", "/api/v1/snapshot", None).await?,
+            &client
+                .request("GET", "/api/v1/snapshot?window=1", None)
+                .await?,
         )?)
     } else {
         None
@@ -1135,28 +1227,43 @@ async fn run(options: Options) -> Result<()> {
     } else {
         match options.command.as_str() {
             "requests" => {
-                let snapshot = client.request("GET", "/api/v1/snapshot", None).await?;
+                let snapshot = if let Some(id) = options.args.first() {
+                    history::detail(&client, id).await?
+                } else {
+                    client
+                        .request("GET", "/api/v1/snapshot?window=1", None)
+                        .await?
+                };
                 let requests = snapshot["execution_requests"]
                     .as_array()
                     .cloned()
                     .unwrap_or_default();
-                json!(requests
+                let items = json!(requests
                     .into_iter()
                     .filter(|request| options
                         .args
                         .first()
                         .is_none_or(|id| request["task_id"] == *id))
-                    .collect::<Vec<_>>())
+                    .collect::<Vec<_>>());
+                history::collection_output(&snapshot, "execution_requests", items)
             }
             "sessions" | "status" => {
                 arity(&options, 0, usize::from(options.command == "status"))?;
-                let snapshot = client.request("GET", "/api/v1/snapshot", None).await?;
-                if options.command == "sessions" {
-                    snapshot["sessions"].clone()
-                } else if let Some(id) = options.args.first() {
-                    task(&snapshot, id)?.clone()
+                if let Some(id) = options.args.first() {
+                    history::detail(&client, id).await?["task"].clone()
                 } else {
-                    snapshot
+                    let snapshot = client
+                        .request("GET", "/api/v1/snapshot?window=1", None)
+                        .await?;
+                    if options.command == "sessions" {
+                        history::collection_output(
+                            &snapshot,
+                            "sessions",
+                            snapshot["sessions"].clone(),
+                        )
+                    } else {
+                        snapshot
+                    }
                 }
             }
             "settings" | "models" => {
@@ -1204,26 +1311,13 @@ async fn run(options: Options) -> Result<()> {
         let id = response["task_id"]
             .as_str()
             .context("该指令没有返回任务ID，无法等待；send生成计划请使用status查询")?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
-        loop {
-            let snapshot = client.request("GET", "/api/v1/snapshot", None).await?;
-            let current = task(&snapshot, id)?;
-            if matches!(
-                current["status"].as_str(),
-                Some("completed" | "failed" | "cancelled")
-            ) {
-                println!("{}", serde_json::to_string_pretty(current)?);
-                if current["status"] != "completed" {
-                    bail!("任务未成功完成");
-                }
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                println!("{}", serde_json::to_string_pretty(current)?);
-                bail!("等待超时；后台任务继续运行，可使用status或cancel");
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        return wait_for_task(
+            &client,
+            id,
+            Duration::from_secs(seconds),
+            &mut std::io::stdout().lock(),
+        )
+        .await;
     }
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
@@ -1698,10 +1792,10 @@ mod tests {
             ),
         ] {
             cli_fixture(&args,vec![
-                ("GET","/api/v1/snapshot",None,Some(snapshot_body(0,"running"))),
+                ("GET","/api/v1/snapshot?window=1",None,Some(json!({"event_cursor":0,"tasks":[],"history":{"tasks":{"total":5000,"returned":0,"has_more":true}}}).to_string())),
                 ("POST","/api/v1/commands",Some(command),Some(json!({"status":"accepted","task_id":"t"}).to_string())),
                 ("GET","/api/v1/events?after=0",None,Some("id: 1\nevent: run_event\ndata: {\"sequence\":1,\"task_id\":\"t\",\"kind\":\"task_completed\"}\n\n".into())),
-                ("GET","/api/v1/snapshot",None,Some(snapshot_body(1,"completed"))),
+                ("GET","/api/v1/tasks/t",None,Some(task_detail_body(1,"completed"))),
             ]).await.unwrap();
         }
     }
@@ -1747,13 +1841,13 @@ mod tests {
             ),
         ] {
             cli_fixture(&args,vec![
-                ("GET","/api/v1/snapshot",None,Some(snapshot_body(0,"waiting_input"))),
+                ("GET","/api/v1/snapshot?window=1",None,Some(json!({"event_cursor":0,"tasks":[],"history":{"tasks":{"total":5000,"returned":0,"has_more":true}}}).to_string())),
                 ("POST","/api/v1/commands",Some(expected),Some(json!({"status":"accepted","task_id":"t"}).to_string())),
                 ("GET","/api/v1/events?after=0",None,Some("id: 1\nevent: run_event\ndata: {\"sequence\":1,\"task_id\":\"t\",\"kind\":\"task_completed\"}\n\n".into())),
-                ("GET","/api/v1/snapshot",None,Some(snapshot_body(1,"completed"))),
+                ("GET","/api/v1/tasks/t",None,Some(task_detail_body(1,"completed"))),
             ]).await.unwrap();
         }
-        cli_fixture(&["requests","t"],vec![("GET","/api/v1/snapshot",None,Some(json!({"execution_requests":[{"id":"r","task_id":"t","kind":"approval","action_digest":digest}]}).to_string()))]).await.unwrap();
+        cli_fixture(&["requests","t"],vec![("GET","/api/v1/tasks/t",None,Some(json!({"task":{"id":"t"},"event_cursor":0,"execution_requests":[{"id":"r","task_id":"t","kind":"approval","action_digest":digest}]}).to_string()))]).await.unwrap();
         assert!(cli_fixture(&["deny","r","0",&digest],vec![("POST","/api/v1/commands",Some(json!({"type":"decide_request","request_id":"r","expected_revision":0,"approve":false,"action_digest":digest})),None)]).await.is_err());
     }
 
@@ -1773,8 +1867,8 @@ mod tests {
         )
     }
 
-    fn snapshot_body(sequence: u64, status: &str) -> String {
-        json!({"event_cursor":sequence,"tasks":[{"id":"t","status":status,"stream_output":"中文"}]})
+    fn task_detail_body(sequence: u64, status: &str) -> String {
+        json!({"event_cursor":sequence,"task":{"id":"t","status":status,"stream_output":"中文"}})
             .to_string()
     }
 
@@ -1888,10 +1982,10 @@ mod tests {
                 rotate_token: None,
             },
             MockReply {
-                path: "/api/v1/snapshot",
+                path: "/api/v1/tasks/t",
                 status: 200,
                 content_type: "application/json",
-                body: snapshot_body(3, "completed"),
+                body: task_detail_body(3, "completed"),
                 token: "token-b",
                 rotate_token: None,
             },
@@ -1927,10 +2021,10 @@ mod tests {
                     rotate_token: None,
                 },
                 MockReply {
-                    path: "/api/v1/snapshot",
+                    path: "/api/v1/tasks/t",
                     status: 200,
                     content_type: "application/json",
-                    body: snapshot_body(8, "running"),
+                    body: task_detail_body(8, "running"),
                     token: "token-a",
                     rotate_token: None,
                 },
@@ -1947,10 +2041,10 @@ mod tests {
                     rotate_token: None,
                 },
                 MockReply {
-                    path: "/api/v1/snapshot",
+                    path: "/api/v1/tasks/t",
                     status: 200,
                     content_type: "application/json",
-                    body: snapshot_body(10, "completed"),
+                    body: task_detail_body(10, "completed"),
                     token: "token-a",
                     rotate_token: None,
                 },
@@ -1976,7 +2070,7 @@ mod tests {
                 rotate_token: None,
             },
             MockReply {
-                path: "/api/v1/snapshot",
+                path: "/api/v1/tasks/t",
                 status: 500,
                 content_type: "application/json",
                 body: "{\"error\":\"暂时不可用\"}".into(),
@@ -1992,10 +2086,10 @@ mod tests {
                 rotate_token: None,
             },
             MockReply {
-                path: "/api/v1/snapshot",
+                path: "/api/v1/tasks/t",
                 status: 200,
                 content_type: "application/json",
-                body: snapshot_body(2, "completed"),
+                body: task_detail_body(2, "completed"),
                 token: "token-a",
                 rotate_token: None,
             },
@@ -2049,10 +2143,10 @@ mod tests {
                     rotate_token: None,
                 },
                 MockReply {
-                    path: "/api/v1/snapshot",
+                    path: "/api/v1/tasks/t",
                     status: 200,
                     content_type: "application/json",
-                    body: snapshot_body(2, "completed"),
+                    body: task_detail_body(2, "completed"),
                     token: "token-b",
                     rotate_token: None,
                 },

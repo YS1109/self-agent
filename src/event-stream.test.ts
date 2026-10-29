@@ -75,7 +75,7 @@ describe("浏览器受控事件代理",()=>{
    .mockResolvedValue(response(wire(11)));
   vi.stubGlobal("fetch",fetcher);const messages:StreamMessage[]=[];const stop=subscribeEvents(1,m=>messages.push(m));
   await vi.waitFor(()=>expect(messages.some(m=>m.type==="event")).toBe(true));stop();
-  expect(fetcher.mock.calls[1][0]).toBe("/api/v1/snapshot");expect(fetcher.mock.calls[2][0]).toBe("/api/v1/events?after=10");
+  expect(fetcher.mock.calls[1][0]).toBe("/api/v1/snapshot?window=1");expect(fetcher.mock.calls[2][0]).toBe("/api/v1/events?after=10");
   const data=messages.filter(m=>m.type!=="status");expect(data[0].type).toBe("snapshot");expect(data[1].type).toBe("event");
  });
 });

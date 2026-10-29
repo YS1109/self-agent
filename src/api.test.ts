@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, dispatch, capabilityClient, providersClient } from "./api";
+import { api, dispatch, capabilityClient, providersClient, historyClient } from "./api";
 import { cleanupResolutionBody, resolveTaskCleanup } from "./cleanup-resolution";
 import { DESKTOP_SOURCE, REMOTE_SOURCE, sameSource } from "./types";
+
+
+async function fixtureResponse(value: {ok: boolean; status?: number; json: () => Promise<unknown>}): Promise<Response> {
+  return new Response(JSON.stringify(await value.json()), {status: value.ok ? 200 : value.status ?? 400, headers: {"Content-Type": "application/json"}});
+}
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -12,16 +17,44 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("有界历史浏览器与原生桥适配", () => {
+  const page = { items: [], total: 0, returned: 0, has_more: false, current_cursor: "abc", next_cursor: null, anchor: "10000000-0000-4000-8000-000000000001", event_cursor: 0, unavailable: [] };
+  it("browser history 使用真正 GET 流且不发送 bearer；native 只经过 Rust", async () => {
+    vi.stubGlobal("window", {});
+    const fetcher = vi.fn(async () => new Response(JSON.stringify(page), { headers: { "Content-Type": "application/json" } })); vi.stubGlobal("fetch", fetcher);
+    await expect(historyClient.page({ kind: "tasks", sessionId: "old-id", cursor: "abc" }, new AbortController().signal)).resolves.toEqual(page);
+    expect(fetcher).toHaveBeenCalledWith("/api/v1/history/tasks?session_id=old-id&cursor=abc", expect.objectContaining({ method: "GET" }));
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} }); invoke.mockResolvedValue(page);
+    await historyClient.page({ kind: "tasks" }, new AbortController().signal);
+    expect(invoke).toHaveBeenCalledWith("api_request", { method: "GET", path: "/api/v1/history/tasks", body: null }); expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it("精确静态 native 错误映射，关闭后迟到响应不采用，未回显底层内容", async () => {
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+    for (const [raw, code] of [["HISTORY_RESET", "history_reset"], ["HISTORY_RECORD_TOO_LARGE", "record_too_large"], ["HISTORY_NOT_FOUND", "not_found"], ["PRIVATE_CANARY", "unavailable"]]) {
+      invoke.mockRejectedValueOnce(raw); await expect(historyClient.page({ kind: "tasks" }, new AbortController().signal)).rejects.toMatchObject({ code });
+    }
+    const controller = new AbortController(); invoke.mockImplementationOnce(async () => { controller.abort(); return page; });
+    await expect(historyClient.page({ kind: "tasks" }, controller.signal)).rejects.toMatchObject({ code: "aborted" });
+  });
+  it("普通 browser API 也在解析前限制响应，snapshot保留12MiB上限", async () => {
+    vi.stubGlobal("window", {}); const cancel = vi.fn();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new ReadableStream({ cancel }), { headers: { "Content-Length": String(12 * 1024 * 1024 + 1) } })));
+    await expect(api("GET", "/snapshot?window=1")).rejects.toThrow("读取上限"); expect(cancel).toHaveBeenCalledOnce();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("PRIVATE_CANARY malformed JSON")));
+    await expect(api("GET", "/snapshot?window=1")).rejects.not.toThrow("PRIVATE_CANARY");
+  });
+});
+
 describe("private daemon transport", () => {
   it("uses same-origin browser API without providing a daemon credential", async () => {
     vi.stubGlobal("window", {});
     const fetcher = vi
       .fn()
-      .mockResolvedValue({ ok: true, json: async () => ({ sessions: [] }) });
+      .mockImplementation(async () => fixtureResponse({ ok: true, json: async () => ({ sessions: [] }) }));
     vi.stubGlobal("fetch", fetcher);
-    await expect(api("GET", "/snapshot")).resolves.toEqual({ sessions: [] });
+    await expect(api("GET", "/snapshot?window=1")).resolves.toEqual({ sessions: [] });
     expect(fetcher).toHaveBeenCalledWith(
-      "/api/v1/snapshot",
+      "/api/v1/snapshot?window=1",
       expect.objectContaining({ method: "GET", headers: undefined }),
     );
     expect(JSON.stringify(fetcher.mock.calls)).not.toMatch(
@@ -49,11 +82,11 @@ describe("private daemon transport", () => {
       "fetch",
       vi
         .fn()
-        .mockResolvedValue({
+        .mockImplementation(async () => fixtureResponse({
           ok: false,
           status: 400,
           json: async () => ({ error: "No selected session" }),
-        }),
+        })),
     );
     await expect(api("POST", "/commands", {})).rejects.toThrow(
       "No selected session",
@@ -64,10 +97,10 @@ describe("private daemon transport", () => {
     vi.stubGlobal("window", {});
     const fetcher = vi
       .fn()
-      .mockResolvedValue({
+      .mockImplementation(async () => fixtureResponse({
         ok: true,
         json: async () => ({ status: "accepted" }),
-      });
+      }));
     vi.stubGlobal("fetch", fetcher);
     await dispatch(REMOTE_SOURCE, { type: "start_task", title: "Build" });
     const envelope = JSON.parse(fetcher.mock.calls[0][1].body);
@@ -85,7 +118,7 @@ describe("private daemon transport", () => {
 
   it("桌面主智能体指令保持独立会话，远程编排协议继续可用", async () => {
     vi.stubGlobal("window", {});
-    const fetcher = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ status: "accepted", task_id: "main-task" }) });
+    const fetcher = vi.fn().mockImplementation(async () => fixtureResponse({ ok: true, json: async () => ({ status: "accepted", task_id: "main-task" }) }));
     vi.stubGlobal("fetch", fetcher);
     await dispatch(DESKTOP_SOURCE, { type: "run_agent", session_id: "session-a", content: "继续修复并测试" });
     await dispatch(REMOTE_SOURCE, { type: "send_message", session_id: "session-b", content: "规划远程任务" });
@@ -98,7 +131,7 @@ describe("private daemon transport", () => {
   });
   it("补充与继续保留显式目标和幂等信封，未知网络结果不重送 POST", async () => {
     vi.stubGlobal("window", {});
-    const fetcher = vi.fn().mockResolvedValue({ok:true,json:async()=>({status:"accepted",task_id:"t",supplement_id:"s"})});
+    const fetcher = vi.fn().mockImplementation(async () => fixtureResponse({ok:true,json:async()=>({status:"accepted",task_id:"t",supplement_id:"s"})}));
     vi.stubGlobal("fetch",fetcher);
     await dispatch(DESKTOP_SOURCE,{type:"steer_task",task_id:"original",content:"补充"});
     const envelope=JSON.parse(fetcher.mock.calls[0][1].body);
@@ -118,7 +151,7 @@ describe("private daemon transport", () => {
 
   it("执行控制和逐次授权信封保留完整绑定，传输失败不重试决定", async () => {
     vi.stubGlobal("window",{});
-    const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>({status:"accepted",task_id:"t"})});
+    const fetcher=vi.fn().mockImplementation(async () => fixtureResponse({ok:true,json:async()=>({status:"accepted",task_id:"t"})}));
     vi.stubGlobal("fetch",fetcher);
     await dispatch(DESKTOP_SOURCE,{type:"run_agent",session_id:"s",content:"目标",controls:{budget:{max_runtime_seconds:30},permissions:{run_commands:"ask"}}});
     expect(JSON.parse(fetcher.mock.calls[0][1].body).command.controls).toEqual({budget:{max_runtime_seconds:30},permissions:{run_commands:"ask"}});
@@ -130,7 +163,7 @@ describe("private daemon transport", () => {
 
   it("能力管理只走本机专用端点并保留幂等信封，未知POST不重发", async () => {
     vi.stubGlobal("window",{});
-    const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>({mcp_servers:[],skills:[]})});vi.stubGlobal("fetch",fetcher);
+    const fetcher=vi.fn().mockImplementation(async () => fixtureResponse({ok:true,json:async()=>({mcp_servers:[],skills:[]})}));vi.stubGlobal("fetch",fetcher);
     const observer=new AbortController();await capabilityClient.getRegistry(observer.signal);
     expect(fetcher.mock.calls[0][0]).toBe("/api/v1/capabilities");
     const envelope={id:"fixed-id",command:{type:"save_skill" as const,name:"fixture",content:"text"}};
@@ -150,7 +183,7 @@ describe("private daemon transport", () => {
     const task={id:"t",session_id:"s",title:"任务",status:"failed",execution_mode:"native" as const,source:DESKTOP_SOURCE,created_at:"now",updated_at:"now",steps:[],execution_cleanup:"unknown" as const,execution_cleanup_updated_at:"stamp"};
     expect(()=>cleanupResolutionBody(task,false)).toThrow();expect(()=>cleanupResolutionBody({...task,status:"running"},true)).toThrow();
     expect(()=>cleanupResolutionBody({...task,execution_cleanup:"pending"},true)).toThrow();expect(()=>cleanupResolutionBody({...task,id:"../t"},true)).toThrow();
-    vi.stubGlobal("window",{});const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>({task_id:"t",resolved:true})});vi.stubGlobal("fetch",fetcher);
+    vi.stubGlobal("window",{});const fetcher=vi.fn().mockImplementation(async () => fixtureResponse({ok:true,json:async()=>({task_id:"t",resolved:true})}));vi.stubGlobal("fetch",fetcher);
     await expect(resolveTaskCleanup(task,true)).resolves.toEqual({task_id:"t",resolved:true});
     expect(fetcher.mock.calls[0][0]).toBe("/api/v1/tasks/t/cleanup-resolution");expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({expected_updated_at:"stamp",confirm_processes_stopped:true});
     fetcher.mockRejectedValue(new Error("lost"));await expect(resolveTaskCleanup(task,true)).rejects.toThrow("lost");expect(fetcher).toHaveBeenCalledTimes(2);
@@ -170,27 +203,27 @@ describe("private daemon transport", () => {
 
 describe("MCP scoped credential transport",()=>{
  it("uses exact scoped routes and suppresses remote error bodies",async()=>{
-  const {mcpCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>null});vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
+  const {mcpCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockImplementation(async () => fixtureResponse({ok:true,json:async()=>null}));vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
   await mcpCredentialClient.setCredential(id,"TOKEN",{id,expected_revision:1,secret:"fixture"},signal);expect(fetcher.mock.calls[0][0]).toBe(`/api/v1/capabilities/mcp/${id}/credentials/TOKEN`);
   await mcpCredentialClient.deleteCredential(id,"TOKEN",{id,expected_revision:1},signal);await mcpCredentialClient.operation(id,signal);await mcpCredentialClient.cleanupCredential(id,{id},signal);expect(fetcher).toHaveBeenCalledTimes(4);
   expect(()=>mcpCredentialClient.setCredential(id,"TOKEN/../PATH",{id,expected_revision:1,secret:"fixture"},signal)).toThrow();expect(fetcher).toHaveBeenCalledTimes(4);
-  fetcher.mockResolvedValue({ok:false,json:async()=>({error:"SECRET_CANARY"})});await expect(mcpCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
+  fetcher.mockImplementation(async () => fixtureResponse({ok:false,json:async()=>({error:"SECRET_CANARY"})}));await expect(mcpCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
  });
 });
 
 describe("QQ owner transport",()=>{
  it("uses actual QQ metadata and credential endpoints, with no arbitrary owner or leaked errors",async()=>{
-  const {qqClient,qqCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>null});vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
+  const {qqClient,qqCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockImplementation(async () => fixtureResponse({ok:true,json:async()=>null}));vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
   await qqClient.snapshot(signal);await qqClient.receipt(id,signal);await qqCredentialClient.setCredential(id,{id,expected_revision:0,secret:"fixture"},signal);await qqCredentialClient.deleteCredential(id,{id,expected_revision:0},signal);await qqCredentialClient.cleanupCredential(id,{id},signal);await qqCredentialClient.operation(id,signal);
   expect(fetcher.mock.calls.map(call=>[call[0],call[1].method])).toEqual([["/api/v1/qq","GET"],[`/api/v1/qq/commands/${id}`,"GET"],[`/api/v1/qq/credentials/${id}`,"POST"],[`/api/v1/qq/credentials/${id}`,"DELETE"],[`/api/v1/qq/credentials/cleanup/${id}`,"POST"],[`/api/v1/qq/credential-operations/${id}`,"GET"]]);expect(()=>qqCredentialClient.operation("../providers",signal)).toThrow();expect(fetcher).toHaveBeenCalledTimes(6);
-  fetcher.mockResolvedValue({ok:false,json:async()=>({error:"SECRET_CANARY"})});await expect(qqCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
+  fetcher.mockImplementation(async () => fixtureResponse({ok:false,json:async()=>({error:"SECRET_CANARY"})}));await expect(qqCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
  });
 });
 
 describe("owner reliability transport", () => {
   it("uses only exact backup and diagnostic routes, never retries or leaks private errors", async () => {
     const { reliabilityClient } = await import("./api"); const id = "11111111-1111-4111-8111-111111111111";
-    vi.stubGlobal("window", {}); const fetcher = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }); vi.stubGlobal("fetch", fetcher); const signal = new AbortController().signal;
+    vi.stubGlobal("window", {}); const fetcher = vi.fn().mockImplementation(async () => fixtureResponse({ ok: true, json: async () => ({}) })); vi.stubGlobal("fetch", fetcher); const signal = new AbortController().signal;
     await reliabilityClient.status(signal); await reliabilityClient.receipt(id, signal); await reliabilityClient.diagnostics(signal);
     expect(fetcher.mock.calls.map(call => [call[0], call[1].method])).toEqual([["/api/v1/reliability", "GET"], [`/api/v1/reliability/backups/${id}`, "GET"], ["/api/v1/reliability/diagnostics", "GET"]]);
     fetcher.mockRejectedValue(new Error("/PRIVATE_DESTINATION SECRET"));
@@ -208,9 +241,9 @@ describe("owner reliability transport", () => {
 
 describe("Gateway owner transport",()=>{
  it("uses actual gateway metadata and credential endpoints, with no arbitrary owner or leaked errors",async()=>{
-  const {gatewayClient,gatewayCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>null});vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
+  const {gatewayClient,gatewayCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockImplementation(async () => fixtureResponse({ok:true,json:async()=>null}));vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
   await gatewayClient.snapshot(signal);await gatewayClient.receipt(id,signal);await gatewayCredentialClient.setCredential(id,{id,expected_revision:0,secret:"fixture"},signal);await gatewayCredentialClient.deleteCredential(id,{id,expected_revision:0},signal);await gatewayCredentialClient.cleanupCredential(id,{id},signal);await gatewayCredentialClient.operation(id,signal);
   expect(fetcher.mock.calls.map(call=>[call[0],call[1].method])).toEqual([["/api/v1/gateway","GET"],[`/api/v1/gateway/commands/${id}`,"GET"],[`/api/v1/gateway/credentials/${id}`,"POST"],[`/api/v1/gateway/credentials/${id}`,"DELETE"],[`/api/v1/gateway/credentials/cleanup/${id}`,"POST"],[`/api/v1/gateway/credential-operations/${id}`,"GET"]]);expect(()=>gatewayCredentialClient.operation("../providers",signal)).toThrow();expect(fetcher).toHaveBeenCalledTimes(6);
-  fetcher.mockResolvedValue({ok:false,json:async()=>({error:"SECRET_CANARY"})});await expect(gatewayCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
+  fetcher.mockImplementation(async () => fixtureResponse({ok:false,json:async()=>({error:"SECRET_CANARY"})}));await expect(gatewayCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
  });
 });

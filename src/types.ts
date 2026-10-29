@@ -13,6 +13,7 @@ export interface Message {
   content: string;
   created_at: string;
   task_id?: string;
+  history_offset?: number;
 }
 export interface Session {
   id: string;
@@ -296,6 +297,11 @@ export interface ContextState {
   updated_at: string;
 }
 export interface Snapshot {
+  history?: {
+    version: 1; anchor: string;
+    collections: Record<string, { total: number; returned: number; has_more: boolean; pending?: number; omitted?: number; pinned?: number; pinned_pending?: number; unavailable?: { id: string; reason: string }[] }>;
+    session_messages: Record<string, { offset: number; total: number; returned: number; has_more_before: boolean; unavailable?: { id: string; offset: number; reason: string }[] }>;
+  };
   named_providers?: NamedProviders;
   managed_capabilities?: ManagedCapabilities;
   execution_requests?: ExecutionRequest[];
