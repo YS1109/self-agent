@@ -25,9 +25,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p harness-core -p harness-daemon -p harness-cli --all-targets -- -D warnings
-      - run: cargo test -p harness-core -p harness-daemon -p harness-cli
-      - run: cargo build -p harness-daemon -p harness-cli
+      - run: cargo clippy -p harness-core -p harness-daemon -p harness-cli -p harness-gateway --all-targets -- -D warnings
+      - run: cargo test -p harness-core -p harness-daemon -p harness-cli -p harness-gateway
+      - run: cargo build -p harness-daemon -p harness-cli -p harness-gateway
       - run: python scripts/smoke.py
       - run: python scripts/provider_smoke.py
       - run: python scripts/configuration_smoke.py
@@ -44,6 +44,7 @@ jobs:
       - run: python scripts/execution_control_smoke.py
       - run: python scripts/capabilities_smoke.py
       - run: python scripts/qq_smoke.py
+      - run: python scripts/gateway_smoke.py
       - run: python scripts/reliability_smoke.py
 
   desktop:
@@ -72,6 +73,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: pnpm build:web
+      - run: pnpm build:mobile
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

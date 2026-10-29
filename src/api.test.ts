@@ -205,3 +205,12 @@ describe("owner reliability transport", () => {
     expect(invoke).toHaveBeenCalledWith("api_request", { method: "GET", path: "/api/v1/reliability/diagnostics", body: null }); expect(fetcher).not.toHaveBeenCalled();
   });
 });
+
+describe("Gateway owner transport",()=>{
+ it("uses actual gateway metadata and credential endpoints, with no arbitrary owner or leaked errors",async()=>{
+  const {gatewayClient,gatewayCredentialClient}=await import("./api");const id="11111111-1111-4111-8111-111111111111";vi.stubGlobal("window",{});const fetcher=vi.fn().mockResolvedValue({ok:true,json:async()=>null});vi.stubGlobal("fetch",fetcher);const signal=new AbortController().signal;
+  await gatewayClient.snapshot(signal);await gatewayClient.receipt(id,signal);await gatewayCredentialClient.setCredential(id,{id,expected_revision:0,secret:"fixture"},signal);await gatewayCredentialClient.deleteCredential(id,{id,expected_revision:0},signal);await gatewayCredentialClient.cleanupCredential(id,{id},signal);await gatewayCredentialClient.operation(id,signal);
+  expect(fetcher.mock.calls.map(call=>[call[0],call[1].method])).toEqual([["/api/v1/gateway","GET"],[`/api/v1/gateway/commands/${id}`,"GET"],[`/api/v1/gateway/credentials/${id}`,"POST"],[`/api/v1/gateway/credentials/${id}`,"DELETE"],[`/api/v1/gateway/credentials/cleanup/${id}`,"POST"],[`/api/v1/gateway/credential-operations/${id}`,"GET"]]);expect(()=>gatewayCredentialClient.operation("../providers",signal)).toThrow();expect(fetcher).toHaveBeenCalledTimes(6);
+  fetcher.mockResolvedValue({ok:false,json:async()=>({error:"SECRET_CANARY"})});await expect(gatewayCredentialClient.operation(id,signal)).rejects.not.toThrow("SECRET_CANARY");
+ });
+});

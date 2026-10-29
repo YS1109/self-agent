@@ -22,9 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 pub(crate) const MAX_DATABASE_BYTES: usize = 128 * 1024 * 1024;
-const LEDGER_ID: &str = "self-agent-schema-v1-atomic-baseline";
+const LEDGER_V1: &str = "self-agent-schema-v1-atomic-baseline";
+const LEDGER_V2: &str = "self-agent-schema-v2-gateway";
 const MAIN: &str = "harness.sqlite";
 const JOURNAL: &str = ".restore-journal.json";
 const COMMIT: &str = ".restore-committed.json";
@@ -60,7 +61,12 @@ fn preflight_inner(db: &Connection) -> Result<u32> {
             .prepare("SELECT version,identity FROM storage_migrations ORDER BY version")?
             .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if records != vec![(SCHEMA_VERSION, LEDGER_ID.into())] {
+        let expected = if version == 1 {
+            vec![(1, LEDGER_V1.into())]
+        } else {
+            vec![(1, LEDGER_V1.into()), (2, LEDGER_V2.into())]
+        };
+        if records != expected {
             bail!("数据库迁移记录不受支持；未修改原数据");
         }
     }
@@ -71,27 +77,35 @@ fn preflight_inner(db: &Connection) -> Result<u32> {
 /// COMMIT itself. Version 1 is the atomic baseline of the pre-ledger schemas.
 pub(crate) fn migrate(
     db: &mut Connection,
-    schema: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    baseline: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    upgrade: impl FnOnce(&Transaction<'_>) -> Result<()>,
 ) -> Result<()> {
-    migrate_inner(db, schema)
+    migrate_inner(db, baseline, upgrade)
         .map_err(|_| anyhow::anyhow!("数据库迁移失败；事务已回滚，未重建或删除原数据"))
 }
 fn migrate_inner(
     db: &mut Connection,
-    schema: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    baseline: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    upgrade: impl FnOnce(&Transaction<'_>) -> Result<()>,
 ) -> Result<()> {
     let version = preflight(db)?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    preflight(&tx)?;
-    schema(&tx)?;
-    tx.execute_batch("CREATE TABLE storage_migrations(version INTEGER PRIMARY KEY,identity TEXT NOT NULL); PRAGMA user_version=1;")?;
-    tx.execute(
-        "INSERT INTO storage_migrations(version,identity) VALUES(?1,?2)",
-        rusqlite::params![SCHEMA_VERSION, LEDGER_ID],
-    )?;
+    let version = preflight(&tx)?;
+    if version == 0 {
+        baseline(&tx)?;
+        tx.execute_batch("CREATE TABLE storage_migrations(version INTEGER PRIMARY KEY,identity TEXT NOT NULL); PRAGMA user_version=1;")?;
+        tx.execute("INSERT INTO storage_migrations VALUES(1,?1)", [LEDGER_V1])?;
+    }
+    // The trusted upgrade callback MUST validate the unchanged v1 compiled
+    // application shape before any gateway DDL. Never run baseline repair on v1.
+    if version < 2 {
+        upgrade(&tx)?;
+        tx.execute("INSERT INTO storage_migrations VALUES(2,?1)", [LEDGER_V2])?;
+        tx.execute_batch("PRAGMA user_version=2;")?;
+    }
     tx.commit()?;
     Ok(())
 }

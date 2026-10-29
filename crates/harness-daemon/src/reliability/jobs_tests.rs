@@ -141,7 +141,7 @@ fn completed_receipt_uses_actual_export_manifest_without_public_path() {
     std::fs::create_dir(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let mut source = Connection::open_in_memory().unwrap();
-    super::super::storage::migrate(&mut source, |_| Ok(())).unwrap();
+    super::super::storage::migrate(&mut source, |_| Ok(()), |_| Ok(())).unwrap();
     let manifest = super::super::storage::export_backup(
         &source,
         &root,

@@ -396,3 +396,340 @@ fn event_ddl_accepts_published_alter_quotes_but_not_extra_tokens_or_quoted_keywo
         assert!(event_schema_tokens(invalid).is_err());
     }
 }
+
+fn downgrade_actual_store_to_v1(db: &Connection) {
+    for (table, _) in REQUIRED_SCHEMA
+        .iter()
+        .filter(|(name, _)| name.starts_with("gateway_"))
+    {
+        db.execute_batch(&format!("DROP TABLE {table};")).unwrap();
+    }
+    db.execute_batch("DELETE FROM storage_migrations WHERE version=2; PRAGMA user_version=1;")
+        .unwrap();
+}
+#[test]
+fn real_v1_migration_only_adds_gateway_preserves_history_and_ledger_identity() {
+    let f = Fixture::new();
+    let mut store = f.store("v1");
+    put_body(&store.db, "sessions", "session", &session("session"));
+    downgrade_actual_store_to_v1(&store.db);
+    let before: String = store
+        .db
+        .query_row("SELECT body FROM sessions WHERE id='session'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(storage::preflight(&store.db).unwrap(), 1);
+    super::super::prepare_database(&mut store.db).unwrap();
+    assert_eq!(storage::preflight(&store.db).unwrap(), 2);
+    let after: String = store
+        .db
+        .query_row("SELECT body FROM sessions WHERE id='session'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(before, after);
+    validate_records(&store.db).unwrap();
+    let ids: Vec<String> = store
+        .db
+        .prepare("SELECT identity FROM storage_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        ids,
+        [
+            "self-agent-schema-v1-atomic-baseline",
+            "self-agent-schema-v2-gateway"
+        ]
+    );
+}
+#[test]
+fn malformed_v1_missing_column_or_unique_is_not_repaired_or_partially_upgraded() {
+    for damage in ["ALTER TABLE tasks RENAME COLUMN body TO wrong", "ALTER TABLE deliveries RENAME TO saved_deliveries;CREATE TABLE deliveries(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,body TEXT NOT NULL);DROP TABLE saved_deliveries;"] {
+        let f=Fixture::new();let mut store=f.store("v1");downgrade_actual_store_to_v1(&store.db);store.db.execute_batch(damage).unwrap();
+        assert!(super::super::prepare_database(&mut store.db).is_err());assert_eq!(storage::preflight(&store.db).unwrap(),1);
+        assert_eq!(store.db.query_row("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'gateway_%'",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    }
+}
+#[test]
+fn real_v1_failed_gateway_upgrade_rolls_back_all_gateway_tables() {
+    let f = Fixture::new();
+    let mut store = f.store("v1");
+    downgrade_actual_store_to_v1(&store.db);
+    assert!(storage::migrate(
+        &mut store.db,
+        |_| panic!("must not run baseline"),
+        |tx| {
+            validate_v1_records(tx)?;
+            super::super::gateway::migrate(tx)?;
+            bail!("fixture after gateway DDL")
+        }
+    )
+    .is_err());
+    assert_eq!(storage::preflight(&store.db).unwrap(), 1);
+    validate_v1_records(&store.db).unwrap();
+    assert_eq!(
+        store
+            .db
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'gateway_%'",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn actual_restore_revokes_gateway_authority_and_preserves_inert_audit_and_text() {
+    use crate::capabilities::vault::{FreshCredential, SecretBytes};
+    use crate::gateway::{configuration as config, credentials, persistence, resources};
+    let f = Fixture::new();
+    let mut store = f.store("gateway-source");
+    let device = new_id();
+    let principal = new_id();
+    let pairing = new_id();
+    let task = new_id();
+    let session_id = new_id();
+    let op = new_id();
+    let command = new_id();
+    let tx = store.db.transaction().unwrap();
+    let c = config::create(&tx, "https://gateway.example.invalid/", &device).unwrap();
+    let scoped = crate::gateway::credential_binding(&c.id, &c.scope_digest).unwrap();
+    let fresh = FreshCredential::new(
+        &scoped,
+        SecretBytes::new(b"fixture-never-written".to_vec()).unwrap(),
+    );
+    let c = config::attach_credential(
+        &tx,
+        &c.id,
+        c.revision,
+        fresh.reference().as_str(),
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    let c = config::update(
+        &tx,
+        &c.id,
+        c.revision,
+        config::ConfigPatch {
+            origin: c.origin.clone(),
+            device_id: device.clone(),
+            enabled: true,
+        },
+        1,
+        |_| Ok(true),
+    )
+    .unwrap();
+    let ch = persistence::TrustedChannel {
+        device_id: device.clone(),
+        config_revision: c.revision,
+    };
+    let issued = persistence::issue_pairing(&tx, &ch, 1, 60).unwrap();
+    let grant = crate::gateway::wire::GatewayGrant {
+        session_ids: vec![session_id.clone()],
+        permissions: Default::default(),
+        controls: serde_json::to_value(harness_core::TaskControls::default()).unwrap(),
+        expires_at_ms: 60000,
+    };
+    let b = persistence::Binding {
+        principal_id: principal.clone(),
+        device_id: device.clone(),
+        config_revision: c.revision,
+        revision: 1,
+        status: "active".into(),
+        label: "fixture browser".into(),
+        pairing_id: pairing,
+        expires_at_ms: 60000,
+        grant: Some(grant),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    tx.execute(
+        "INSERT INTO gateway_bindings VALUES(?1,?2,?3,1,'active',60000,?4)",
+        params![
+            principal,
+            device,
+            c.revision,
+            serde_json::to_string(&b).unwrap()
+        ],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO gateway_receipts VALUES(?1,?2,?3,?4,1,?5,?6,'{}',0,1)",
+        params![
+            command,
+            device,
+            c.revision,
+            principal,
+            session_id,
+            "a".repeat(64)
+        ],
+    )
+    .unwrap();
+    let next = FreshCredential::new(
+        &scoped,
+        SecretBytes::new(b"another-fixture-never-written".to_vec()).unwrap(),
+    );
+    credentials::begin_set(
+        &tx,
+        &op,
+        &c.id,
+        c.revision,
+        next.reference().as_str(),
+        |_, _, _| Ok(()),
+    )
+    .unwrap();
+    credentials::claim(&tx, &op, |_, _, _| Ok(())).unwrap();
+    let resource = resources::mint(
+        &tx,
+        &task,
+        &session_id,
+        "result",
+        "result.txt",
+        "historical redacted text",
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    validate_records(&store.db).unwrap();
+    let bundle = f.bundle(&store, "gateway-backup");
+    let manifest = storage::inspect_backup(&bundle).unwrap();
+    let target = f.0.join("gateway-restored");
+    crate::maintenance::restore_backup(&target, &bundle, &manifest.sha256).unwrap();
+    let mut restored = Store::open(&target.join("harness.sqlite")).unwrap();
+    let c = config::current(&restored.db).unwrap().unwrap();
+    assert!(!c.enabled);
+    assert!(c.credential_ref().is_none());
+    let tx = restored.db.transaction().unwrap();
+    assert_eq!(
+        persistence::binding(&tx, &principal).unwrap().status,
+        "revoked"
+    );
+    assert_eq!(
+        tx.query_row(
+            "SELECT status FROM gateway_pairings WHERE id=?1",
+            [issued.id],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "revoked"
+    );
+    assert_eq!(
+        tx.query_row(
+            "SELECT invalidated FROM gateway_receipts WHERE command_id=?1",
+            [command],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let operation = credentials::operation(&tx, &op).unwrap();
+    assert_eq!(operation.status, "unknown");
+    assert!(!operation.can_cleanup);
+    assert!(credentials::claim(&tx, &op, |_, _, _| panic!("no replay"))
+        .unwrap()
+        .is_none());
+    assert!(credentials::begin_cleanup(&tx, &new_id(), &op).is_err());
+    assert_eq!(
+        resources::read(&tx, &resource.id, &task, &session_id)
+            .unwrap()
+            .content,
+        "historical redacted text"
+    );
+    assert!(resources::read(&tx, &resource.id, &task, &new_id()).is_err());
+    assert_eq!(
+        tx.query_row("SELECT count(*) FROM gateway_connection", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn gateway_unique_keys_are_compiled_requirements_not_imported_assumptions() {
+    let f = Fixture::new();
+    let store = f.store("unique");
+    for (table, from, to) in [
+        (
+            "gateway_configuration",
+            "id TEXT NOT NULL UNIQUE",
+            "id TEXT NOT NULL",
+        ),
+        (
+            "gateway_pairings",
+            "code_hash TEXT NOT NULL UNIQUE",
+            "code_hash TEXT NOT NULL",
+        ),
+        (
+            "gateway_text_resources",
+            ",\n        UNIQUE(task_id,kind)",
+            "",
+        ),
+    ] {
+        store.db.execute_batch("SAVEPOINT damage;").unwrap();
+        let ddl: String = store
+            .db
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let modified = ddl.replace(from, to);
+        assert_ne!(ddl, modified, "fixture must remove constraint: {table}");
+        store
+            .db
+            .execute_batch(&format!("DROP TABLE {table};{modified};"))
+            .unwrap();
+        assert!(
+            validate_records(&store.db).is_err(),
+            "missing unique: {table}"
+        );
+        store
+            .db
+            .execute_batch("ROLLBACK TO damage; RELEASE damage;")
+            .unwrap();
+    }
+}
+#[test]
+fn forged_gateway_text_and_unscoped_vault_reference_reject_before_destination_replace() {
+    for kind in ["resource_hash", "credential_scope"] {
+        let f = Fixture::new();
+        let mut store = f.store("source");
+        let tx = store.db.transaction().unwrap();
+        let c = crate::gateway::configuration::create(
+            &tx,
+            "https://gateway.example.invalid/",
+            &new_id(),
+        )
+        .unwrap();
+        let resource = crate::gateway::resources::mint(
+            &tx,
+            &new_id(),
+            &new_id(),
+            "result",
+            "result.txt",
+            "safe historical text",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let bundle = f.bundle(&store, "gateway-forged");
+        drop(store);
+        let sha = forge(&bundle, |db| {
+            if kind == "resource_hash" {
+                db.execute(
+                    "UPDATE gateway_text_resources SET sha256=?1 WHERE id=?2",
+                    params!["0".repeat(64), resource.id],
+                )
+                .unwrap();
+            } else {
+                db.execute("UPDATE gateway_configuration SET credential_ref='unscoped-reference' WHERE id=?1",[c.id]).unwrap();
+            }
+        });
+        rejected_without_replacement(&f, &bundle, &sha);
+    }
+}

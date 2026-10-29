@@ -12,7 +12,9 @@
     "tauri": "tauri",
     "dev:web": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build:web": "tsc -b && vite build",
-    "desktop:build": "node scripts/build-desktop.mjs"
+    "desktop:build": "node scripts/build-desktop.mjs",
+    "dev:mobile": "vite --config vite.mobile.config.ts",
+    "build:mobile": "tsc -b && vite build --config vite.mobile.config.ts"
   },
   "dependencies": {
     "@fontsource/geist": "^5.2.0",
@@ -36,6 +38,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.1.0",
+    "jsdom": "30.0.0",
     "tailwindcss": "^4.1.0",
     "typescript": "^5.9.0",
     "vite": "^7.2.0",

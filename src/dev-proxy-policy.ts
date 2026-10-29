@@ -8,6 +8,8 @@ const routes: Record<string, string> = {
   "GET /api/v1/reliability": "GET",
   "GET /api/v1/reliability/diagnostics": "GET",
   "POST /api/v1/reliability/backups": "POST",
+  "GET /api/v1/gateway": "GET",
+  "POST /api/v1/gateway/commands": "POST",
   "GET /api/v1/qq": "GET",
   "POST /api/v1/qq/commands": "POST",
   "GET /api/v1/providers": "GET",
@@ -55,6 +57,12 @@ export function qqProxyPath(method:string,path:string):boolean {
  if(method==="POST"&&new RegExp(`^/api/v1/qq/credentials/cleanup/${id}$`).test(path))return true;
  return ["POST","DELETE"].includes(method)&&new RegExp(`^/api/v1/qq/credentials/${id}$`).test(path);
 }
+export function gatewayProxyPath(method:string,path:string):boolean {
+ const id="[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+ if(method==="GET")return new RegExp(`^/api/v1/gateway/(?:commands|credential-operations)/${id}$`).test(path);
+ if(method==="POST"&&new RegExp(`^/api/v1/gateway/credentials/cleanup/${id}$`).test(path))return true;
+ return ["POST","DELETE"].includes(method)&&new RegExp(`^/api/v1/gateway/credentials/${id}$`).test(path);
+}
 
 export function allowDevelopmentProxy(
   method: string,
@@ -63,7 +71,7 @@ export function allowDevelopmentProxy(
   fetchSite: string | undefined,
   contentType: string | undefined,
 ): boolean {
-  if (!qqProxyPath(method,path) && !mcpCredentialProxyPath(method,path) && !Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (backupReceiptProxyPath(path) || eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
+  if (!gatewayProxyPath(method,path) && !qqProxyPath(method,path) && !mcpCredentialProxyPath(method,path) && !Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (backupReceiptProxyPath(path) || eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
   if (fetchSite === "cross-site") return false;
   if (origin && !localOrigins.has(origin)) return false;
   return (

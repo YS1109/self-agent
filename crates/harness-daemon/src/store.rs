@@ -17,6 +17,7 @@ mod changes;
 mod continuation;
 mod decisions;
 pub(crate) mod execution;
+pub(crate) mod gateway;
 pub(crate) mod providers;
 pub(crate) mod qq;
 pub(crate) mod reliability;
@@ -38,9 +39,11 @@ pub struct Store {
 /// Trusted application baseline. All current schema creation and legacy event
 /// conversion share one ledger transaction; adapters cannot migrate outside it.
 pub(crate) fn prepare_database(db: &mut Connection) -> Result<()> {
-    crate::reliability::storage::migrate(db, |tx| {
-        let db: &Connection = tx;
-        db.execute_batch(
+    crate::reliability::storage::migrate(
+        db,
+        |tx| {
+            let db: &Connection = tx;
+            db.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -52,37 +55,43 @@ pub(crate) fn prepare_database(db: &mut Connection) -> Result<()> {
              CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, task_id TEXT UNIQUE NOT NULL, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS settings(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
         )?;
-        db.execute_batch(
+            db.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_contexts(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS task_changes(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS execution_requests(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, body TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS execution_requests_task ON execution_requests(task_id);",
         )?;
-        capabilities::migrate(db)?;
-        capability_credentials::migrate(db)?;
-        providers::migrate(db)?;
-        qq::migrate(db)?;
-        crate::reliability::jobs::migrate(tx)?;
-        // One atomic migration preserves legacy UUIDs and insertion order. An
-        // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
-        let has_sequence = db
-            .prepare("PRAGMA table_info(events)")?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .iter()
-            .any(|name| name == "sequence");
-        if !has_sequence {
-            db.execute_batch(
-                "CREATE TABLE events_v7(sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            capabilities::migrate(db)?;
+            capability_credentials::migrate(db)?;
+            providers::migrate(db)?;
+            qq::migrate(db)?;
+            crate::reliability::jobs::migrate(tx)?;
+            // One atomic migration preserves legacy UUIDs and insertion order. An
+            // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
+            let has_sequence = db
+                .prepare("PRAGMA table_info(events)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "sequence");
+            if !has_sequence {
+                db.execute_batch(
+                    "CREATE TABLE events_v7(sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                      id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
                  INSERT INTO events_v7(id,body) SELECT id,body FROM events ORDER BY rowid;
                  DROP TABLE events;
                  ALTER TABLE events_v7 RENAME TO events;",
-            )?;
-        }
-        reliability::validate_records(db)?;
-        Ok(())
-    })?;
+                )?;
+            }
+            reliability::validate_v1_records(db)?;
+            Ok(())
+        },
+        |tx| {
+            reliability::validate_v1_records(tx)?;
+            gateway::migrate(tx)?;
+            reliability::validate_records(tx)
+        },
+    )?;
     reliability::validate_records(db)
 }
 
@@ -167,6 +176,7 @@ impl Store {
         capability_credentials::recover(&tx)?;
         providers::recover(&tx)?;
         qq::recover(&tx)?;
+        gateway::recover(&tx)?;
         decisions::recover_pending(&tx)?;
         execution::recover_execution_cleanup(&tx)?;
         changes::recover_changes(&tx)?;
@@ -417,6 +427,7 @@ impl Store {
     pub fn claim_task(&mut self) -> Result<Option<Value>> {
         let tx = self.db.transaction()?;
         qq::reconcile(&tx)?;
+        gateway::reconcile(&tx)?;
         advance_plans(&tx)?;
         let mut candidates = rows(&tx, "tasks")?;
         candidates.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
@@ -620,6 +631,7 @@ impl Store {
     pub fn claim_coordinator_job(&mut self) -> Result<Option<Value>> {
         let tx = self.db.transaction()?;
         qq::reconcile(&tx)?;
+        gateway::reconcile(&tx)?;
         advance_plans(&tx)?;
         let mut jobs = rows(&tx, "coordinator_jobs")?;
         jobs.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
@@ -658,6 +670,7 @@ impl Store {
         let job = record(&self.db, "coordinator_jobs", job_id)?;
         Ok(job["status"] == "running"
             && qq::check_source(&self.db, &job).is_ok()
+            && gateway::check_source(&self.db, &job).is_ok()
             && (job["kind"] != "review" || review_target_current(&self.db, &job)?)
             && (job["kind"] != "change" || change_target_active(&self.db, &job)?))
     }
@@ -713,6 +726,7 @@ impl Store {
         // Fence the result inside its commit transaction, not just the wait loop.
         let result = result.and_then(|value| {
             qq::check_source(&tx, &job)?;
+            gateway::check_source(&tx, &job)?;
             providers::check_coordinator_provider(&tx, job_id)
                 .map_err(|_| anyhow!("作业固定的模型服务已改变，未应用旧服务返回的结果"))?;
             if value["action"] == "plan" {
@@ -1850,12 +1864,17 @@ fn complete_transaction(tx: &Transaction<'_>, task: &mut Value) -> Result<RunEve
         "cancelled" => "已取消",
         _ => status,
     };
-    put(
-        tx,
-        "deliveries",
-        &json!({"id":new_id(),"task_id":task_id,"session_id":session_id,"target":task["source"],
+    // Gateway is a scoped read/SSE transport, not an outbound delivery adapter.
+    // Durable task/event/session state below is the only result authority; do not
+    // create an unfulfillable callback or pretend a network send succeeded.
+    if task["source"]["channel_id"] != "gateway" {
+        put(
+            tx,
+            "deliveries",
+            &json!({"id":new_id(),"task_id":task_id,"session_id":session_id,"target":task["source"],
         "status":"pending","payload":format!("会话 {session_id} 的任务 {task_id}：{status_label}\n{result}"),"attempts":0,"created_at":now(),"updated_at":now()}),
-    )?;
+        )?;
+    }
     let mut session = record(tx, "sessions", session_id)?;
     append_message(&mut session, "assistant", result, Some(task_id))?;
     put(tx, "sessions", &session)?;

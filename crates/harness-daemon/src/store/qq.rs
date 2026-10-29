@@ -435,7 +435,9 @@ impl Store {
         Ok(result)
     }
     pub(crate) fn check_task_remote(&self, id: &str) -> Result<()> {
-        check_source(&self.db, &record(&self.db, "tasks", id)?)
+        let task = record(&self.db, "tasks", id)?;
+        check_source(&self.db, &task)?;
+        super::gateway::check_source(&self.db, &task)
     }
 }
 /// For snapshots and running work, source fields must match the immutable route.

@@ -160,3 +160,9 @@ it("owner backup routes are exact, read-only recovery/diagnostics cannot restore
   for (const [method, path] of [["GET", "/api/v1/reliability/backups"], ["POST", `/api/v1/reliability/backups/${id}`], ["DELETE", `/api/v1/reliability/backups/${id}`], ["POST", "/api/v1/reliability/diagnostics"], ["POST", "/api/v1/reliability/restore"], ["POST", "/api/v1/reliability/stop"], ["GET", "/api/v1/reliability/backups/../snapshot"], ["GET", `/api/v1/reliability/backups/${id.toUpperCase()}`]]) expect(allowDevelopmentProxy(method, path, undefined, "same-origin", "application/json")).toBe(false);
   expect(allowDevelopmentProxy("POST", "/api/v1/reliability/backups", undefined, "same-origin", "text/plain")).toBe(false);
 });
+
+it("limits gateway methods and canonical routes without broad credential proxy",()=>{
+ const id="11111111-1111-4111-8111-111111111111";
+ for(const [method,path] of [["GET","/api/v1/gateway"],["POST","/api/v1/gateway/commands"],["GET",`/api/v1/gateway/commands/${id}`],["GET",`/api/v1/gateway/credential-operations/${id}`],["POST",`/api/v1/gateway/credentials/${id}`],["DELETE",`/api/v1/gateway/credentials/${id}`],["POST",`/api/v1/gateway/credentials/cleanup/${id}`]]){expect(allowDevelopmentProxy(method,path,undefined,"same-origin","application/json")).toBe(true);expect(allowDevelopmentProxy(method,path+"?owner=provider",undefined,"same-origin","application/json")).toBe(false);expect(allowDevelopmentProxy(method,path,"https://evil.invalid","cross-site","application/json")).toBe(false);}
+ for(const method of ["GET","PUT","PATCH"]){expect(allowDevelopmentProxy(method,`/api/v1/gateway/credentials/${id}`,undefined,"same-origin","application/json")).toBe(false);}expect(allowDevelopmentProxy("DELETE",`/api/v1/gateway/credentials/${id}`,undefined,"same-origin","text/plain")).toBe(false);
+});

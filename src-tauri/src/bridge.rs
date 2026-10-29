@@ -296,6 +296,32 @@ fn qq_route(method: &str, path: &str) -> bool {
             .strip_prefix("/api/v1/qq/credentials/")
             .is_some_and(scoped_uuid)
 }
+fn gateway_route(method: &str, path: &str) -> bool {
+    if (method == "GET" && path == "/api/v1/gateway")
+        || (method == "POST" && path == "/api/v1/gateway/commands")
+    {
+        return true;
+    }
+    if method == "GET" {
+        return [
+            "/api/v1/gateway/commands/",
+            "/api/v1/gateway/credential-operations/",
+        ]
+        .iter()
+        .any(|prefix| path.strip_prefix(prefix).is_some_and(scoped_uuid));
+    }
+    if method == "POST"
+        && path
+            .strip_prefix("/api/v1/gateway/credentials/cleanup/")
+            .is_some_and(scoped_uuid)
+    {
+        return true;
+    }
+    matches!(method, "POST" | "DELETE")
+        && path
+            .strip_prefix("/api/v1/gateway/credentials/")
+            .is_some_and(scoped_uuid)
+}
 
 fn reliability_route(method: &str, path: &str) -> bool {
     (method == "GET"
@@ -318,7 +344,7 @@ fn validate_route(method: &str, path: &str) -> Result<Method, String> {
             Method::POST
         });
     }
-    if qq_route(method, path) {
+    if qq_route(method, path) || gateway_route(method, path) {
         return Ok(match method {
             "GET" => Method::GET,
             "DELETE" => Method::DELETE,
@@ -597,5 +623,30 @@ mod reliability_route_tests {
         ] {
             assert!(validate_route(method, &path).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_route_tests {
+    use super::*;
+    #[test]
+    fn gateway_scope_routes_have_exact_methods_and_ids() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for (method, path) in [
+            ("GET", "/api/v1/gateway".into()),
+            ("POST", "/api/v1/gateway/commands".into()),
+            ("GET", format!("/api/v1/gateway/commands/{id}")),
+            ("GET", format!("/api/v1/gateway/credential-operations/{id}")),
+            ("POST", format!("/api/v1/gateway/credentials/{id}")),
+            ("DELETE", format!("/api/v1/gateway/credentials/{id}")),
+            ("POST", format!("/api/v1/gateway/credentials/cleanup/{id}")),
+        ] {
+            assert!(validate_route(method, &path).is_ok());
+            assert!(validate_route(method, &format!("{path}?owner=provider")).is_err());
+        }
+        for method in ["GET", "PUT", "PATCH"] {
+            assert!(validate_route(method, &format!("/api/v1/gateway/credentials/{id}")).is_err());
+        }
+        assert!(validate_route("POST", "/api/v1/gateway/credentials/../providers").is_err());
     }
 }

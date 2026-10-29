@@ -6,6 +6,7 @@ mod context;
 mod continuation;
 mod coordinator;
 mod execution_control;
+mod gateway;
 pub mod maintenance;
 mod model_config;
 mod models;
@@ -200,6 +201,8 @@ pub struct AppState {
     pub capability_probe_gate: Arc<Semaphore>,
     pub(crate) storage_lease: Option<Arc<maintenance::DataLease>>,
     pub(crate) backup_gate: Arc<Semaphore>,
+    pub(crate) gateway_stop: tokio::sync::watch::Sender<bool>,
+    pub(crate) gateway_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) qq_stop: tokio::sync::watch::Sender<bool>,
     pub(crate) qq_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -273,6 +276,8 @@ impl AppState {
             capability_probe_gate: Arc::new(Semaphore::new(2)),
             storage_lease,
             backup_gate: Arc::new(Semaphore::new(2)),
+            gateway_stop: tokio::sync::watch::channel(false).0,
+            gateway_worker: Mutex::new(None),
             qq_stop: tokio::sync::watch::channel(false).0,
             qq_worker: Mutex::new(None),
         }))
@@ -281,6 +286,17 @@ impl AppState {
     /// Best-effort bounded draining; a blocked OS mutation remains uncertain
     /// and its durable intent is recovered without replay on the next startup.
     pub async fn shutdown_credentials(&self) -> bool {
+        self.gateway_stop.send_replace(true);
+        let gateway_worker = { self.gateway_worker.lock().unwrap().take() };
+        let gateway_settled = if let Some(mut worker) = gateway_worker {
+            // Do not abort an accepted SQLite worker. It keeps AppState/data
+            // lease until the original transaction settles; no RPC replay.
+            tokio::time::timeout(Duration::from_secs(2), &mut worker)
+                .await
+                .is_ok()
+        } else {
+            true
+        };
         self.qq_stop.send_replace(true);
         let worker = { self.qq_worker.lock().unwrap().take() };
         if let Some(mut worker) = worker {
@@ -292,10 +308,12 @@ impl AppState {
                 let _ = worker.await;
             }
         }
-        self.vault
+        let vault_stopped = self
+            .vault
             .shutdown(std::time::Instant::now() + Duration::from_secs(2))
             .await
-            == capabilities::vault::ShutdownStatus::Stopped
+            == capabilities::vault::ShutdownStatus::Stopped;
+        gateway_settled && vault_stopped
     }
 
     pub fn publish(&self, event: RunEvent) {
@@ -308,6 +326,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/snapshot", get(snapshot))
         .merge(capabilities::credential_api::routes())
         .merge(reliability::api::routes())
+        .merge(gateway::api::routes())
         .route("/api/v1/qq", get(qq::api::snapshot))
         .route(
             "/api/v1/qq/commands",
@@ -797,6 +816,7 @@ async fn events(
 
 pub fn spawn_workers(state: Arc<AppState>) {
     qq::daemon::spawn(state.clone());
+    gateway::daemon::spawn(state.clone());
     coordinator::spawn(state.clone());
     for _ in 0..2 {
         let state = state.clone();

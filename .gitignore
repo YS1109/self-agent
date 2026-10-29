@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-mobile/
 target/
 coverage/
 .DS_Store

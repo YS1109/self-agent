@@ -1,3 +1,4 @@
+import type {GatewayClient,GatewayCredentialClient} from "./gateway-client";
 import type { ReliabilityClient } from "./reliability-client";
 import type {QqClient,QqCredentialClient} from "./qq-client";
 import {mcpSlotError,type McpCredentialClient} from "./mcp-credentials-client";
@@ -87,4 +88,18 @@ export const reliabilityClient:ReliabilityClient={
  backup:(body,signal)=>reliabilityRequest("POST","/reliability/backups",body,signal),
  receipt:(id,signal)=>{if(!providerUuid(id))throw new Error("备份操作标识无效");return reliabilityRequest("GET",`/reliability/backups/${id}`,undefined,signal);},
  diagnostics:signal=>reliabilityRequest("GET","/reliability/diagnostics",undefined,signal),
+};
+
+function gatewayId(id:string):string{if(!providerUuid(id))throw new Error("网关 配置或操作标识无效");return id;}
+async function gatewayRequest<T>(method:string,path:string,body:unknown,signal:AbortSignal):Promise<T>{try{return await api<T>(method,path,body,signal);}catch{throw new Error("网关 请求未确认，请检查原操作；未回显凭据或底层错误。");}}
+export const gatewayClient:GatewayClient={
+ snapshot:signal=>gatewayRequest("GET","/gateway",undefined,signal),
+ command:(envelope,signal)=>gatewayRequest("POST","/gateway/commands",envelope,signal),
+ receipt:(id,signal)=>gatewayRequest("GET",`/gateway/commands/${gatewayId(id)}`,undefined,signal),
+};
+export const gatewayCredentialClient:GatewayCredentialClient={
+ setCredential:(id,body,signal)=>gatewayRequest("POST",`/gateway/credentials/${gatewayId(id)}`,body,signal),
+ deleteCredential:(id,body,signal)=>gatewayRequest("DELETE",`/gateway/credentials/${gatewayId(id)}`,body,signal),
+ cleanupCredential:(id,body,signal)=>gatewayRequest("POST",`/gateway/credentials/cleanup/${gatewayId(id)}`,body,signal),
+ operation:(id,signal)=>gatewayRequest("GET",`/gateway/credential-operations/${gatewayId(id)}`,undefined,signal),
 };

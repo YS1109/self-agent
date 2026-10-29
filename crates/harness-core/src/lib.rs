@@ -1,5 +1,6 @@
 //! Shared records exchanged by the daemon, desktop bridge, and channel adapters.
 
+pub mod gateway;
 mod providers;
 pub use providers::*;
 mod capabilities;

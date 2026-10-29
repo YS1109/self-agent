@@ -1,3 +1,4 @@
+mod gateway;
 mod maintenance;
 use std::{
     io::{Read, Write},
@@ -34,6 +35,9 @@ const HELP: &str = r#"Self Agent 命令行客户端
   providers save <JSON文件|->       保存服务元数据（不接受密钥）
   providers enable <ID> <修订> <true|false>  显式启停命名服务
   providers delete <ID> <修订>      删除服务，遗留凭据需显式清理
+  gateway [snapshot] | command <JSON文件|-> | receipt <ID> | pair <秒数>
+  gateway credential-set <CONFIG> <修订> --stdin | credential-delete <CONFIG> <修订>
+  gateway credential-operation <ID> | cleanup <ID>  本机网关管理，不是远程owner代理
   qq [snapshot] | command <JSON文件|-> | receipt <ID> | pair <秒数>
   qq credential-set <CONFIG> <修订> --stdin | credential-delete <CONFIG> <修订>
   qq credential-operation <ID> | cleanup <ID>  只读查询/显式清理；不自动重发
@@ -305,7 +309,8 @@ fn command(options: &Options) -> Result<Option<Value>> {
         | "providers"
         | "provider-credential"
         | "mcp-credential"
-        | "qq" => return Ok(None),
+        | "qq"
+        | "gateway" => return Ok(None),
         _ => bail!("未知命令，使用 --help 查看用法"),
     };
     if let Some(path) = &options.controls {
@@ -1008,6 +1013,7 @@ async fn run(options: Options) -> Result<()> {
     let provider_request = provider_request(&options)?;
     let mcp_credential_request = mcp_credential_request(&options)?;
     let qq_request = qq_request(&options)?;
+    let gateway_request = gateway::request(&options)?;
     validate_follow(&options, command.as_ref())?;
     if options.command == "requests" {
         arity(&options, 0, 1)?;
@@ -1019,6 +1025,21 @@ async fn run(options: Options) -> Result<()> {
         .then(|| changes_route(&options))
         .transpose()?;
     let client = Client::open(&options.directory)?;
+    if let Some((method, path, body)) = gateway_request {
+        if method != "GET" {
+            eprintln!(
+                "网关 操作 ID：{}；结果未知时只读查询原操作，不会自动重发。",
+                options.command_id
+            );
+        }
+        let response = client.request(&method, &path, body).await.map_err(|_| {
+            anyhow::anyhow!(
+                "网关 请求未确认，请用receipt或credential-operation查询原ID；未回显凭据或底层错误"
+            )
+        })?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
     if let Some((method, path, body)) = qq_request {
         if method != "GET" {
             eprintln!(
@@ -1615,6 +1636,7 @@ mod tests {
                         || path.ends_with("/credential-delete")
                         || path.starts_with("/api/v1/credential-operations/")
                         || path.starts_with("/api/v1/qq/credentials/")
+                        || path.starts_with("/api/v1/gateway/credentials/")
                         || path.starts_with("/api/v1/capabilities/mcp/")
                         || path.starts_with("/api/v1/capability-credential-operations/")
                     {
@@ -1624,6 +1646,7 @@ mod tests {
                         assert!(envelope[if path == "/api/v1/capabilities/commands"
                             || path == "/api/v1/providers/commands"
                             || path == "/api/v1/qq/commands"
+                            || path == "/api/v1/gateway/commands"
                         {
                             "id"
                         } else {

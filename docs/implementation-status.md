@@ -254,3 +254,13 @@
 此切片不包含完整后台启停/drain、客户端兼容握手、更新安装器或生产发布。诊断不探测系统凭据，备份是私有历史而非脱敏材料。实际协议见 protocol-v12，门禁与未验证边界见 acceptance-v1.0；最终源码修复后的冻结全量和精确 SHA CI 必须另行记录。
 
 本切片独立候选冻结门禁通过：core 7 / daemon 527 / CLI 35 / 前端 222，事件桥 7、维护路由提取 1、Web 代理 3 组、17 个后台 smoke，以及 fmt / Clippy / 构建。独立源码复审闭环；精确 SHA CI 另行跟踪，真实 GUI/系统凭据/外部服务/安装发布仍未验证。
+
+## 0.10 网关/H5 接线（本地冻结通过，精确 CI 另列）
+
+独立认证网关与 daemon 出站连接、真实 Store 的配对/白名单命令/幂等回执/资源 ACL、系统凭据意图、桌面 owner 设置、CLI 和独立移动 H5 已接线；不是孤立 UI 占位。显式 schema v2 与恢复撤权已集成，真实本地 daemon + gateway + Native 模型协议夹具五组通过。
+
+H5 的 task/session/result/event/diff/纯文本产物读取都按实时授权；view-only 不暴露正文，artifact 需 results。新建远端任务持续绑定撤权；明确授权后已接受到桌面任务的补充/回答保留原所有权与审计，不因撤销而撤回。没有远程动作批准或 owner 管理 API。
+
+最终冻结/源码复核/精确 SHA CI 以 [acceptance-v0.10.md](acceptance-v0.10.md) 为准。浏览器会话仅内存、网关重启需重新配对；headless Chromium 被环境沙箱阻止，真实手机视觉、OS vault、公网 nginx/TLS、实际部署均未验证。0.10 不替代仍待交付的完整 1.0 生命周期/生产更新。
+
+0.10 最终本地冻结：core9 / daemon595 / CLI37 / gateway17 / 前端265、18个后台smoke、Web流式代理3组、桥路由提取4项、fmt/Clippy/构建均通过；独立实际集成审查clear。精确提交CI不能用这些本地证据替代。

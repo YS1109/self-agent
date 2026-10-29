@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/harness-core", "crates/harness-daemon", "crates/harness-cli", "src-tauri"]
-default-members = ["crates/harness-core", "crates/harness-daemon", "crates/harness-cli"]
+members = ["crates/harness-core", "crates/harness-daemon", "crates/harness-cli", "crates/harness-gateway", "src-tauri"]
+default-members = ["crates/harness-core", "crates/harness-daemon", "crates/harness-cli", "crates/harness-gateway"]
 resolver = "2"
 
 [workspace.package]

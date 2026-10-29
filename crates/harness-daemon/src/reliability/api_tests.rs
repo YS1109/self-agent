@@ -225,7 +225,7 @@ fn actual_store_migrates_legacy_events_and_rejects_newer_database_before_writes(
     let store = Store::open(&path).unwrap();
     drop(store);
     let db = rusqlite::Connection::open(&path).unwrap();
-    assert_eq!(storage::preflight(&db).unwrap(), 1);
+    assert_eq!(storage::preflight(&db).unwrap(), storage::SCHEMA_VERSION);
     assert_eq!(
         db.query_row("SELECT id FROM events WHERE sequence=1", [], |r| r
             .get::<_, String>(0))

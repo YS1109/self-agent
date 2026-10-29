@@ -1,3 +1,5 @@
+import {GatewaySettings} from "./components/gateway-settings";
+import {EMPTY_GATEWAY} from "./gateway-client";
 import { ReliabilitySettings } from "./components/reliability-settings";
 import {QqSettings} from "./components/qq-settings";
 import {EMPTY_QQ} from "./qq-client";
@@ -50,7 +52,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient, qqClient, qqCredentialClient, reliabilityClient } from "./api";
+import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient, qqClient, qqCredentialClient, gatewayClient, gatewayCredentialClient, reliabilityClient } from "./api";
 import { useDaemonSnapshot } from "./use-daemon-snapshot";
 import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
 import { TaskSupplements, ContinueTask } from "./components/task-controls";
@@ -89,7 +91,7 @@ import {
 } from "./types";
 
 type Panel = "plan" | "changes" | "artifacts" | "task";
-type Modal = "new" | "settings" | "remote" | "capabilities" | "providers" | "qq" | "reliability" | null;
+type Modal = "new" | "settings" | "remote" | "capabilities" | "providers" | "qq" | "gateway" | "reliability" | null;
 const time = (value: string) =>
   new Date(value).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -597,6 +599,7 @@ export default function App() {
             </span>
           </button>
           <button className="sidebar-link" onClick={() => setModal("reliability")}><ShieldCheck size={16}/><span>备份与诊断</span></button>
+          <button className="sidebar-link" onClick={() => setModal("gateway")}><Radio size={16}/><span>自托管网关 / H5</span></button>
           <button className="sidebar-link" onClick={() => setModal("qq")}><Radio size={16}/><span>QQ 官方应用</span></button>
           <button className="sidebar-link" onClick={() => setModal("remote")}>
             <Radio size={16} />
@@ -1329,6 +1332,10 @@ export default function App() {
 
       <ModalFrame error="" open={modal === "reliability"} onClose={()=>setModal(null)} title="备份与诊断" description="本机所有者维护入口；私有历史备份与固定字段诊断严格分开。" wide>
         {modal === "reliability" && <ReliabilitySettings client={reliabilityClient} disabled={!connected}/>}
+      </ModalFrame>
+
+      <ModalFrame error="" open={modal === "gateway"} onClose={()=>setModal(null)} title="自托管网关 / H5" description="出站设备连接、一次性配对与会话级授权；不是本机管理 API 的公网代理。" wide>
+        {modal === "gateway" && <GatewaySettings initialSnapshot={EMPTY_GATEWAY} client={gatewayClient} credentialClient={gatewayCredentialClient} registry={registry} sessions={snapshot.sessions} executor={settings.main_executor==="codex"?"codex":"native"} disabled={!connected}/>}
       </ModalFrame>
 
       <ModalFrame error="" open={modal === "qq"} onClose={()=>setModal(null)} title="QQ 官方应用" description="独立应用凭据、精确身份授权与被动回复；不是任意远端管理代理。" wide>

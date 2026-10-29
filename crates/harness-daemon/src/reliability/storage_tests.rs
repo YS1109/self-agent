@@ -19,7 +19,7 @@ fn schema(tx: &Transaction<'_>) -> Result<()> {
 }
 fn db(value: &str) -> Connection {
     let mut db = Connection::open_in_memory().unwrap();
-    migrate(&mut db, schema).unwrap();
+    migrate(&mut db, schema, |_| Ok(())).unwrap();
     db.execute(
         "INSERT INTO sessions VALUES('s',?1)",
         [json!({"messages":[value]}).to_string()],
@@ -46,7 +46,7 @@ fn bundle(root: &Root, value: &str) -> (PathBuf, BackupManifest) {
 fn original(root: &Root) -> Connection {
     let path = root.0.join(MAIN);
     let mut source = Connection::open(path).unwrap();
-    migrate(&mut source, schema).unwrap();
+    migrate(&mut source, schema, |_| Ok(())).unwrap();
     source
         .execute("INSERT INTO sessions VALUES('s','original')", [])
         .unwrap();
@@ -89,16 +89,20 @@ fn foreign_key_violations_reject_before_backup_publication() {
 fn migration_is_atomic_and_preserves_legacy_history() {
     let mut c = Connection::open_in_memory().unwrap();
     c.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,body TEXT NOT NULL);INSERT INTO sessions VALUES('s','old');").unwrap();
-    assert!(migrate(&mut c, |tx| {
-        schema(tx)?;
-        bail!("fixture")
-    })
+    assert!(migrate(
+        &mut c,
+        |tx| {
+            schema(tx)?;
+            bail!("fixture")
+        },
+        |_| Ok(())
+    )
     .is_err());
     assert_eq!(preflight(&c).unwrap(), 0);
     assert!(!table_exists(&c, "tasks").unwrap());
     assert_eq!(value(&c), "old");
-    migrate(&mut c, schema).unwrap();
-    assert_eq!(preflight(&c).unwrap(), 1);
+    migrate(&mut c, schema, |_| Ok(())).unwrap();
+    assert_eq!(preflight(&c).unwrap(), 2);
     assert_eq!(value(&c), "old");
 }
 #[test]
@@ -151,7 +155,7 @@ fn newer_and_malformed_versions_reject_without_writes() {
     )
     .unwrap();
     let before = std::fs::read(&path).unwrap();
-    assert!(migrate(&mut c, schema).is_err());
+    assert!(migrate(&mut c, schema, |_| Ok(())).is_err());
     drop(c);
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let c = db("one");
@@ -202,7 +206,12 @@ fn tamper_wrong_digest_cancel_and_unsafe_schema_fail_closed() {
     assert!(consistent_image(&db("x"), Instant::now() + Duration::from_secs(1), || true).is_err());
     let guard = StorageGuard::acquire(&root.0).unwrap();
     assert!(guard
-        .restore(&path, &"0".repeat(64), |db| migrate(db, schema), |_| Ok(()))
+        .restore(
+            &path,
+            &"0".repeat(64),
+            |db| migrate(db, schema, |_| Ok(())),
+            |_| Ok(())
+        )
         .is_err());
     assert!(!root.0.join(MAIN).exists());
     let mut bytes = std::fs::read(path.join("database.sqlite")).unwrap();
@@ -212,7 +221,7 @@ fn tamper_wrong_digest_cancel_and_unsafe_schema_fail_closed() {
         .restore(
             &path,
             &manifest.sha256,
-            |db| migrate(db, schema),
+            |db| migrate(db, schema, |_| Ok(())),
             |_| Ok(())
         )
         .is_err());
@@ -246,7 +255,7 @@ fn successful_restore_closes_original_and_invalidates_active_records() {
         .restore(
             &root.0.join("bundle"),
             &manifest.sha256,
-            |db| migrate(db, schema),
+            |db| migrate(db, schema, |_| Ok(())),
             |tx| {
                 tx.execute_batch(
                     "CREATE TABLE adapter_revoked(v);INSERT INTO adapter_revoked VALUES(1);",
@@ -289,7 +298,7 @@ fn every_restore_stage_interruption_is_recoverable() {
         let result = guard.restore_with_hook(
             &path,
             &manifest.sha256,
-            |db| migrate(db, schema),
+            |db| migrate(db, schema, |_| Ok(())),
             |_| Ok(()),
             |p| {
                 if p == point {
@@ -504,7 +513,7 @@ fn rejected_callbacks_never_replace_original() {
     let result = guard.restore(
         &path,
         &manifest.sha256,
-        |db| migrate(db, schema),
+        |db| migrate(db, schema, |_| Ok(())),
         |_| bail!("private-fixture-error-do-not-expose"),
     );
     assert!(!format!("{:#}", result.unwrap_err()).contains("private-fixture-error"));
@@ -527,7 +536,7 @@ fn interrupted_new_database_restore_does_not_invent_an_original() {
             .restore_with_hook(
                 &path,
                 &manifest.sha256,
-                |db| migrate(db, schema),
+                |db| migrate(db, schema, |_| Ok(())),
                 |_| Ok(()),
                 |p| {
                     if p == point {
@@ -567,7 +576,7 @@ fn interrupted_restore_rolls_back_committed_wal_without_mixing_sidecars() {
         .restore_with_hook(
             &path,
             &manifest.sha256,
-            |db| migrate(db, schema),
+            |db| migrate(db, schema, |_| Ok(())),
             |_| Ok(()),
             |p| {
                 if p == RestorePoint::WalMoved {
@@ -607,7 +616,7 @@ fn forged_manifest_cannot_authorize_trigger_execution() {
         .restore(
             &path,
             &manifest.sha256,
-            |db| migrate(db, schema),
+            |db| migrate(db, schema, |_| Ok(())),
             |_| Ok(())
         )
         .is_err());
@@ -626,7 +635,7 @@ fn commit_marker_survives_interrupted_journal_cleanup() {
         .restore_with_hook(
             &path,
             &manifest.sha256,
-            |db| migrate(db, schema),
+            |db| migrate(db, schema, |_| Ok(())),
             |_| Ok(()),
             |point| {
                 if point == RestorePoint::Committed {
@@ -722,7 +731,7 @@ fn inconsistent_existing_commit_marker_preserves_every_material() {
             .restore_with_hook(
                 &path,
                 &manifest.sha256,
-                |db| migrate(db, schema),
+                |db| migrate(db, schema, |_| Ok(())),
                 |_| Ok(()),
                 |point| {
                     if point == RestorePoint::Committed {
@@ -812,7 +821,7 @@ fn replaced_root_path_never_restores_into_pinned_or_replacement_directory() {
         .restore(
             &bundle_path,
             &manifest.sha256,
-            |db| migrate(db, schema),
+            |db| migrate(db, schema, |_| Ok(())),
             |_| Ok(())
         )
         .is_err());
@@ -838,7 +847,7 @@ fn source_file_identity_change_during_prepare_is_rejected_without_restore_writes
         |db| {
             std::fs::rename(root.0.join(MAIN), &moved)?;
             drop(original(&root));
-            migrate(db, schema)
+            migrate(db, schema, |_| Ok(()))
         },
         |_| Ok(()),
     );
@@ -1006,6 +1015,72 @@ fn create_and_acquire_rejects_existing_symlink_without_changing_target() {
 }
 
 #[test]
+fn v1_upgrade_skips_baseline_and_failed_v2_rolls_back_ddl_and_ledger() {
+    let mut c = Connection::open_in_memory().unwrap();
+    c.execute_batch("CREATE TABLE storage_migrations(version INTEGER PRIMARY KEY,identity TEXT NOT NULL);INSERT INTO storage_migrations VALUES(1,'self-agent-schema-v1-atomic-baseline');PRAGMA user_version=1;").unwrap();
+    assert!(migrate(
+        &mut c,
+        |_| panic!("v1 cannot run baseline"),
+        |tx| {
+            tx.execute_batch("CREATE TABLE upgrade_probe(id TEXT);")?;
+            bail!("fixture upgrade failure")
+        }
+    )
+    .is_err());
+    assert_eq!(preflight(&c).unwrap(), 1);
+    assert!(!table_exists(&c, "upgrade_probe").unwrap());
+    migrate(
+        &mut c,
+        |_| panic!("v1 cannot run baseline"),
+        |tx| {
+            tx.execute_batch("CREATE TABLE upgrade_probe(id TEXT);")?;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(preflight(&c).unwrap(), 2);
+    let records: Vec<(u32, String)> = c
+        .prepare("SELECT version,identity FROM storage_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(records, vec![(1, LEDGER_V1.into()), (2, LEDGER_V2.into())]);
+    migrate(&mut c, |_| panic!("v2 baseline"), |_| panic!("v2 upgrade")).unwrap();
+}
+#[test]
+fn fresh_v2_failure_rolls_back_even_the_baseline_and_readonly_ledger_preflight_writes_nothing() {
+    let mut c = Connection::open_in_memory().unwrap();
+    assert!(migrate(&mut c, schema, |_| bail!("fixture")).is_err());
+    assert_eq!(preflight(&c).unwrap(), 0);
+    assert!(!table_exists(&c, "sessions").unwrap());
+    assert!(!table_exists(&c, "storage_migrations").unwrap());
+    let root = Root::new();
+    let path = root.0.join("ledger.sqlite");
+    let mut disk = Connection::open(&path).unwrap();
+    migrate(&mut disk, schema, |_| Ok(())).unwrap();
+    drop(disk);
+    let before = std::fs::read(&path).unwrap();
+    let readonly = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(preflight(&readonly).unwrap(), 2);
+    drop(readonly);
+    assert_eq!(before, std::fs::read(&path).unwrap());
+    let c = Connection::open(&path).unwrap();
+    c.execute(
+        "UPDATE storage_migrations SET identity='tampered' WHERE version=1",
+        [],
+    )
+    .unwrap();
+    drop(c);
+    let before = std::fs::read(&path).unwrap();
+    let readonly = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert!(preflight(&readonly).is_err());
+    drop(readonly);
+    assert_eq!(before, std::fs::read(&path).unwrap());
+}
+
+#[test]
 fn directory_identity_uses_open_handle_and_empty_root_preflight_succeeds() {
     let root = Root::new();
     let dir = open_directory(&root.0).unwrap();
@@ -1030,7 +1105,7 @@ fn restore_reaches_commit_hook_with_directory_identity_checks_enabled() {
     let result = guard.restore_with_hook(
         &path,
         &manifest.sha256,
-        |db| migrate(db, schema),
+        |db| migrate(db, schema, |_| Ok(())),
         |_| Ok(()),
         |point| {
             if point == RestorePoint::Committed {

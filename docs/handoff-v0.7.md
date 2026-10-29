@@ -168,3 +168,9 @@ MCP 环境凭据后续切片见 protocol-v9 附节与 acceptance-mcp-credentials
 后续 gateway schema 必须明确提高 ledger 版本并加事务恢复撤权 helper，不能只往当前 schema 1 偷添表。生命周期和更新独立模块暂未接线；不能在提交中混入并冒充已验收。见 protocol-v12 / acceptance-v1.0；当前仍未运行真实 GUI、真实模型/QQ/系统凭据或实际安装发布。
 
 本切片独立候选冻结门禁通过：core 7 / daemon 527 / CLI 35 / 前端 222，事件桥 7、维护路由提取 1、Web 代理 3 组、17 个后台 smoke，以及 fmt / Clippy / 构建。独立源码复审闭环；精确 SHA CI 另行跟踪，真实 GUI/系统凭据/外部服务/安装发布仍未验证。
+
+## 0.10 网关/H5 后续接手
+
+0.10 接线与边界见 `protocol-v11.md` / `acceptance-v0.10.md`。当前 gateway wire 在 core，独立服务在 `crates/harness-gateway`，daemon private modules 在 `gateway/`、可信 Store 边界在 `store/gateway.rs`，移动构建在 `src/mobile`。schema 已显式扩到 v2；后续表结构变更不能绕过迁移 ledger 或恢复撤权。
+
+真实本地 HTTP/WS 联合入口是 `scripts/gateway_smoke.py`；它只用临时设备 token、模拟 Native HTTP 和 isolated SQLite。不要把其通过扩写为真实公网/TLS、系统凭据、原生 GUI 或手机浏览器视觉验收。源码冻结、提交与 CI 结果按 0.10 验收文档更新。
