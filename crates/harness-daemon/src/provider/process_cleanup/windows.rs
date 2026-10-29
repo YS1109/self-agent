@@ -410,6 +410,12 @@ fn launch_line(selected: &Path, args: &[OsString]) -> Result<(PathBuf, Vec<u16>)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
     {
+        if selected
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"))
+        {
+            return Ok((selected.to_path_buf(), cmd_command_line(selected, args)?));
+        }
         return Ok((selected.to_path_buf(), command_line(selected, args)?));
     }
     if !selected
@@ -786,6 +792,35 @@ fn command_line(program: &Path, args: &[OsString]) -> Result<Vec<u16>, SpawnErro
     out.push(0);
     Ok(out)
 }
+
+/// CMD does not use CRT argument decoding. Accept only the explicit command
+/// mode used by our callsites: fixed switches plus one complete shell program.
+/// The payload is intentionally executable command text, not a quoted data
+/// argument; retain its quotes/operators verbatim inside /s /c's outer quotes.
+/// https://learn.microsoft.com/windows-server/administration/windows-commands/cmd
+/// https://doc.rust-lang.org/std/os/windows/process/trait.CommandExt.html#tymethod.raw_arg
+fn cmd_command_line(program: &Path, args: &[OsString]) -> Result<Vec<u16>, SpawnError> {
+    if args.len() != 5
+        || !args[..4]
+            .iter()
+            .zip(["/d", "/v:off", "/s", "/c"])
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+    {
+        return Err(SpawnError::new(
+            "CMD 执行器需要显式禁用 AutoRun 的单命令模式",
+        ));
+    }
+    let mut out = Vec::new();
+    quote_arg(&mut out, program.as_os_str());
+    out.extend(OsStr::new(" /d /v:off /s /c \"").encode_wide());
+    out.extend(args[4].encode_wide());
+    out.push(b'"' as u16);
+    if out.contains(&0) || out.len() >= 32767 {
+        return Err(SpawnError::new("Windows 执行器 参数超过命令行限制"));
+    }
+    out.push(0);
+    Ok(out)
+}
 /// Documented CRT argv quoting; never invokes a shell or expands metacharacters.
 fn quote_arg(out: &mut Vec<u16>, arg: &OsStr) {
     out.push(b'"' as u16);
@@ -879,26 +914,44 @@ mod tests {
         );
         info.ActiveProcesses
     }
-    #[tokio::test]
-    async fn normal_exited_root_and_job_are_confirmed_without_taskkill() {
-        let mut child = spawn(
-            &fixture_command("echo fixture-output & exit /b 7"),
-            [false, true, true],
-            &|| false,
-            &|| panic!("cleanup must be confirmed"),
-        )
+    async fn completed_fixture(command: &tokio::process::Command) -> (ExitStatus, String, String) {
+        let mut child = spawn(command, [false, true, true], &|| false, &|| {
+            panic!("fixture launch cleanup must be confirmed")
+        })
         .await
         .unwrap();
-        let mut output = child.stdout.take().unwrap();
-        let mut bytes = Vec::new();
-        output.read_to_end(&mut bytes).await.unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains("fixture-output"));
-        assert_eq!(child.wait().await.unwrap().code(), Some(7));
-        child
-            .close(&|| panic!("completed Job cannot be unknown"))
-            .await
-            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let observed = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::try_join!(
+                child.wait(),
+                stdout.read_to_end(&mut output),
+                stderr.read_to_end(&mut errors),
+            )
+        })
+        .await;
+        // Even a failed fixture must finish the original Job cleanup before
+        // asserting; no timed-out process is abandoned to a test future's Drop.
+        child.close(&|| Ok(())).await.unwrap();
         assert_eq!(job_empty(&child.job), Some(true));
+        let (status, _, _) = observed.expect("fixture command timeout").unwrap();
+        (
+            status,
+            String::from_utf8_lossy(&output).into_owned(),
+            String::from_utf8_lossy(&errors).into_owned(),
+        )
+    }
+    #[tokio::test]
+    async fn normal_exited_root_and_job_are_confirmed_without_taskkill() {
+        let (status, output, errors) =
+            completed_fixture(&fixture_command("echo fixture-output & exit /b 7")).await;
+        assert!(
+            output.contains("fixture-output"),
+            "fixture stderr: {errors}"
+        );
+        assert_eq!(status.code(), Some(7), "fixture stderr: {errors}");
     }
     #[tokio::test]
     async fn cancelling_an_ordinary_child_tree_confirms_the_job_is_empty() {
@@ -935,20 +988,111 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success());
-        assert!(
-            active_members(&child) >= 1,
-            "root exited but ordinary descendant must remain"
-        );
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let remaining = active_members(&child);
         child
             .close(&|| panic!("remaining Job member did not settle"))
             .await
             .unwrap();
         assert_eq!(job_empty(&child.job), Some(true));
+        assert!(status.unwrap().unwrap().success());
+        assert!(
+            remaining >= 1,
+            "root exited but ordinary descendant must remain"
+        );
+    }
+    #[test]
+    fn cmd_command_mode_keeps_shell_text_verbatim_and_rejects_ambiguous_argv() {
+        let program = Path::new(r"C:\Windows\System32\cmd.exe");
+        let script = r#"call "C:\fixture & directory\quoted script.cmd" > "out & file.txt" && type "out & file.txt" & exit /b 7"#;
+        let args: Vec<OsString> = ["/d", "/v:off", "/s", "/c", script]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let (_, encoded) = launch_line(program, &args).unwrap();
+        assert_eq!(
+            OsString::from_wide(&encoded[..encoded.len() - 1]),
+            OsString::from(format!(
+                r#""C:\Windows\System32\cmd.exe" /d /v:off /s /c "{script}""#
+            )),
+            "the shell program must not acquire CRT backslash-quote escapes"
+        );
+        for args in [
+            vec!["/c", "echo wrong"],
+            vec!["/d", "/v:off", "/s", "/k", "echo wrong"],
+            vec!["/d", "/v:off", "/s", "/c", "echo wrong", "extra"],
+            vec!["/d", "/v:off", "/s", "/c", "echo\0wrong"],
+        ] {
+            let args: Vec<_> = args.into_iter().map(OsString::from).collect();
+            assert!(launch_line(program, &args).is_err());
+        }
+        let mut quoted_path = args.clone();
+        quoted_path[4] = OsString::from(r#""C:\quoted directory\tool.exe" "literal argument""#);
+        let (_, encoded) = launch_line(program, &quoted_path).unwrap();
+        assert!(String::from_utf16_lossy(&encoded)
+            .ends_with("/s /c \"\"C:\\quoted directory\\tool.exe\" \"literal argument\"\"\0"));
+        let mut oversized = args.clone();
+        oversized[4] = OsString::from("😀".repeat(16_400));
+        assert!(
+            launch_line(program, &oversized).is_err(),
+            "limit counts UTF-16 units"
+        );
+        // Ordinary EXEs still receive CRT argv; they never opt into shell text.
+        let (_, encoded) = launch_line(Path::new(r"C:\fixture\executor.exe"), &args).unwrap();
+        assert!(String::from_utf16_lossy(&encoded).contains(r#"\"C:\fixture"#));
+    }
+    #[tokio::test]
+    async fn cmd_compound_quoted_path_and_redirection_preserve_the_command_inside_the_job() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "executor-cmd-{}-{} & fixture",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let script = root.join("quoted script.cmd");
+        let output = root.join("redirect & output.txt");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho quoted-path-output\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let script_arg = batch_path(&script).unwrap();
+        let output_arg = batch_path(&output).unwrap();
+        let command =
+            format!(r#"call "{script_arg}" > "{output_arg}" && type "{output_arg}" & exit /b 7"#);
+        let (status, stdout, stderr) = completed_fixture(&fixture_command(&command)).await;
+        let saved = std::fs::read_to_string(&output);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(status.code(), Some(7), "fixture stderr: {stderr}");
+        assert!(
+            stdout.contains("quoted-path-output"),
+            "fixture stderr: {stderr}"
+        );
+        assert!(saved.unwrap().contains("quoted-path-output"));
+    }
+    #[tokio::test]
+    async fn native_powershell_command_shape_keeps_quotes_operators_and_exit_status() {
+        let program = system_cmd()
+            .parent()
+            .unwrap()
+            .join(r"WindowsPowerShell\v1.0\powershell.exe");
+        let mut command = tokio::process::Command::new(program);
+        command.current_dir(system_cmd().parent().unwrap()).args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$text = 'fixture \"quoted\" & pipe |'; Write-Output $text; [Console]::Error.WriteLine('fixture-stderr'); exit 7",
+        ]);
+        let (status, stdout, stderr) = completed_fixture(&command).await;
+        assert_eq!(status.code(), Some(7), "fixture stderr: {stderr}");
+        assert!(
+            stdout.contains("fixture \"quoted\" & pipe |"),
+            "fixture stdout: {stdout}"
+        );
+        assert!(stderr.contains("fixture-stderr"));
     }
     #[tokio::test]
     async fn suspended_spawn_failures_are_reaped_before_returning() {

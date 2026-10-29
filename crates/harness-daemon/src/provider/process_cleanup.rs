@@ -264,11 +264,21 @@ mod tests {
         let pid = child.id();
         assert_eq!(observe_exit(&mut child).await.unwrap().code(), Some(7));
         assert_eq!(child.id(), pid, "normal observation must not reap");
-        assert_eq!(group_exists(pid.unwrap()), Some(true));
+        // Re-observe the actual kernel child, not merely Tokio's cached ID.
+        // Darwin killpg1 filters SZOMB from the group and can return EPERM for
+        // a zombie-only group. Thus kill(-pgid, 0) is not a portable proof that
+        // our exited root is still waitable; production must keep EPERM unknown.
+        // XNU: bsd/kern/kern_sig.c killpg1; bsd/kern/kern_exit.c waitid_nocancel.
+        assert_eq!(
+            observed_status(pid.unwrap()).unwrap().unwrap().code(),
+            Some(7),
+            "WNOWAIT must leave the same kernel child waitable"
+        );
         stop(&mut child, pid, &|| panic!("owned root should settle"))
             .await
             .unwrap();
         assert!(child.id().is_none());
+        assert_eq!(child.wait().await.unwrap().code(), Some(7));
         assert_eq!(group_exists(pid.unwrap()), Some(false));
     }
 

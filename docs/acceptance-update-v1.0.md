@@ -70,3 +70,13 @@
 `7aea4f15f04a4ce3ffdbf944fdc454160dcc465c` 的 push `40827179414` / PR `40827184463` 均在 Windows Rust Clippy 报 `storage.rs` 的 `unused_mut`；该平台后续测试、构建及 smoke 尚未运行，不记作通过。三平台 Desktop 和 Ubuntu Rust 已通过，macOS Rust 后台烟测继续跟踪。
 
 修复仅将目录 builder 的可变绑定放入 Unix cfg 块：Unix 仍设置 0700，Windows 使用原默认 builder，创建、AlreadyExists、no-follow capability 和身份复核逻辑不变。独立静态复核通过；隔离源码的 storage 34 / Store updates 4、fmt、四 crate all-target Clippy 通过。精确生产 builder 片段的 Windows GNU compile-only Clippy 通过；完整 daemon Windows 交叉检查因本地缺少 `x86_64-w64-mingw32-gcc`（ring C 构建）未完成，不能冒充 Windows 执行通过。后续修复精确提交 CI 单独跟踪。
+
+## Windows 控制台编码夹具修复
+
+`43d12ee3bc7f708cbe55101b7a12ce63480f0f68` 的 push `40828345766` / PR `40828352198` 已在真实 Windows 越过原 Clippy 阻塞，Rust 测试、构建、既有后台 smoke、新 update 4 组与 package self-test 均通过；最后实际 package smoke 的首条中文 PASS 输出被 Python cp1252 stdout 拒绝，失败处理的中文消息同样不能编码。此结果不等于产品更新流程失败，但完整 CI 仍不记作通过。
+
+后续修复仅在 package 夹具入口显式将 stdout/stderr 设为严格 UTF-8，不改变产品、动作、断言、超时或二进制来源检查。继承 v16 的 freshness 回归后共 6 项 self-test 通过：新增真实子进程 `PYTHONIOENCODING=cp1252` 下中文 help 与两路诊断输出解码验证。以完全相同修改后脚本源码、固定 v16 私有候选普通二进制运行的实际 package 4 组全部通过，完整保留 freshness/hash/原数据检查；未改写冻结候选源码或构建产物。此为 Linux 上模拟 cp1252 的本地回归，不能替代新精确 Windows CI。
+
+证据：`/tmp/package-utf8-self-tests.log`、`/tmp/package-utf8-actual.log`。没有真实安装、生产签名/更新、GUI 或外部服务行为。
+
+本次与生命周期平台修复联合冻结后，又用新构建二进制运行完整 **22 个后台 smoke**（包括 update 4 / package 4 / shutdown 6 组）、完整 Rust **13 / 791 / 53 / 17**、fmt / all-target Clippy / 构建与 package **6 项** self-test，均通过。日志见生命周期验收的新 CI 修复段；真实 Windows 编码修复终态仍待新精确 CI，不以本地 cp1252 模拟替代。

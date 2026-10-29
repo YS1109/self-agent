@@ -19,6 +19,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -384,6 +385,18 @@ def run_package(keep_fixture=False):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_console_is_utf8_even_when_parent_selects_cp1252(self):
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--help"],
+                                env=env, capture_output=True, timeout=10, check=True)
+        self.assertIn("仅测试脚本边界", result.stdout.decode("utf-8"))
+        probe = ("import runpy,sys; m=runpy.run_path(sys.argv[1]); "
+                 "m['configure_console'](); print('中文输出'); print('中文错误', file=sys.stderr)")
+        result = subprocess.run([sys.executable, "-c", probe, str(Path(__file__).resolve())],
+                                env=env, capture_output=True, timeout=10, check=True)
+        self.assertEqual(result.stdout.decode("utf-8").strip(), "中文输出")
+        self.assertEqual(result.stderr.decode("utf-8").strip(), "中文错误")
+
     def test_uninstall_only_known_copies_keeps_data(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -467,7 +480,14 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(len(known_binaries(root)[0]), 3)
 
 
+def configure_console():
+    # Windows CI can redirect a cp1252 console; fixture diagnostics are UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="strict")
+
+
 def main():
+    configure_console()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keep-fixture", action="store_true", help="保留本次新建私有夹具，不使用任意已有数据目录")
     parser.add_argument("--self-test", action="store_true", help="仅测试脚本边界，不执行任何构建二进制")

@@ -1,6 +1,6 @@
 # Self Agent 0.7 开发交接
 
-更新日期：2026-10-28。交接性质：0.6 基线与 0.7 分切片开发记录；事件消费、执行器续接及补充/继续/区间改动切片已实现，未发布完整 0.7。
+更新日期：2026-10-29 06:34 UTC。交接性质：保留 0.6 基线与后续分切片开发历史；当前开发分支已到 v16，运行包版本仍为 0.6.0，不代表完整 1.0 正式发行。最新提交/CI 见文末；历史段落的“未接线/待发布”只描述当时阶段。
 
 ## 接手先读
 
@@ -193,7 +193,7 @@ MCP 环境凭据后续切片见 protocol-v9 附节与 acceptance-mcp-credentials
 
 协议v15/schema v4 的更新代码位于 `reliability/update*.rs`，实际同Store适配器在 `store/updates.rs`；floor与数据目录下独立pinned witness共同保留下限，恢复不得删除/降低witness。只允许本机owner配置verification-only信任，生产下载/安装不开放。CLI updates可实际暂存惰性字节，UI仅观察。
 
-compatibility由core唯一wire类型驱动；Native `startup.rs` 保留单次进程尝试、有界metadata读取和revision状态，不能在不兼容/超时后自动替换后台。生命周期后续必须注册真正上传/metadata blocking worker并与Store admission同锁闭合，不能把HTTP observer drop当settled。本切片没有宣称drain已交付；验收和未运行项见 `acceptance-update-v1.0.md`。
+compatibility由core唯一wire类型驱动；Native `startup.rs` 保留单次进程尝试、有界metadata读取和revision状态，不能在不兼容/超时后自动替换后台。v15 本片当时未包含统一 drain；后续 v16 已注册真正上传/metadata blocking worker并与Store admission同锁闭合，不能把HTTP observer drop当settled。两片的验收和未运行项分别见 `acceptance-update-v1.0.md` 与 `acceptance-lifecycle-v1.0.md`。
 
 ## 1.0 实际 drain 接手
 
@@ -202,3 +202,17 @@ compatibility由core唯一wire类型驱动；Native `startup.rs` 保留单次进
 HTTP 关闭必须带当前 `expected_instance`，CLI/UI 只发送一次并保留原实例观察。Vault 需真实 OS 线程 join；进程组/Job、阻塞 I/O、上传/备份和远端在途工作均不能因 observer 被丢弃而记为 Stopped。物理 Unknown 保持租约；历史 outcome_unknown 不被清理成功覆盖。
 
 接手前按 `acceptance-lifecycle-v1.0.md` 核对最新源码、固定二进制门禁、精确 SHA CI 和仍未运行项。不要把开发工作树、Linux/交叉编译、headless 夹具分别冒充已发布、Windows 执行或完整 GUI/安装验收。
+
+
+## 最新发布与接手待办（2026-10-29 06:34 UTC）
+
+- 开发分支 `codex/v0.7-native-events` / 草稿 PR #1 已发布至 `925e6cf2d924141a0cff972113d5b37556891de9`（v16；tree `29fb0f4b0ce4c42cada299f773a5ad1e5ff5b251`）。此前 v15 为 `7aea4f15f04a4ce3ffdbf944fdc454160dcc465c`，生产等价 Windows cfg 修复为 `43d12ee3bc7f708cbe55101b7a12ce63480f0f68`；没有版本提升、merge、tag 或正式 release。
+- 网关撤权夹具提交 `c73a62a` 的 push `40821487804` / PR `40821493624` 均 6/6。v15 `7aea4f15` 两轮 `40827179414` / `40827184463` 各 5/6，仅 Windows `unused_mut` 失败、该平台后续 tests 未跑；cfg 修复 `43d12ee3` 两轮 `40828345766` / `40828352198` 也各 5/6，macOS / Ubuntu Rust 全部 smoke 与三平台 Desktop 成功，Windows 产品 Rust / update 4 组通过，仅最后 package 中文输出 cp1252 失败。两类原失败保留，不把后一阶段进展写成完整成功。
+- 最新 v16 [push 40828936545](https://github.com/YS1109/self-agent/actions/runs/40828936545) / [PR 40828942266](https://github.com/YS1109/self-agent/actions/runs/40828942266) 均终态 **4/6**：三平台 Desktop、Ubuntu Rust 通过；macOS daemon **790/791**（僵尸进程组信号探测夹具）及 Windows daemon **728/730**（两个新 CMD / Job 复合脚本夹具）失败。进程编码/夹具与 package 编码窄修复已完成本地门禁并随本文提交，仍待新精确 CI。接手先保留这些改动，独立验证后跟踪新精确 SHA CI，不能沿用旧通过结果。
+- 原固定 Linux 门禁 core13 / daemon791 / CLI53 / gateway17 / UI343、22 个后台 smoke、Web 4 组不变，仍是原候选证据，不是本次重跑或新 CI；详细归档与失败见 [生命周期验收](acceptance-lifecycle-v1.0.md)。
+- 原 GitHub 内容披露确认暂停已解除：用户明确授权了 v15/v16 与 QQ 相关代码的开发分支发布。不要再次把它写成等待确认，也不要扩展成真实 QQ 通讯/模型消费/OS vault/公网部署/原生安装/生产签名/正式发行授权；这些均无成功实测声明，完整 GUI 也未验。
+- managed Codex 的安全 fresh-history 回退和普通 Unix 进程组 / Windows Job 清理边界保持不变；Unix 故意 `setsid` 脱离不在保证内。当前重点是修复并确认跨平台 CI，不以降低这些边界换取测试通过。
+
+### 本次 CI 窄修复本地重验（2026-10-29 06:46 UTC）
+
+CMD 固定脚本编码、macOS WNOWAIT 观察夹具及 package UTF-8 输出修复已独立复核。重新完整通过 Rust **13 / 791 / 53 / 17**、fmt / all-target Clippy / 后台构建、**22 个 smoke**、history self-test 和 package **6 项** self-test；新 Windows 13 项仍仅交叉编译，真实跨平台结果等新提交 CI。原失败保留，详细证据与未运行项见 [生命周期验收](acceptance-lifecycle-v1.0.md#本次跨平台-ci-修复的重新冻结2026-10-29-0646-utc)。本地通过不等于正式发行或实机验收。
