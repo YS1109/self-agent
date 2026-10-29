@@ -238,7 +238,9 @@ impl Cursor {
         }
         let bytes = raw
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let digit = |c: u8| (c as char).to_digit(16).unwrap() as u8;
                 (digit(pair[0]) << 4) | digit(pair[1])

@@ -85,3 +85,9 @@
 5,000组HWM为 **241,729,536 bytes**；CPU/时延样本、n=1全遍历和原始哈希见 performance-v1.0，不外推普适容量。**剩余实测风险**：5,000组3次温启动约7.153/6.836/5.702秒，2次超过当前 Native bridge 6秒等待；将由后续真实 readiness/启动体验切片修复，不靠本30秒benchmark通过掩盖。诊断并非全面变快，GUI/安装与跨OS性能仍未测。
 
 正式结果 SHA-256：`d98a208808888a94119cc4093ca12a7bc23223acfe48021ff27ad54048afc79c`。精确完整哈希以 performance-v1.0 和实际归档结果为准，新提交 CI 发布后继续跟踪。
+
+### v14 跨平台新 Clippy 规则修复
+
+`7b026c06bd475aeaf50f3141dc5a0369c7d623b9` 的 push `40801817466` / PR `40801824633` 各 **3/6**：三个 Desktop 均成功，三个 Rust 均在 Rust 1.99 新增 `chunks_exact_to_as_chunks` lint 阻断；其后的 Rust 测试/构建/smoke 尚未执行，不能记为通过或运行失败。
+
+窄修复仅把游标解码的固定二字节迭代改为 `as_chunks::<2>().0.iter()`；原长度、偶数、ASCII hex 校验及解码/作用域/epoch约束未变，也没有禁用 lint。隔离候选 Store **16** 与真实 HTTP **3** 回归、fmt 和 daemon all-targets Clippy `-D warnings` 均通过；修复提交精确 CI 发布后单独跟踪。没有重跑未变的 GUI/完整前端或原性能测量；之前三平台 Desktop 成功不代替新提交 CI。
