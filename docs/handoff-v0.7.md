@@ -1,6 +1,14 @@
 # Self Agent 0.7 开发交接
 
-更新日期：2026-10-29 07:28 UTC。交接性质：保留 0.6 基线与后续分切片开发历史；当前已验证代码基线为 `8a5b980a`，两轮精确 CI 各 6/6，运行包版本仍为 0.6.0，不代表完整 1.0 正式发行。最新提交/CI 见文末；历史段落的“未接线/待发布”只描述当时阶段。
+## 当前跟进状态（2026-10-29 07:54 UTC）
+
+文档提交 `d8533feb8c82ad6ebff97e28fd4259f52cabdf96` 的 [push 40836552098](https://github.com/YS1109/self-agent/actions/runs/40836552098) / [PR 40836559612](https://github.com/YS1109/self-agent/actions/runs/40836559612) 均终态 **5/6（失败）**：push 的 Ubuntu MCP 夹具把尚未写完的 PID 文件视为就绪；PR 的 Windows PowerShell 夹具未区分冷启动和脚本执行，超过原 10 秒观察期。其它作业均成功。下文 `8a5b980a` 的两轮 6/6 是保留的历史证据，不覆盖这些重复运行暴露的竞态。
+
+独立复审另确认 MCP Unix 旧 PGID 复用风险，本次有独立生产安全修复；不是只修测试后就宣称安全。已保留清理 Unknown、项目隔离、禁止自动重放及普通进程组边界。
+
+本轮门禁与发布结果见 [生命周期验收的后续安全切片](acceptance-lifecycle-v1.0.md#后续-mcp-身份安全与就绪夹具切片)。精确新提交 CI 以 [草稿 PR #1](https://github.com/YS1109/self-agent/pull/1) 对应 SHA 的检查及收据为准；本地通过不代表跨平台已经通过。
+
+以下历史基线记录日期：2026-10-29 07:28 UTC。交接性质：保留 0.6 基线与后续分切片开发历史；07:28 UTC 时的历史已验证代码基线为 `8a5b980a`，两轮精确 CI 各 6/6，运行包版本仍为 0.6.0，不代表完整 1.0 正式发行。最新提交/CI 见文末；历史段落的“未接线/待发布”只描述当时阶段。
 
 ## 接手先读
 
@@ -220,7 +228,7 @@ CMD 固定脚本编码、macOS WNOWAIT 观察夹具及 package UTF-8 输出修�
 
 ## 当前代码基线与最终接手（2026-10-29 07:28 UTC）
 
-当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+07:28 UTC 时的历史已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交；后续文档提交重复 CI 的实际失败与修正见本文顶部。
 
 - 前序 `df0657906a7b41f77c49ebac5ef9e0ee48da655f` 的 push `40831626789` / PR `40831632978` 均 5/6；macOS / Ubuntu Rust 全部 smoke 与三平台 Desktop 通过，Windows daemon 732/733 仅新增 PowerShell 初始化夹具失败，后续 Windows smoke 未运行。原记录和日志保留，不由最终成功抹去。
 - 最新两轮 Windows daemon **734/734** 与全部 smoke 通过，含 update 4 / package 4 / 实际 shutdown 3 组；macOS / Linux 的信号关闭是另 6 组。真实路径 A/B 旧 extended exit -65536 / ServicePointManager=true，普通 DOS exit 7 / false，两者均未超时。修复保持 canonical no-follow handle、Job 与权限，只支持 UTF-8 可表示、少于 260 个 UTF-16 code unit 的普通本地 image/cwd。

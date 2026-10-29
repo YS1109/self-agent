@@ -95,6 +95,42 @@ mod unix {
         );
     }
 
+    async fn wait_for_pid_record(path: &Path, pid: u32, timeout: Duration) -> bool {
+        let expected = pid.to_string();
+        tokio::time::timeout(timeout, async {
+            // Creation is not publication: Python write_text opens/truncates
+            // before writing. Match the live child identity, not mere existence
+            // or a parseable prefix of a partially written PID.
+            loop {
+                if std::fs::read_to_string(path).is_ok_and(|value| value == expected) {
+                    return;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn pid_readiness_requires_complete_matching_child_identity() {
+        let project = Project::new();
+        let path = project.0.join("pid-publication");
+        std::fs::write(&path, "").unwrap();
+        let waiting = wait_for_pid_record(&path, 12345, Duration::from_secs(10));
+        tokio::pin!(waiting);
+        for value in ["", "123", "12346"] {
+            std::fs::write(&path, value).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                    .await
+                    .is_err()
+            );
+        }
+        std::fs::write(&path, "12345").unwrap();
+        assert!(waiting.await);
+    }
+
     #[tokio::test]
     async fn precancelled_open_is_definitely_not_started() {
         let project = Project::new();
@@ -373,22 +409,18 @@ mod unix {
             })
             .ok()
             .unwrap();
-            tokio::time::timeout(cfg.limits.setup_timeout, async {
-                while !actual.join("mcp-pid").exists() {
-                    sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap();
+            let pid = process.child.id().unwrap();
+            let published =
+                wait_for_pid_record(&actual.join("mcp-pid"), pid, cfg.limits.setup_timeout).await;
+            process.child.stdin.take();
+            let cleanup = process.close(control()).await;
+            // Even a failed readiness observation must join the original child
+            // before the fixture reports an assertion failure.
+            assert!(published, "fixture did not publish its complete child PID");
             assert!(!outside.0.join("mcp-pid").exists());
             assert!(!outside.0.join("selected/mcp-pid").exists());
-            let pid = std::fs::read_to_string(actual.join("mcp-pid")).unwrap();
-            process.child.stdin.take();
-            assert_eq!(
-                process.close(control()).await,
-                CleanupStatus::ProcessGroupStopped
-            );
-            assert_dead(&pid);
+            assert_eq!(cleanup, CleanupStatus::ProcessGroupStopped);
+            assert_dead(&pid.to_string());
         }
     }
 

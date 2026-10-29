@@ -45,6 +45,8 @@ OS vault 保留真实标准线程 JoinHandle；逻辑 STOPPED 标记不足以确
 
 Native 阻塞读在取消时仍等待原线程结束。进程清理由专用 backend 报告，不能忽略 kill/wait 错误。Unix 的保证针对所启动的普通进程组，不是恶意 setsid 脱离的安全沙箱；Windows 普通树通过独立 Job launcher 接线，实际平台执行结果必须由精确 CI 记录，不能用 Linux 编译冒充。
 
+Unix Native/Codex 与 MCP 均必须在最后一次进程组信号之前保留尚未回收的根进程身份；协作退出只用 `waitid(WNOWAIT)` 观察，不以普通 `wait`/`try_wait` 提前释放 PID。保存的数字 PGID 本身不是发送信号的权威。最终组信号同步消费该权威后才真正回收根；随后取消、重复 close 或 Drop 不得再向保存的 PGID 发信号。根已回收或身份不匹配时不信号旧组；停止证明不足仍为 Unknown，不因避免误杀而假称清理完成。
+
 Windows launcher 保留 no-follow 的项目/程序/祖先句柄至原 Job 结束，但传给子进程的是经验证等价的普通本地 DOS 路径，不把句柄 API 返回的 `\\?\` 设备拼写强加给旧运行时。当前 image/cwd 只支持可表示为 UTF-8、少于 260 个 UTF-16 code unit 的普通固定盘符路径；UNC、相对路径、无普通 DOS 等价表示的设备路径、尾点/尾空格、保留设备别名及其它不等价拼写明确拒绝，不作有损规范化或不安全回退。这是有意的兼容范围限制，不是任意 Windows 长路径支持；句柄锁、Job、权限和清理确认规则不变。
 
 ## 5. 客户端行为

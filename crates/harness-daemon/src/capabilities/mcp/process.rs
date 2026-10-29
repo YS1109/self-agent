@@ -49,6 +49,12 @@ pub(super) struct Process {
     pub child: Child,
     #[cfg(unix)]
     group: Option<u32>,
+    // Separate observation identity from signal authority. The latter is
+    // consumed before the final group signal/reap and is never recreated.
+    #[cfg(unix)]
+    signal_authority: Option<u32>,
+    #[cfg(all(test, unix))]
+    signal_hook: Option<Box<dyn FnMut(u32, i32) + Send>>,
     cleanup: Option<CleanupStatus>,
     _root: cap_std::fs::Dir,
 }
@@ -122,10 +128,35 @@ impl Process {
             .map_err(|_| McpError::new("MCP 服务启动失败"))?;
         Ok(Self {
             group: child.id(),
+            signal_authority: child.id(),
+            #[cfg(test)]
+            signal_hook: None,
             child,
             cleanup: None,
             _root: root_handle,
         })
+    }
+
+    #[cfg(unix)]
+    fn signal_owned_group(&mut self, signum: i32, final_signal: bool) {
+        let authority = if final_signal {
+            self.signal_authority.take()
+        } else {
+            self.signal_authority
+        };
+        // A saved numeric group alone is never authority. Child::id becomes
+        // None after a Tokio wait/try_wait reaps it; that group may be recycled.
+        let Some(group) =
+            authority.filter(|group| Some(*group) == self.group && self.child.id() == Some(*group))
+        else {
+            return;
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.signal_hook.as_mut() {
+            hook(group, signum);
+            return;
+        }
+        signal(group, signum);
     }
 
     pub async fn close(&mut self, control: Control<'_>) -> CleanupStatus {
@@ -140,18 +171,25 @@ impl Process {
                 let grace = control
                     .deadline
                     .min(Instant::now() + Duration::from_millis(100));
-                tokio::select! { _ = self.child.wait() => {}, _ = tokio::time::sleep_until(grace) => {}, _ = async { while !(control.cancelled)() { sleep(Duration::from_millis(10)).await; } } => {} }
+                tokio::select! {
+                    // WNOWAIT keeps the kernel PID/PGID reserved through every
+                    // group signal, even when cooperative EOF already exited.
+                    _ = crate::provider::process_cleanup::observe_exit(&mut self.child) => {},
+                    _ = tokio::time::sleep_until(grace) => {},
+                    _ = async { while !(control.cancelled)() { sleep(Duration::from_millis(10)).await; } } => {}
+                }
             }
-            signal(group, libc::SIGTERM);
+            self.signal_owned_group(libc::SIGTERM, false);
             let until = Instant::now() + Duration::from_millis(100);
             while Instant::now() < until && group_exists(group) != Some(false) {
-                let _ = self.child.try_wait();
                 if (control.cancelled)() {
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;
             }
-            signal(group, libc::SIGKILL);
+            // Consume authority synchronously BEFORE the first real reap.
+            // Cancellation during wait or subsequent Drop must not reuse it.
+            self.signal_owned_group(libc::SIGKILL, true);
             let reaped = timeout(Duration::from_millis(500), self.child.wait())
                 .await
                 .is_ok_and(|result| result.is_ok());
@@ -179,9 +217,7 @@ impl Drop for Process {
     fn drop(&mut self) {
         if self.cleanup.is_none() {
             #[cfg(unix)]
-            if let Some(group) = self.group {
-                signal(group, libc::SIGKILL);
-            }
+            self.signal_owned_group(libc::SIGKILL, true);
             let _ = self.child.start_kill();
         }
     }
@@ -237,3 +273,7 @@ fn root_nofollow(root: &Path) -> Result<cap_std::fs::Dir, McpError> {
     }
     Ok(dir)
 }
+
+#[cfg(all(test, unix))]
+#[path = "process_tests.rs"]
+mod tests;

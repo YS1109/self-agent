@@ -1,6 +1,14 @@
 # 1.0 本机签名校验、暂存与兼容切片验收
 
-当前状态（2026-10-29 07:28 UTC）：当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+## 当前跟进状态（2026-10-29 07:54 UTC）
+
+文档提交 `d8533feb8c82ad6ebff97e28fd4259f52cabdf96` 的 [push 40836552098](https://github.com/YS1109/self-agent/actions/runs/40836552098) / [PR 40836559612](https://github.com/YS1109/self-agent/actions/runs/40836559612) 均终态 **5/6（失败）**：push 的 Ubuntu MCP 夹具把尚未写完的 PID 文件视为就绪；PR 的 Windows PowerShell 夹具未区分冷启动和脚本执行，超过原 10 秒观察期。其它作业均成功。下文 `8a5b980a` 的两轮 6/6 是保留的历史证据，不覆盖这些重复运行暴露的竞态。
+
+独立复审另确认 MCP Unix 旧 PGID 复用风险，本次有独立生产安全修复；不是只修测试后就宣称安全。已保留清理 Unknown、项目隔离、禁止自动重放及普通进程组边界。
+
+本轮门禁与发布结果见 [生命周期验收的后续安全切片](acceptance-lifecycle-v1.0.md#后续-mcp-身份安全与就绪夹具切片)。精确新提交 CI 以 [草稿 PR #1](https://github.com/YS1109/self-agent/pull/1) 对应 SHA 的检查及收据为准；本地通过不代表跨平台已经通过。
+
+历史状态（2026-10-29 07:28 UTC）：当时已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交；后续文档提交重复 CI 的实际失败与修正见本文顶部。
 
 本记录只覆盖协议 v15 / schema v4 的开发实现，不把它称作生产更新器、安装发布或整个 1.0 完成。所有签名材料均来自临时进程内 Ed25519 key；没有登记用户信任根、生产密钥或访问真实更新源。
 
@@ -88,7 +96,7 @@
 
 `df0657906a7b41f77c49ebac5ef9e0ee48da655f` 的 push `40831626789` / PR `40831632978` 均终态 **5/6**：macOS / Ubuntu Rust 全部 smoke 和三平台 Desktop 成功；Windows **732/733**，新 PowerShell 初始化夹具失败，失败后的 smoke 未运行。原编码、CMD 与路径问题按精确提交分别保留，不相互覆盖。
 
-当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+07:28 UTC 时的历史已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交；后续文档提交重复 CI 的实际失败与修正见本文顶部。
 
 两轮 Windows 产品 daemon **734/734** 与全部 smoke 成功，包含 update **4 组**、package **4 组**和实际 shutdown **3 组**；macOS / Linux 信号关闭另为 **6 组**。真实旧 extended 路径 / DOS 等价路径 A/B 分别 exit -65536 / 7，`ServicePointManager` 异常分类分别 true / false，均未超时。固定 handle 身份、Job、权限和清理规则没有放松；Windows 普通本地路径的 UTF-8 与少于 260 个 UTF-16 code unit 限制见协议 v16，不是通用长路径支持。
 

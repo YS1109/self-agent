@@ -1,12 +1,20 @@
 # 0.7–1.0 路线图验收追踪矩阵
 
+## 当前跟进状态（2026-10-29 07:54 UTC）
+
+文档提交 `d8533feb8c82ad6ebff97e28fd4259f52cabdf96` 的 [push 40836552098](https://github.com/YS1109/self-agent/actions/runs/40836552098) / [PR 40836559612](https://github.com/YS1109/self-agent/actions/runs/40836559612) 均终态 **5/6（失败）**：push 的 Ubuntu MCP 夹具把尚未写完的 PID 文件视为就绪；PR 的 Windows PowerShell 夹具未区分冷启动和脚本执行，超过原 10 秒观察期。其它作业均成功。下文 `8a5b980a` 的两轮 6/6 是保留的历史证据，不覆盖这些重复运行暴露的竞态。
+
+独立复审还确认既有 MCP Unix 清理路径会先回收根进程，再向保存的数字 PGID 发信号，存在身份复用风险；本次安全切片在最后组信号之前保留未回收根身份，并同步消费信号权威，取消/重复 close/Drop 不再重用旧 PGID。PID 夹具改为在原 10 秒内等待真实子进程完整 PID；Windows 仅夹具新增完整 ready 行，将最长 50 秒运行时就绪与其后严格 10 秒脚本完成分开，生产 60 秒预算不变，不把冷启动假设写成已证实根因。清理 Unknown、项目隔离和原停止断言不放松。
+
+本轮门禁与发布结果见 [生命周期验收的后续安全切片](acceptance-lifecycle-v1.0.md#后续-mcp-身份安全与就绪夹具切片)。精确新提交 CI 以 [草稿 PR #1](https://github.com/YS1109/self-agent/pull/1) 对应 SHA 的检查及收据为准；本地通过不代表跨平台已经通过。
+
 更新：2026-10-29。本文把[路线图](roadmap.md)的要求映射到实际实现和证据，**不是 1.0 发布完成声明**。版本标题、独立 helper 测试和历史 CI 均不能代替当前提交的应用验收。
 
 ## 1. 范围、基线与判断方法
 
-- 已发布且完成精确 CI 的代码基线：`8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（v16 后续 Windows 路径兼容修复，tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）；前序 v15 为 `7aea4f15`，生产等价 Windows cfg 修复为 `43d12ee3`。分支 `codex/v0.7-native-events`，[草稿 PR #1](https://github.com/YS1109/self-agent/pull/1)。用户本地审核和合并；没有 merge、tag 或公开 release，运行包版本仍为 `0.6.0`。
+- 此前已发布且完成双轮精确 CI 的代码基线：`8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（v16 后续 Windows 路径兼容修复，tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）；前序 v15 为 `7aea4f15`，生产等价 Windows cfg 修复为 `43d12ee3`。分支 `codex/v0.7-native-events`，[草稿 PR #1](https://github.com/YS1109/self-agent/pull/1)。用户本地审核和合并；没有 merge、tag 或公开 release，运行包版本仍为 `0.6.0`。
 - 本文依据该基线源码、各版本 acceptance/protocol、固定候选测试记录和性能归档。**编写本文没有重新执行测试**。下述 CI 状态是主任务提供的精确 run 观察，不是从版本名或本地结果推断。
-- v15 / v16 源码、API、协议及授权模拟实现已交付。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**（完成于 07:27:46 / 07:26:37 UTC）；这只证明 `8a5b980a`，不是本次未来文档提交的 CI。前序失败保留于第 2 / 6 节，不再作为当前代码基线的 CI 阻塞。
+- v15 / v16 源码、API、协议及授权模拟实现已交付。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**（完成于 07:27:46 / 07:26:37 UTC）；这只证明 `8a5b980a`，后续文档提交重复 CI 的实际失败见本文顶部。前序失败保留于第 2 / 6 节，不回写为通过；新暴露的问题与修正见本文顶部。
 - 用户选择 QQ 官方机器人、自托管 nginx、先完成 H5、只做模拟测试。可开发/构建/推送开发分支及运行 CI；不因此获得真实模型消费、真实 QQ 收发、OS 凭据登记、生产部署或发布授权。
 - 可选 **0.11 独立 App 已按用户指示排除**：不做 iOS/Android 原生 App、商店分发或系统推送，也不把它列成 1.0 阻塞。复杂图节点、模板库、并行 worktree、更多执行器、Responses、外部历史导入等仍是路线图候选，不偷偷并入本轮。
 
@@ -14,7 +22,7 @@
 
 ### 交付结论与仍有边界的事项
 
-1. **代码与授权模拟范围已交付，最新精确 CI 已闭环**：`8a5b980a` 两轮各 6/6。原 v14 lint / 网关竞态、v15 Windows lint / cp1252、v16 进程夹具及 PowerShell 路径失败继续按原 SHA 保留，不把历史失败当当前阻塞，也不把全绿扩写为生产 1.0 完成。
+1. **代码与授权模拟范围已交付，历史基线的精确 CI 已闭环**：`8a5b980a` 两轮各 6/6。原 v14 lint / 网关竞态、v15 Windows lint / cp1252、v16 进程夹具及 PowerShell 路径失败继续按原 SHA 保留，不把历史失败当当前阻塞，也不把全绿扩写为生产 1.0 完成。
 2. **实现限制不是外部验收缺席**：managed ChatGPT Codex 缺少可核实的不可变 principal 合同，仍采用安全 fresh thread + 应用历史，不能称其 thread resume 完成；严格 Codex 预算维度、QQ 富卡片/附件、H5 多设备切换等限制见下表及第 6.1 节。可选 0.11 已明确排除。
 3. **启动等待已修复，但不是性能优化或实机验收**：原 5,000 任务 7.153 / 6.836 / 5.702 秒与旧 6 秒截止的冲突样本保留。v15 单次 30 秒观察、可见进度和迟到只读恢复已发布；同 seed 迁移/三次温启动为 11.599 / 20.335 / 3.523 / 3.166 秒。原 seed 和历史未变，不外推任意负载 SLA、长期稳定性或 GUI。
 4. **真实环境与生产发布仍未验**：真实 OS vault、模型/QQ、GUI、nginx、三平台原生安装/升级/卸载、生产签名/信任源见第 7 节。用户本地审核合并与开发分支 CI 不等于生产签名、部署或正式发行授权。
@@ -40,7 +48,7 @@
 | E15 校验/暂存与兼容启动 | `7aea4f15`；Windows cfg 窄修复 `43d12ee3` | 开发分支已发布；两提交各自两轮 CI 均终态 **5/6**。前者仅 Windows `unused_mut` 阻断、该平台后续 tests 未跑；后者 Windows 产品 Rust / update 4 组通过，仅最后 package smoke 出现 cp1252 中文输出失败；macOS / Ubuntu Rust 全部 smoke 与三平台 Desktop 成功。原始失败与本地证据见 [更新验收](acceptance-update-v1.0.md)，不宣称完整 CI 通过。 |
 | E16 实际后台停止 | `925e6cf2d924141a0cff972113d5b37556891de9` | 原本地固定候选 core 13 / daemon 791 / CLI 53 / gateway 17 / UI 343、22 个 smoke、Web 4 组通过；[push 40828936545](https://github.com/YS1109/self-agent/actions/runs/40828936545) / [PR 40828942266](https://github.com/YS1109/self-agent/actions/runs/40828942266) 均终态 **4/6**，macOS / Windows Rust 失败见第 6 节及 [生命周期验收](acceptance-lifecycle-v1.0.md)。后续修复及新精确 CI 见 E16-F / E16-W，不回写原失败。 |
 | E16-F 进程夹具 / package 编码修复 | `df0657906a7b41f77c49ebac5ef9e0ee48da655f` | [push 40831626789](https://github.com/YS1109/self-agent/actions/runs/40831626789) / [PR 40831632978](https://github.com/YS1109/self-agent/actions/runs/40831632978) 均终态 **5/6**，macOS / Ubuntu Rust 全部 smoke 与三平台 Desktop 成功；Windows **732/733**，新增 PowerShell 初始化/截止夹具失败，后续 smoke 未运行。 |
-| E16-W Windows 普通 DOS 路径兼容 / 最新代码基线 | `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1` | [push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，共 12 个作业。Windows 两轮 daemon **734/734**、全部 smoke（含 update 4 / package 4 / shutdown 3）通过；真实路径 A/B 见第 6 节。不是本次未来文档提交的 CI。 |
+| E16-W Windows 普通 DOS 路径兼容 / 历史双全绿基线 | `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1` | [push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，共 12 个作业。Windows 两轮 daemon **734/734**、全部 smoke（含 update 4 / package 4 / shutdown 3）通过；真实路径 A/B 见第 6 节。后续文档提交重复 CI 的实际失败见本文顶部。 |
 
 ## 3. 固定产品方向与 0.7
 
@@ -97,7 +105,7 @@
 | 1.0-P0-1a 数据迁移与失败保护 | `reliability/storage.rs`、`store/reliability.rs`、`store/scheduling.rs`；旧版本真实 SQLite、v1/v2/v3 迁移、DDL 故障/回滚、未来版本拒绝，E12/E13/E14 | **已实现 / 模拟通过**。先数据目录锁/只读兼容检查再迁移；不重建较新或不一致 DB。还不是任意未来版本降级支持。 |
 | 1.0-P0-1b 备份、离线恢复、恢复后撤权 | `reliability/{jobs,storage,api}.rs`、Store reliability、CLI maintenance、UI reliability；`reliability_smoke.py`、真实备份/inspect/恢复、E12/E14 | **已实现 / 模拟通过**。SQLite 一致快照、128 MiB 影像上限、一次性意图；离线 journal/锁/类型/摘要/完整性验证。恢复使任务、批准、续接及 Provider/MCP/QQ/gateway 权威失效，不自动重放/删除 OS 秘密。备份含私有历史，**不是脱敏导出**；SHA 检错不认证来源。 |
 | 1.0-P0-1c 协议兼容 | 已发布 HTTP v1、v14 显式窗口 opt-in 与错误合同；core compatibility / 认证握手已随 v15 发布 | **已接线 / 模拟与精确 CI 通过**。旧无 query snapshot 维持全量语义或明确 413，不能静默给窗口；主动握手/不兼容启动拒绝的本地证据及精确提交结果分列第 6 节，不扩写为任意旧版本兼容。 |
-| 1.0-P0-2 三平台安装、启动、退出、升级、取消、崩溃恢复 | 已发布 daemon 锁、任务中断恢复/取消/清理、跨平台构建 CI；actual lifecycle / startup / package fixture 已随 v15 / v16 发布 | **未整体完成**。v16 的真实 Linux HTTP/CLI/SIGINT/SIGTERM、observer 断连、paused 计划取消与硬崩溃隔离均已通过本地进程回归；最新三平台 Rust / Desktop CI 已通过，Windows 实际关闭 3 组与 macOS / Linux 信号关闭 6 组分开记录。三平台原生安装/升级/卸载及完整 GUI 仍须独立验收，不能由二进制临时复制代替。 |
+| 1.0-P0-2 三平台安装、启动、退出、升级、取消、崩溃恢复 | 已发布 daemon 锁、任务中断恢复/取消/清理、跨平台构建 CI；actual lifecycle / startup / package fixture 已随 v15 / v16 发布 | **未整体完成**。v16 的真实 Linux HTTP/CLI/SIGINT/SIGTERM、observer 断连、paused 计划取消与硬崩溃隔离均已通过本地进程回归；历史 `8a5b980a` 三平台 Rust / Desktop CI 已通过，Windows 实际关闭 3 组与 macOS / Linux 信号关闭 6 组分开记录。三平台原生安装/升级/卸载及完整 GUI 仍须独立验收，不能由二进制临时复制代替。 |
 | 1.0-P0-3 凭据保护、权限和脱敏 | vault / credential intent、执行权限、QQ/gateway ACL、`provider_redaction.rs`、`changes.rs`、诊断白名单；raw JSON key/value、跨块/跨轮/截断边界 canary 回归，E08–E14 | **已实现声明边界 / 模拟通过；OS 待验**。已知秘密不进入公开 snapshot/事件/错误/诊断；不可承诺识别任意未知密钥或任意编码。私有备份另行保护，真实日志/OS 权限实机检查仍需进行。 |
 | 1.0-P0-4 发布校验、签名、更新策略 | 已发布 `reliability/update*.rs` / `store/updates.rs` / CLI updates 与 v15 协议 | **已接线 / 模拟与精确 CI 通过；生产发布条件未完成**。本轮仅本机 verification-only 校验/私有暂存，不自动下载/执行/安装。生产签名身份、信任根、更新源未配置，实际签名/自动安装/发布未授权且未做。 |
 | 1.0-P1-1 诊断与用户文档 | `reliability/diagnostics.rs`、owner API、CLI maintenance、UI；固定字段/聚合、无私有值回归，README、协议、acceptance、handoff | **诊断已实现 / 模拟通过，文档需持续校准**。配置存在、连接成功、任务成功、投递成功分开。旧 iteration/status 的阶段性“未接入”与后续追加有时间差；以本矩阵证据 / 精确 SHA 为准，不靠旧标题推断。 |
@@ -112,7 +120,7 @@
 - 旧 no-query snapshot 六次明确 413 是兼容拒绝，不是把原 40 MiB 全量内容压成小响应。原 baseline/v3 失败样本和 runner 自身修正记录保留，不删掉失败后只展示 exit 0。
 - 证据：`history-benchmark-v14-bounded/measured-final-cli/results.json`，SHA-256 `d98a208808888a94119cc4093ca12a7bc23223acfe48021ff27ad54048afc79c`；[性能记录](performance-v1.0.md)列出二进制 hash、归档路径、样本、旧候选及重跑命令。该测量来源是冻结 reviewed v14 候选，不能将它冒充发布后 CI 或另一组二进制性能。
 
-## 6. v15 / v16 已发布：保留原冻结与失败，最新精确 CI 已闭环
+## 6. v15 / v16 已发布：保留原冻结、失败与历史基线 CI
 
 协议为 [v15](protocol-v15.md) / [v16](protocol-v16.md)。这两片已实际接线、独立审查并发布到开发分支，提交分别为 `7aea4f15` / `925e6cf2`，中间有 `43d12ee3` 窄 cfg 修复，随后 `df065790` / `8a5b980a` 完成跨平台兼容修复。以下表格保留原本地冻结证据，不是本次重新执行，也不能代替最新精确 CI。
 
@@ -121,7 +129,7 @@
 | 认证兼容握手与启动 | Store / owner HTTP、CLI、Native bridge / 事件流、开发代理已接线；错误 generation 拒绝、512 bytes 响应边界、真实延迟子进程、不兼容不替换等回归通过。固定 v15 daemon 的 5,000 任务副本 readiness 4/4 在同一 30 秒预算内，最大 20.335 秒。 | 不是数据库加速、任意负载 SLA 或完整 GUI。原 seed 和全部历史未改；详细二进制/结果摘要见 [更新验收](acceptance-update-v1.0.md)。 |
 | 校验 / 暂存与防回退 | 固定 owner trust、Ed25519 原字节清单、长度/hash/platform/schema/有效期、CAS、单次上传、真实 owned I/O、DB + 独立 witness、旧库恢复撤权均已接线；exact v15 core 13 / daemon683 / CLI50 / gateway 17、fmt/Clippy/build、更新与包布局各4组重验通过。 | verification-only；不下载、解压、执行或自动安装产物，不登记生产信任根。临时签名夹具不是生产签名身份。 |
 | 同一实例实际停止 | 同 Store 锁 admission、真实 worker registry、OS 线程 join、进程清理、两次 quiesce、HTTP/CLI/UI 固定 UUID、observer 断连不取消 owner 已接线。v16 完整 core 13 / daemon 791 / CLI 53 / gateway 17、UI 343、fmt/Clippy/build、Web/H5 构建、22个后台 smoke及Web代理4组通过。 | 正常关闭会取消运行/排队/暂停任务及计划，重启不自动恢复；硬崩溃仍保留 interrupted/unknown 和项目隔离。进程清理仅覆盖普通 Unix 进程组 / Windows Job 后代，故意 `setsid` 脱离不在保证内，不是恶意进程沙箱。原本地冻结时 Windows 10 个进程夹具仅交叉编译/Clippy；后续各失败与最终真实平台通过见下文。完整 Native GUI 仍不能由这些夹具代替。 |
-| 包布局夹具 | 只复制固定当前 daemon/CLI/gateway，实际认证使用、进程重启、保留历史与仅移除副本；新 freshness 自测保持真实 library/manifest 依赖，CLI 不错误依赖 daemon binary main。 | 不是三平台原生安装器、生产签名或真实升级/卸载。旧 Windows 输出编码失败已保留，最新 `8a5b980a` 两轮 package 4 组成功，仍不是原生安装/升级/卸载。 |
+| 包布局夹具 | 只复制固定当前 daemon/CLI/gateway，实际认证使用、进程重启、保留历史与仅移除副本；新 freshness 自测保持真实 library/manifest 依赖，CLI 不错误依赖 daemon binary main。 | 不是三平台原生安装器、生产签名或真实升级/卸载。旧 Windows 输出编码失败已保留，历史 `8a5b980a` 两轮 package 4 组成功，仍不是原生安装/升级/卸载。 |
 
 v15 原文档冻结候选 tree 为 `472e5969210a0afbe60186ab046b6081b5e7cd9d`（历史本地对象，不是当前 HEAD）；其测量源码 tree `105a702e4c9a5a42b756bf22f77e3943704f3ce7` 后只更新验收文字。v16 本地源码/固定二进制及原失败保留记录见工作区 `drain-frozen-candidate.json` 和 [生命周期验收](acceptance-lifecycle-v1.0.md)。这些测试数量存在包含关系，不能累加或写成 E14 已发布门禁。
 
@@ -131,9 +139,9 @@ v15 原文档冻结候选 tree 为 `472e5969210a0afbe60186ab046b6081b5e7cd9d`（
 - v16 `925e6cf2` 的两轮 CI 均终态 **4/6**：三平台 Desktop 和 Ubuntu Rust 通过；macOS daemon **790/791**，僵尸进程组信号探测夹具失败；Windows daemon **728/730**，两个新 CMD / Job 复合脚本夹具失败。随后修复已随 `df065790` / `8a5b980a` 发布；原失败不改写为通过。
 - 原 GitHub 内容上传确曾被 auto-review 要求额外披露确认，后续用户已明确授权 v15/v16 与 QQ 相关代码开发分支发布；此阻塞已解除，不再等待用户确认。授权没有扩大到真实 QQ 消息、OS vault、部署、生产签名或正式发行。
 
-### 最新代码基线的实际结果（2026-10-29 07:28 UTC）
+### 历史代码基线的实际结果（2026-10-29 07:28 UTC）
 
-当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+07:28 UTC 时的历史已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交；后续文档提交重复 CI 的实际失败与修正见本文顶部。
 
 两轮 Windows daemon 均 **734/734**，全部后台 smoke 通过，包括 update **4 组**、package **4 组**和实际 shutdown **3 组**。macOS / Linux 的信号关闭覆盖另为 **6 组**，不把 Windows 3 组扩写成 Unix 信号验证。
 
@@ -166,7 +174,7 @@ v15 原文档冻结候选 tree 为 `472e5969210a0afbe60186ab046b6081b5e7cd9d`（
 ## 8. 更新本矩阵的规则
 
 1. 每次新增“通过”必须带精确 SHA / 固定二进制身份、实际 gate 与范围；CI 失败、未运行和不适用分开。发布新提交后保留旧失败及修复归因，不覆写成从未失败。
-2. 当前代码基线的跨平台修复、发布与精确 CI 已闭环；后续优先按第 6.1 / 7 节分别处理实现边界和实机/生产验收。实际 lifecycle/兼容、5,000 历史 readiness 和 verification-only 的本地证据已列第 6 节，不冒充本次重新运行或真实外部验证。真实平台未验与可开发缺口不能互相替代。
+2. 历史 `8a5b980a` 的跨平台修复、发布与精确 CI 已闭环；随后 `d8533feb` 重复 CI 暴露的新问题及 MCP 生产安全修复见本文顶部，本轮发布与精确 CI 仍须单独核验。之后再按第 6.1 / 7 节分别处理实现边界和实机/生产验收。实际 lifecycle/兼容、5,000 历史 readiness 和 verification-only 的本地证据已列第 6 节，不冒充本次重新运行或真实外部验证。真实平台未验与可开发缺口不能互相替代。
 3. 独立记录产品取舍：managed ChatGPT 安全 fresh fallback、Codex 不支持的强制预算、QQ 文本降级、H5 纯文本产物/单设备配对，以及明确排除的 0.11。若后来扩展，补协议和验收，不悄悄改“已完成”的含义。
 4. 最终交付至少提供开发分支/提交、各 gate 通过/失败/未运行、此矩阵剩余项及用户本地审核步骤；**只有代码和授权模拟范围的完成，不自动意味着 1.0 生产可发布**。
 

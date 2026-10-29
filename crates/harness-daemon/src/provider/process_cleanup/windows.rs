@@ -904,7 +904,184 @@ fn environment(env: &BTreeMap<String, OsString>) -> Result<Vec<u16>, SpawnError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncRead, AsyncReadExt};
+
+    const POWERSHELL_READY: &[u8] = b"self-agent-fixture-powershell-ready-v1";
+
+    // Only the test fixture has separate CLR-startup and command-completion
+    // observations. Production Native retains its existing 60-second deadline.
+    struct FixtureObservation {
+        status: Option<ExitStatus>,
+        stdout: String,
+        stderr: String,
+        ready: bool,
+        timeout_phase: &'static str,
+        elapsed_ms: u128,
+    }
+
+    fn complete_ready_line(output: &[u8]) -> bool {
+        output.split_inclusive(|byte| *byte == b'\n').any(|line| {
+            line.strip_suffix(b"\n")
+                .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                == Some(POWERSHELL_READY)
+        })
+    }
+
+    async fn fixture_stdout(
+        mut reader: impl AsyncRead + Unpin,
+        output: &mut Vec<u8>,
+        mut ready: Option<tokio::sync::oneshot::Sender<Instant>>,
+    ) -> std::io::Result<()> {
+        let mut chunk = [0u8; 1024];
+        loop {
+            let count = reader.read(&mut chunk).await?;
+            if count == 0 {
+                return Ok(());
+            }
+            if output.len() + count > 64 * 1024 {
+                return Err(std::io::Error::other("fixture output limit"));
+            }
+            output.extend_from_slice(&chunk[..count]);
+            if ready.is_some() && complete_ready_line(output) {
+                let _ = ready.take().unwrap().send(Instant::now());
+            }
+        }
+    }
+
+    async fn observe_ready_completion<T>(
+        work: impl std::future::Future<Output = T>,
+        mut ready: tokio::sync::oneshot::Receiver<Instant>,
+        startup: Duration,
+        execution: Duration,
+    ) -> (Option<T>, bool, &'static str) {
+        let started = Instant::now();
+        let total_deadline = started + startup + execution;
+        let mut deadline = started + startup;
+        let mut ready_at = None;
+        let mut ready_closed = false;
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                biased;
+                value = &mut ready, if ready_at.is_none() && !ready_closed => {
+                    match value {
+                        Ok(at) => {
+                            if at >= started + startup {
+                                return (None, true, "startup");
+                            }
+                            ready_at = Some(at);
+                            deadline = (at + execution).min(total_deadline);
+                        }
+                        Err(_) => ready_closed = true,
+                    }
+                }
+                value = &mut work => {
+                    // Work can send readiness and complete in one poll, after
+                    // the receiver was polled. Do not lose that real marker.
+                    if ready_at.is_none() && !ready_closed {
+                        if let Ok(at) = ready.try_recv() {
+                            if at >= started + startup {
+                                return (None, true, "startup");
+                            }
+                            ready_at = Some(at);
+                            deadline = (at + execution).min(total_deadline);
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return (None, ready_at.is_some(), if ready_at.is_some() { "execution" } else { "startup" });
+                    }
+                    return (Some(value), ready_at.is_some(), "none");
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return (None, ready_at.is_some(), if ready_at.is_some() { "execution" } else { "startup" });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_readiness_requires_a_complete_exact_line() {
+        assert!(!complete_ready_line(POWERSHELL_READY));
+        assert!(!complete_ready_line(&[POWERSHELL_READY, b"\r"].concat()));
+        assert!(!complete_ready_line(
+            &[b"prefix-", POWERSHELL_READY, b"\n"].concat()
+        ));
+        assert!(!complete_ready_line(
+            &[POWERSHELL_READY, b"-suffix\n"].concat()
+        ));
+        assert!(complete_ready_line(&[POWERSHELL_READY, b"\n"].concat()));
+        assert!(complete_ready_line(
+            &[b"banner\r\n", POWERSHELL_READY, b"\r\n"].concat()
+        ));
+    }
+
+    #[tokio::test]
+    async fn fixture_readiness_survives_fragmented_pipe_reads() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let expected = [POWERSHELL_READY, b"\r\nfixture-output\r\n"].concat();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut output = Vec::new();
+        let (written, read) = tokio::join!(
+            async {
+                writer.write_all(&expected).await?;
+                writer.shutdown().await
+            },
+            fixture_stdout(reader, &mut output, Some(tx)),
+        );
+        written.unwrap();
+        read.unwrap();
+        assert_eq!(output, expected);
+        assert!(rx.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fixture_readiness_separates_startup_and_strict_completion_timeouts() {
+        let startup = Duration::from_secs(5);
+        let execution = Duration::from_millis(20);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let completed = observe_ready_completion(
+            async move {
+                sleep(execution * 3).await;
+                tx.send(Instant::now()).unwrap();
+                7
+            },
+            rx,
+            startup,
+            execution,
+        )
+        .await;
+        assert_eq!(
+            completed,
+            (Some(7), true, "none"),
+            "startup does not consume the execution deadline"
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let missing =
+            observe_ready_completion(std::future::pending::<u8>(), rx, execution, startup).await;
+        assert_eq!(missing, (None, false, "startup"));
+        drop(tx);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Instant::now()).unwrap();
+        let unfinished =
+            observe_ready_completion(std::future::pending::<u8>(), rx, startup, execution).await;
+        assert_eq!(
+            unfinished,
+            (None, true, "execution"),
+            "readiness must not grant another startup budget"
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let no_marker = observe_ready_completion(async { 7 }, rx, startup, execution).await;
+        assert_eq!(
+            no_marker,
+            (Some(7), false, "none"),
+            "an exit alone is not readiness"
+        );
+        drop(tx);
+    }
 
     fn system_cmd() -> PathBuf {
         let mut value = vec![0u16; 32768];
@@ -946,7 +1123,8 @@ mod tests {
     async fn observed_fixture(
         command: &tokio::process::Command,
         fault: Fault,
-    ) -> (Option<ExitStatus>, String, String) {
+        expect_ready: bool,
+    ) -> FixtureObservation {
         let mut child = spawn_inner(
             command,
             [false, true, true],
@@ -956,32 +1134,64 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
         let mut output = Vec::new();
         let mut errors = Vec::new();
-        let observed = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::try_join!(
-                child.wait(),
-                stdout.read_to_end(&mut output),
-                stderr.read_to_end(&mut errors),
-            )
-        })
-        .await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let observed_started = Instant::now();
+        let (observed, ready, timeout_phase) = {
+            let work = async {
+                tokio::try_join!(
+                    child.wait(),
+                    fixture_stdout(stdout, &mut output, expect_ready.then_some(ready_tx)),
+                    fixture_stdout(stderr, &mut errors, None),
+                )
+            };
+            if expect_ready {
+                // Ready is flushed by the shell before the tested script.
+                // Cold CLR initialization gets at most 50s; actual script/root
+                // and pipe completion still get exactly 10s after readiness.
+                observe_ready_completion(
+                    work,
+                    ready_rx,
+                    Duration::from_secs(50),
+                    Duration::from_secs(10),
+                )
+                .await
+            } else {
+                let observed = tokio::time::timeout(Duration::from_secs(10), work)
+                    .await
+                    .ok();
+                let phase = if observed.is_some() {
+                    "none"
+                } else {
+                    "execution"
+                };
+                (observed, false, phase)
+            }
+        };
+        let elapsed_ms = observed_started.elapsed().as_millis();
         // Even a failed fixture must finish the original Job cleanup before
         // asserting; no timed-out process is abandoned to a test future's Drop.
         child.close(&|| Ok(())).await.unwrap();
         assert_eq!(job_empty(&child.job), Some(true));
-        let status = observed.ok().map(|result| result.unwrap().0);
-        (
-            status,
-            String::from_utf8_lossy(&output).into_owned(),
-            String::from_utf8_lossy(&errors).into_owned(),
-        )
+        FixtureObservation {
+            status: observed.map(|result| result.unwrap().0),
+            stdout: String::from_utf8_lossy(&output).into_owned(),
+            stderr: String::from_utf8_lossy(&errors).into_owned(),
+            ready,
+            timeout_phase,
+            elapsed_ms,
+        }
     }
     async fn completed_fixture(command: &tokio::process::Command) -> (ExitStatus, String, String) {
-        let (status, output, errors) = observed_fixture(command, Fault::None).await;
-        (status.expect("fixture command timeout"), output, errors)
+        let observed = observed_fixture(command, Fault::None, false).await;
+        (
+            observed.status.expect("fixture command timeout"),
+            observed.stdout,
+            observed.stderr,
+        )
     }
     #[tokio::test]
     async fn normal_exited_root_and_job_are_confirmed_without_taskkill() {
@@ -1124,32 +1334,41 @@ mod tests {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$text = 'fixture \"quoted\" & pipe |'; Write-Output $text; [Console]::Error.WriteLine('fixture-stderr'); exit 7",
+            "[Console]::Out.WriteLine('self-agent-fixture-powershell-ready-v1'); [Console]::Out.Flush(); $text = 'fixture \"quoted\" & pipe |'; Write-Output $text; [Console]::Error.WriteLine('fixture-stderr'); exit 7",
         ]);
-        let (status, stdout, stderr) = observed_fixture(&command, Fault::None).await;
-        let (legacy_status, _, legacy_errors) =
-            observed_fixture(&command, Fault::ExtendedLaunchPaths).await;
+        let observed = observed_fixture(&command, Fault::None, true).await;
+        let legacy = observed_fixture(&command, Fault::ExtendedLaunchPaths, true).await;
         // Only fixed classifications, never environment values or arbitrary
         // runtime text. Old failure is evidence, not a required future behavior:
         // a newer Windows/.NET image may support both path spellings.
         use std::io::Write;
         writeln!(
             std::io::stderr(),
-            "powershell_path_ab legacy_exit={:?} legacy_timeout={} legacy_servicepoint_init={} dos_exit={:?} dos_timeout={} dos_servicepoint_init={}",
-            legacy_status.and_then(|value| value.code()),
-            legacy_status.is_none(),
-            legacy_errors.contains("System.Net.ServicePointManager"),
-            status.and_then(|value| value.code()),
-            status.is_none(),
-            stderr.contains("System.Net.ServicePointManager"),
+            "powershell_path_ab legacy_exit={:?} legacy_timeout={} legacy_servicepoint_init={} legacy_ready={} legacy_timeout_phase={} legacy_elapsed_ms={} dos_exit={:?} dos_timeout={} dos_servicepoint_init={} dos_ready={} dos_timeout_phase={} dos_elapsed_ms={}",
+            legacy.status.and_then(|value| value.code()),
+            legacy.status.is_none(),
+            legacy.stderr.contains("System.Net.ServicePointManager"),
+            legacy.ready,
+            legacy.timeout_phase,
+            legacy.elapsed_ms,
+            observed.status.and_then(|value| value.code()),
+            observed.status.is_none(),
+            observed.stderr.contains("System.Net.ServicePointManager"),
+            observed.ready,
+            observed.timeout_phase,
+            observed.elapsed_ms,
         ).unwrap();
-        let status = status.expect("fixture command timeout");
+        assert!(
+            observed.ready,
+            "PowerShell fixture must reach explicit readiness"
+        );
+        let status = observed.status.expect("fixture command timeout");
         assert_eq!(status.code(), Some(7), "PowerShell fixture exit status");
         assert!(
-            stdout.contains("fixture \"quoted\" & pipe |"),
+            observed.stdout.contains("fixture \"quoted\" & pipe |"),
             "PowerShell fixture stdout must preserve quotes and operators"
         );
-        assert!(stderr.contains("fixture-stderr"));
+        assert!(observed.stderr.contains("fixture-stderr"));
     }
     #[test]
     fn launch_spelling_only_accepts_bounded_dos_equivalent_locked_paths() {

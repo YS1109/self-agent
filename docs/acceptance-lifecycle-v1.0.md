@@ -1,6 +1,14 @@
 # 1.0 实际后台生命周期验收记录
 
-状态（2026-10-29 07:28 UTC）：当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+## 当前跟进状态（2026-10-29 07:54 UTC）
+
+文档提交 `d8533feb8c82ad6ebff97e28fd4259f52cabdf96` 的 [push 40836552098](https://github.com/YS1109/self-agent/actions/runs/40836552098) / [PR 40836559612](https://github.com/YS1109/self-agent/actions/runs/40836559612) 均终态 **5/6（失败）**：push 的 Ubuntu MCP 夹具把尚未写完的 PID 文件视为就绪；PR 的 Windows PowerShell 夹具未区分冷启动和脚本执行，超过原 10 秒观察期。其它作业均成功。下文 `8a5b980a` 的两轮 6/6 是保留的历史证据，不覆盖这些重复运行暴露的竞态。
+
+独立复审还确认既有 MCP Unix 清理路径会先回收根进程，再向保存的数字 PGID 发信号，存在身份复用风险；本次安全切片在最后组信号之前保留未回收根身份，并同步消费信号权威，取消/重复 close/Drop 不再重用旧 PGID。PID 夹具改为在原 10 秒内等待真实子进程完整 PID；Windows 仅夹具新增完整 ready 行，将最长 50 秒运行时就绪与其后严格 10 秒脚本完成分开，生产 60 秒预算不变，不把冷启动假设写成已证实根因。清理 Unknown、项目隔离和原停止断言不放松。
+
+本轮门禁与发布结果见 [生命周期验收的后续安全切片](acceptance-lifecycle-v1.0.md#后续-mcp-身份安全与就绪夹具切片)。精确新提交 CI 以 [草稿 PR #1](https://github.com/YS1109/self-agent/pull/1) 对应 SHA 的检查及收据为准；本地通过不代表跨平台已经通过。
+
+历史状态（2026-10-29 07:28 UTC）：当时已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交；后续文档提交重复 CI 的实际失败与修正见本文顶部。
 
 本片源码、API、协议及授权的模拟实现已交付；下文保留各次失败与本地冻结记录，不以最终成功抹去旧提交的失败，也不把构建/模拟门禁称为完整生产 1.0 或实机 GUI/安装验收。
 
@@ -69,7 +77,7 @@
 
 ## 未运行 / 仍待处理
 
-- 当前代码基线的开发分支发布及精确 push / PR CI 已闭环。旧失败提交在失败后未运行的阶段仍不回写为通过；新提交的独立结果见文末。
+- 历史 `8a5b980a` 的开发分支发布及精确 push / PR CI 已闭环；后续重复 CI 和本次修正见本文顶部。旧失败提交在失败后未运行的阶段仍不回写为通过；新提交的独立结果见文末。
 - 实机 GUI、真实 OS vault、真实模型/QQ、公网 nginx、原生安装/升级/卸载、生产签名/发行均未运行。用户授权的是模拟验证和开发分支，不是部署或正式发行。
 
 ## 本次跨平台 CI 修复的重新冻结（2026-10-29 06:46 UTC）
@@ -97,9 +105,9 @@
 证据：`/tmp/drain-powershell-path-{native,codex,clippy}.log`、`drain-ci-fix-ci-final.json`；Windows 源码 SHA-256 `e2463a90b83f952062773f1c88b0dcfe0fdc63a7a3c12062324c0883c92ed6b4`。
 
 
-## 最终代码基线与精确 CI 闭环（2026-10-29 07:28 UTC）
+## 历史代码基线与精确 CI（2026-10-29 07:28 UTC）
 
-当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+07:28 UTC 时的历史已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交；后续文档提交重复 CI 的实际失败与修正见本文顶部。
 
 两轮 Windows daemon 均 **734/734**，全部后台 smoke 通过，包括 update **4 组**、package **4 组**和实际 shutdown **3 组**。macOS / Linux 的信号关闭覆盖另为 **6 组**，不把 Windows 3 组扩写成 Unix 信号验证。
 
@@ -108,3 +116,15 @@
 精确 run 与全部作业记录：工作区 `powershell-path-ci-final.json`；Windows 证明日志 `/tmp/powershell-path-windows-{push,pr}-proof.log`。原固定 Linux core 13 / daemon 791 / CLI 53 / gateway 17 / UI 343、22 个 smoke 和 Web 4 组仍属于各自原冻结记录，本次文档更新未重跑或替换这些证据。
 
 运行包版本仍为 `0.6.0`；交付在开发分支 / 草稿 PR，合并由用户本地审核决定，没有 merge、tag、release、生产签名或部署。真实模型、QQ、OS vault、完整 GUI、nginx 和三平台原生安装/升级/卸载仍未验证。普通 Unix 进程组 / Windows Job 的所有权边界不变，Unix 故意 `setsid` 脱离仍不在保证内。
+
+## 后续 MCP 身份安全与就绪夹具切片
+
+本节记录 `d8533feb` 之后的安全修复，不将此前全绿当作生产安全的证明。MCP 的 grace 观察复用已审 `waitid(WNOWAIT)`，TERM 等待不再 `try_wait`，每次组信号均检查仍持有原根身份；最终信号在真正 reap 前同步消费权威。未知清理、无自动重放、项目隔离和 Unix 故意 `setsid` 脱离不在保证内的边界均不变。
+
+已完成定向门禁：MCP **18/18**（包含新增身份/close 取消/Drop **6 项**与原协议/后代清理回归）、daemon all-target Clippy；PID 就绪夹具仍使用原 **10 秒**设置期限，不接受空、部分或另一 PID。测试通过注入的信号观察器验证旧数字身份不可再使用，不向伪造或无关进程组发送真实信号，也不宣称已经在实机制造 PID 复用。
+
+Windows 变化仅在 `#[cfg(test)]` 内：完整唯一 ready 行（LF/CRLF）、分片读取和双阶段 timer 的实际源提取 **3/3** 通过；Windows **17 项**交叉检查及 Clippy 通过，但并未在本机执行 Windows。ready 最多等待 50 秒，标记后 root/输出/错误完成仍严格限 10 秒，每次 fixture 调用的总观察上限为 60 秒，不含 spawn/cleanup，也不是 A/B 两轮合计耗时保证；所有超时先完成原 Job 清理，原 exit 7、输出及 Job 空断言保留。新 CI 同时记录 ready/timeout 阶段和 elapsed，冷 CLR 初始化仍是待真实观测的解释，不据此改生产预算。
+
+最终冻结后重新运行：core **13** / daemon **798** / CLI **53** / gateway **17** 全部通过；fmt、四 crate all-target Clippy、daemon/CLI/gateway 与 update fixture 构建通过。**22 个后台 smoke**、history benchmark self-test 及 package **6 项** self-test 全部 exit 0，其中实际后台关闭仍为 **6 组**（含 SIGINT/SIGTERM、paused 取消、重启不重放）。352 个源码/夹具与 4 个二进制在门禁前后 SHA-256 完全一致；`mcp-process-safety-gates.json` 与 `/tmp/mcp-process-safety-{fmt,rust,clippy,build,smokes}.log` 保留在执行工作区。
+
+MCP 生产修复与 Windows 测试-only delta 均已独立只读复审，无已知范围内阻断。此次未重新运行前端/GUI 或真实 Windows/macOS；已有前端与旧精确 CI 只作为对应历史证据。本文记录时该候选尚待开发分支发布及新 SHA 的双 CI，不能把本地或交叉检查写成实际平台成功。后续精确 run/结果由 [PR #1](https://github.com/YS1109/self-agent/pull/1) 收据标明，不改写本节记录时的事实。
