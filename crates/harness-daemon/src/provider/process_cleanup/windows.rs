@@ -190,6 +190,8 @@ enum Fault {
     Assign,
     #[cfg(test)]
     Resume,
+    #[cfg(test)]
+    ExtendedLaunchPaths,
 }
 async fn spawn_inner(
     command: &tokio::process::Command,
@@ -209,26 +211,25 @@ async fn spawn_inner(
         .map(|path| Ok(path.to_path_buf()))
         .unwrap_or_else(std::env::current_dir)
         .context("执行器当前目录不可用")?;
-    let (mut roots, mut root_wide) = lock_path(&root, true, control)?;
+    let (mut roots, locked_root) = lock_path(&root, true, control)?;
+    let root_wide = compatible_launch_path(&locked_root)?;
     let env = effective_environment(command)?;
     let (selected, selected_roots) = resolve_program(command.get_program(), &root, &env, control)?;
     roots.extend(selected_roots);
     let args: Vec<_> = command.get_args().map(OsStr::to_os_string).collect();
+    let selected = PathBuf::from(batch_path(&selected)?);
     let (program, mut line) = launch_line(&selected, &args)?;
-    if selected
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
-    {
-        // CMD's shell namespace is not the full extended-length Win32 namespace.
-        // Convert only ordinary DOS names whose interpretation cannot change;
-        // the existing ancestor handles continue to pin the exact same objects.
-        root_wide = OsStr::new(&batch_path(&root)?)
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-    }
-    let (program_roots, program_wide) = lock_path(&program, false, control)?;
+    let (program_roots, locked_program) = lock_path(&program, false, control)?;
     roots.extend(program_roots);
+    let program_wide = compatible_launch_path(&locked_program)?;
+    #[cfg(test)]
+    let (root_wide, program_wide) = if fault == Fault::ExtendedLaunchPaths {
+        // Regression-only A/B keeps the same command/environment/Job/locks and
+        // reproduces the previous API spelling. No production toggle exists.
+        (locked_root, locked_program)
+    } else {
+        (root_wide, program_wide)
+    };
     let mut environment = environment(&env)?;
     let job = owned(unsafe { CreateJobObjectW(null(), null()) })?;
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
@@ -398,8 +399,10 @@ fn resolve_program(
             // No ambient metadata probe: a fixed drive can contain a junction
             // into a remote namespace. The component walk rejects that entry
             // before accessing anything beneath it and retains selected locks.
-            if let Ok((locks, _)) = lock_path(&candidate, false, control) {
-                return Ok((candidate, locks));
+            if let Ok((locks, canonical)) = lock_path(&candidate, false, control) {
+                let canonical =
+                    PathBuf::from(OsString::from_wide(&canonical[..canonical.len() - 1]));
+                return Ok((canonical, locks));
             }
         }
     }
@@ -464,46 +467,72 @@ fn launch_line(selected: &Path, args: &[OsString]) -> Result<(PathBuf, Vec<u16>)
     Ok((interpreter, line))
 }
 
-/// The Windows shell and extended-length filesystem namespace have different
+/// Win32/legacy-runtime and extended-length filesystem namespaces have different
 /// normalization rules. Never strip a prefix from a trailing-dot/space or DOS
-/// device name and accidentally execute a different path.
+/// device name and accidentally execute a different path. This launcher uses
+/// only bounded ordinary DOS spellings, never a lossy path rewrite or fallback.
 /// https://learn.microsoft.com/windows/win32/fileio/naming-a-file
 fn batch_path(path: &Path) -> Result<String> {
-    let text = path.to_str().context("执行器包装路径无法安全编码")?;
+    let text = path.to_str().context("执行器路径无法安全编码")?;
     let text = text.strip_prefix(r"\\?\").unwrap_or(text);
     if !matches!(Path::new(text).components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)))
         || !Path::new(text).is_absolute()
         || text.encode_utf16().count() >= 260
     {
-        bail!("CMD/BAT 包装仅支持有界的普通本地盘符路径");
+        bail!("Windows 执行器仅支持有界的普通本地盘符路径");
     }
     for component in Path::new(text).components() {
         if let Component::Normal(name) = component {
-            let name = name.to_str().context("执行器包装路径无法安全编码")?;
-            let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-            let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
-                || stem
-                    .strip_prefix("COM")
-                    .or_else(|| stem.strip_prefix("LPT"))
-                    .is_some_and(|tail| {
-                        matches!(
-                            tail,
-                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-                        )
-                    });
+            let name = name.to_str().context("执行器路径无法安全编码")?;
+            let stem = name
+                .split('.')
+                .next()
+                .unwrap_or("")
+                .trim_matches(' ')
+                .to_ascii_uppercase();
+            let reserved = matches!(
+                stem.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+            ) || stem
+                .strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT"))
+                .is_some_and(|tail| {
+                    matches!(
+                        tail,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                });
             if name.ends_with(['.', ' '])
-                || name
-                    .chars()
-                    .any(|ch| ch.is_control() || matches!(ch, ':' | '<' | '>' | '|' | '?' | '*'))
+                || name.chars().any(|ch| {
+                    ch.is_control() || matches!(ch, ':' | '<' | '>' | '|' | '?' | '*' | '"')
+                })
                 || reserved
             {
-                bail!("CMD/BAT 包装路径存在不同命名空间解释；未启动");
+                bail!("执行器路径存在不同命名空间解释；未启动");
             }
         } else if matches!(component, Component::ParentDir | Component::CurDir) {
-            bail!("CMD/BAT 包装路径不能包含相对组件");
+            bail!("执行器路径不能包含相对组件");
         }
     }
     Ok(text.to_owned())
+}
+
+/// GetFinalPathNameByHandleW returns a device spelling even for a short DOS
+/// input. Do not inject that spelling into the child runtime: GetModuleFileNameW
+/// preserves the loaded spelling, and legacy .NET configuration derives paths
+/// from it. Keep every no-follow ancestor/image handle while selecting only a
+/// validated equivalent DOS name for CreateProcessW's image and cwd.
+/// https://learn.microsoft.com/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulefilenamew
+/// https://github.com/microsoft/referencesource/blob/main/System.Configuration/System/Configuration/ClientConfigPaths.cs
+fn compatible_launch_path(locked_path: &[u16]) -> Result<Vec<u16>> {
+    let Some((&0, path)) = locked_path.split_last() else {
+        bail!("执行器锁定路径格式无效");
+    };
+    let path = PathBuf::from(OsString::from_wide(path));
+    Ok(OsStr::new(&batch_path(&path)?)
+        .encode_wide()
+        .chain(Some(0))
+        .collect())
 }
 async fn stdio_end(
     reads: bool,
@@ -914,10 +943,17 @@ mod tests {
         );
         info.ActiveProcesses
     }
-    async fn completed_fixture(command: &tokio::process::Command) -> (ExitStatus, String, String) {
-        let mut child = spawn(command, [false, true, true], &|| false, &|| {
-            panic!("fixture launch cleanup must be confirmed")
-        })
+    async fn observed_fixture(
+        command: &tokio::process::Command,
+        fault: Fault,
+    ) -> (Option<ExitStatus>, String, String) {
+        let mut child = spawn_inner(
+            command,
+            [false, true, true],
+            &|| false,
+            &|| panic!("fixture launch cleanup must be confirmed"),
+            fault,
+        )
         .await
         .unwrap();
         let mut stdout = child.stdout.take().unwrap();
@@ -936,12 +972,16 @@ mod tests {
         // asserting; no timed-out process is abandoned to a test future's Drop.
         child.close(&|| Ok(())).await.unwrap();
         assert_eq!(job_empty(&child.job), Some(true));
-        let (status, _, _) = observed.expect("fixture command timeout").unwrap();
+        let status = observed.ok().map(|result| result.unwrap().0);
         (
             status,
             String::from_utf8_lossy(&output).into_owned(),
             String::from_utf8_lossy(&errors).into_owned(),
         )
+    }
+    async fn completed_fixture(command: &tokio::process::Command) -> (ExitStatus, String, String) {
+        let (status, output, errors) = observed_fixture(command, Fault::None).await;
+        (status.expect("fixture command timeout"), output, errors)
     }
     #[tokio::test]
     async fn normal_exited_root_and_job_are_confirmed_without_taskkill() {
@@ -1086,13 +1126,64 @@ mod tests {
             "-Command",
             "$text = 'fixture \"quoted\" & pipe |'; Write-Output $text; [Console]::Error.WriteLine('fixture-stderr'); exit 7",
         ]);
-        let (status, stdout, stderr) = completed_fixture(&command).await;
-        assert_eq!(status.code(), Some(7), "fixture stderr: {stderr}");
+        let (status, stdout, stderr) = observed_fixture(&command, Fault::None).await;
+        let (legacy_status, _, legacy_errors) =
+            observed_fixture(&command, Fault::ExtendedLaunchPaths).await;
+        // Only fixed classifications, never environment values or arbitrary
+        // runtime text. Old failure is evidence, not a required future behavior:
+        // a newer Windows/.NET image may support both path spellings.
+        use std::io::Write;
+        writeln!(
+            std::io::stderr(),
+            "powershell_path_ab legacy_exit={:?} legacy_timeout={} legacy_servicepoint_init={} dos_exit={:?} dos_timeout={} dos_servicepoint_init={}",
+            legacy_status.and_then(|value| value.code()),
+            legacy_status.is_none(),
+            legacy_errors.contains("System.Net.ServicePointManager"),
+            status.and_then(|value| value.code()),
+            status.is_none(),
+            stderr.contains("System.Net.ServicePointManager"),
+        ).unwrap();
+        let status = status.expect("fixture command timeout");
+        assert_eq!(status.code(), Some(7), "PowerShell fixture exit status");
         assert!(
             stdout.contains("fixture \"quoted\" & pipe |"),
-            "fixture stdout: {stdout}"
+            "PowerShell fixture stdout must preserve quotes and operators"
         );
         assert!(stderr.contains("fixture-stderr"));
+    }
+    #[test]
+    fn launch_spelling_only_accepts_bounded_dos_equivalent_locked_paths() {
+        fn wide(path: &str) -> Vec<u16> {
+            OsStr::new(path).encode_wide().chain(Some(0)).collect()
+        }
+        assert_eq!(
+            compatible_launch_path(&wide(r"\\?\C:\Windows\System32\powershell.exe")).unwrap(),
+            wide(r"C:\Windows\System32\powershell.exe")
+        );
+        for path in [
+            r"\\?\C:\trailing.\powershell.exe",
+            r"\\?\C:\trailing \powershell.exe",
+            r"\\?\C:\CONIN$\powershell.exe",
+            r"\\?\C:\ CONIN$.txt\powershell.exe",
+            r"\\?\C:\CONOUT$.txt\powershell.exe",
+            r"\\?\C:\NUL .txt\powershell.exe",
+            r"\\?\C:\COM¹.txt\powershell.exe",
+            r"\\?\C:\..\powershell.exe",
+            r"\\?\UNC\server\share\powershell.exe",
+            r"\\.\C:\powershell.exe",
+            r"C:relative\powershell.exe",
+            r#"\\?\C:\double"quote\powershell.exe"#,
+            "C:\\nul\0injected\\powershell.exe",
+        ] {
+            assert!(compatible_launch_path(&wide(path)).is_err());
+        }
+        let long = format!(r"\\?\C:\{}\powershell.exe", "a".repeat(260));
+        assert!(compatible_launch_path(&wide(&long)).is_err());
+        assert!(compatible_launch_path(&[b'C' as u16]).is_err());
+        let mut invalid_unicode = wide(r"\\?\C:\fixture");
+        invalid_unicode.pop();
+        invalid_unicode.extend([0xD800, 0]);
+        assert!(compatible_launch_path(&invalid_unicode).is_err());
     }
     #[tokio::test]
     async fn suspended_spawn_failures_are_reaped_before_returning() {

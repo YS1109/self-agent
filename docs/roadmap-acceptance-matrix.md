@@ -151,3 +151,7 @@ v15 原文档冻结候选 tree 为 `472e5969210a0afbe60186ab046b6081b5e7cd9d`（
 ### 本次 CI 窄修复本地重验（2026-10-29 06:46 UTC）
 
 CMD 固定脚本编码、macOS WNOWAIT 观察夹具及 package UTF-8 输出修复已独立复核。重新完整通过 Rust **13 / 791 / 53 / 17**、fmt / all-target Clippy / 后台构建、**22 个 smoke**、history self-test 和 package **6 项** self-test；新 Windows 13 项仍仅交叉编译，真实跨平台结果等新提交 CI。原失败保留，详细证据与未运行项见 [生命周期验收](acceptance-lifecycle-v1.0.md#本次跨平台-ci-修复的重新冻结2026-10-29-0646-utc)。本地通过不等于正式发行或实机验收。
+
+### Windows 路径兼容性跟进（2026-10-29 07:07 UTC）
+
+后续已发布 `df065790` 两轮 CI 各 **5/6**：macOS / Ubuntu Rust 与全部 Desktop 通过；Windows **732/733**，只有新增 PowerShell 初始化/超时测试失败，后续 smoke 未运行。本次进一步把已锁定 handle 的 canonical image/cwd 转成严格等价普通 DOS 表示；所有锁、Job、权限和 10 秒回归截止不变，无自动重试。Windows image/cwd 当前仅支持 UTF-8 可表示、少于 260 个 UTF-16 code unit 的普通固定盘符路径，歧义或不支持的命名空间明确拒绝；不是通用长路径支持。Linux 52/47 定向、Clippy 与 Windows 14 项交叉编译通过，独立复核 clear；实际新 Windows A/B/完整 CI 未取得，不提前称根因已证实或平台全绿。详见 [生命周期验收](acceptance-lifecycle-v1.0.md)。

@@ -45,6 +45,8 @@ OS vault 保留真实标准线程 JoinHandle；逻辑 STOPPED 标记不足以确
 
 Native 阻塞读在取消时仍等待原线程结束。进程清理由专用 backend 报告，不能忽略 kill/wait 错误。Unix 的保证针对所启动的普通进程组，不是恶意 setsid 脱离的安全沙箱；Windows 普通树通过独立 Job launcher 接线，实际平台执行结果必须由精确 CI 记录，不能用 Linux 编译冒充。
 
+Windows launcher 保留 no-follow 的项目/程序/祖先句柄至原 Job 结束，但传给子进程的是经验证等价的普通本地 DOS 路径，不把句柄 API 返回的 `\\?\` 设备拼写强加给旧运行时。当前 image/cwd 只支持可表示为 UTF-8、少于 260 个 UTF-16 code unit 的普通固定盘符路径；UNC、相对路径、无普通 DOS 等价表示的设备路径、尾点/尾空格、保留设备别名及其它不等价拼写明确拒绝，不作有损规范化或不安全回退。这是有意的兼容范围限制，不是任意 Windows 长路径支持；句柄锁、Job、权限和清理确认规则不变。
+
 ## 5. 客户端行为
 
 CLI `daemon-status` 只读；`self-agent-cli --wait 30 daemon-stop --confirm` 先读取并固定实例 UUID，再只发送一次带该 UUID 的关闭请求，`--wait` 为 1–30 秒。未知响应返回非零，不能自动再 POST；不得把连接拒绝或不同实例的快照打印为原实例已停止。

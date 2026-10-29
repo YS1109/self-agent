@@ -81,3 +81,15 @@
 已重新运行并终态通过：core **13** / daemon **791** / CLI **53** / gateway **17**，fmt、四 crate all-target Clippy、daemon/CLI/gateway 与 update fixture 构建；全部 **22 个后台 smoke**（含真实关闭 6 组）以及 history benchmark self-test、package **6 项** self-test。另在 cp1252 环境下单独运行同一 6 项 package self-test，通过。源码与 4 个二进制前后 SHA-256 一致，证据为 `drain-ci-fix-gate-receipt.json` 和 `/tmp/drain-ci-fix-{fmt,rust,clippy,build,smokes,package-self-tests,history-self-tests}.log`。
 
 独立源码复核通过；Linux Native 52 / Codex 47 定向通过。Windows **13 项仅交叉编译及 Clippy**，不是新 Windows 执行结果；修复后的真实 Windows/macOS 运行仍须新精确提交 CI，不能沿用失败父提交或本地 Linux 结果。前端未修改，此次未重跑 GUI/前端；前述 343 与原三平台 Desktop CI 是其各自的历史证据。
+
+## Windows 旧运行时路径跟进（2026-10-29 07:07 UTC）
+
+`df0657906a7b41f77c49ebac5ef9e0ee48da655f` 的 [push 40831626789](https://github.com/YS1109/self-agent/actions/runs/40831626789) / [PR 40831632978](https://github.com/YS1109/self-agent/actions/runs/40831632978) 两轮终态均 **5/6**：macOS / Ubuntu Rust（含全部后台 smoke）和三平台 Desktop 通过；Windows daemon **732/733**，原 CMD/Job 与新增 CMD 引号路径全部通过，但新增 PowerShell 测试在一轮报告 ServicePointManager 初始化异常/exit -65536，另一轮达到原 10 秒观察截止。Windows 后续 smoke 未运行；不把新失败写成平台已修好。
+
+本次仅改 Windows launcher 与其测试：不再把 `GetFinalPathNameByHandleW` 返回的设备路径拼写直接传给子运行时，而由已持有的同一 no-follow handle 得到 canonical 路径，再严格验证普通 DOS 等价表示。保留所有祖先/程序锁、Job、环境、权限和清理确认，歧义/长路径明确拒绝；支持上限见协议 v16。微软 `GetModuleFileNameW` 和 .NET ReferenceSource 配置路径传播语义支持此兼容性假设，但泛化的初始化异常不足以单独证明内层根因。
+
+回归在同一 Job/环境/脚本条件下先运行普通 DOS，再观察旧设备拼写；每次仍独立限 10 秒并等待原 Job 清理，只输出退出码/超时/固定异常分类。正常路径仍严格要求 exit 7、原引号/运算符 stdout、指定 stderr 和 Job 空；旧路径失败不是通过条件，也没有生产自动重试/回退开关。
+
+独立源码复核通过；Linux Native **52/52**、Codex **47/47**、daemon all-target Clippy、fmt / diff check 通过；Windows **14 项交叉编译及 Clippy** 通过。本次改动完全在 Windows cfg 模块，未重新运行完整 Linux/前端或复用旧二进制假称新 smoke。真实 Windows A/B 和完整门禁须在本次精确提交 CI 验证，当前仍未确认有效性。
+
+证据：`/tmp/drain-powershell-path-{native,codex,clippy}.log`、`drain-ci-fix-ci-final.json`；Windows 源码 SHA-256 `e2463a90b83f952062773f1c88b0dcfe0fdc63a7a3c12062324c0883c92ed6b4`。
