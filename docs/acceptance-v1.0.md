@@ -91,3 +91,11 @@
 `7b026c06bd475aeaf50f3141dc5a0369c7d623b9` 的 push `40801817466` / PR `40801824633` 各 **3/6**：三个 Desktop 均成功，三个 Rust 均在 Rust 1.99 新增 `chunks_exact_to_as_chunks` lint 阻断；其后的 Rust 测试/构建/smoke 尚未执行，不能记为通过或运行失败。
 
 窄修复仅把游标解码的固定二字节迭代改为 `as_chunks::<2>().0.iter()`；原长度、偶数、ASCII hex 校验及解码/作用域/epoch约束未变，也没有禁用 lint。隔离候选 Store **16** 与真实 HTTP **3** 回归、fmt 和 daemon all-targets Clippy `-D warnings` 均通过；修复提交精确 CI 发布后单独跟踪。没有重跑未变的 GUI/完整前端或原性能测量；之前三平台 Desktop 成功不代替新提交 CI。
+
+### v14 网关撤权观察竞态修复
+
+`03341d39246689eefdacfcb51271078f9f98e7f5` 的 push `40803221173` **6/6 成功**；PR `40803228478` **5/6**，仅 macOS Rust 最后的网关 smoke 将撤权期间在途只读 RPC 的 `outcome_unknown` 误判为测试失败。三平台 Rust 测试、Clippy、构建与三个 Desktop 均通过；失败整项仍记录为失败，不把 push 成功代替 PR 结果。
+
+源码核对确认：网关收到 `Revoked` 时删除该主体 cookie，并将已在途 RPC 结为无数据的未知结果；后续同 cookie 读取明确拒绝。窄修只改夹具的观察方式：同一固定只读 artifact 在 10 秒总期限内复查，每次必须只有静态 code；任何成功或 data 立即失败，永久 unknown/到期也失败，最终仍必须明确 unauthorized/forbidden。没有修改产品、重发 command、延长模型执行期限或降低任务 cancelled/remote_permission_revoked、重启不重放断言。
+
+新增 8 个确定性观察序列自测（两种拒绝、成功、数据泄露、永久未知和迟到拒绝），Python 编译通过；使用 v14 已冻结的 daemon/CLI/gateway 二进制实际联合 smoke **连续两轮、每轮 6 组通过**。这些二进制与性能证据的 SHA 相同；本次没有 Rust/前端产品变更，未重跑全套编译或真实平台服务。精确新提交 CI 发布后继续跟踪，不能用本地两轮代替 macOS 实际结果。

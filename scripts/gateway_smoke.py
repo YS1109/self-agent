@@ -106,13 +106,13 @@ class Browser:
     def __init__(self, gateway):
         self.gateway, self.cookie, self.csrf = gateway, "", ""
 
-    def request(self, method, path, value=None, origin=None):
+    def request(self, method, path, value=None, origin=None, timeout=25):
         headers = {"Sec-Fetch-Site": "same-origin", "Cookie": self.cookie}
         if method != "GET":
             headers.update({"Origin": origin or self.gateway.origin, "x-csrf-token": self.csrf, "Content-Type": "application/json"})
         request = urllib.request.Request(self.gateway.origin + "/gateway/api/" + path,
             data=None if value is None else json.dumps(value).encode(), method=method, headers=headers)
-        with urllib.request.urlopen(request, timeout=25) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             assert response.headers["Cache-Control"] == "no-store"
             cookie = response.headers.get("Set-Cookie")
             if cookie:
@@ -128,11 +128,71 @@ class Browser:
         self.csrf = result["data"]["csrf"]
         return result["data"]
 
-    def rpc(self, value):
-        return self.request("POST", "rpc", value)
+    def rpc(self, value, timeout=25):
+        return self.request("POST", "rpc", value, timeout=timeout)
+
+
+def assert_artifact_revoked(browser, resource, timeout=10, clock=time.monotonic, sleep=time.sleep):
+    """Observe one fixed read-only resource; never replay a command or accept unknown as denial."""
+    deadline = clock() + timeout
+    while True:
+        remaining = deadline - clock()
+        assert remaining > 0, "resource revocation was not explicitly observed before the deadline"
+        result = browser.rpc({"type": "artifact", "resource_id": resource}, timeout=remaining)
+        # Revoked can invalidate an already pending RPC and return OutcomeUnknown.
+        # Every observation must be data-free; only a subsequent explicit denial passes.
+        assert isinstance(result, dict) and set(result) == {"code"}, result
+        assert result["code"] in {"unauthorized", "forbidden", "outcome_unknown"}, result
+        assert clock() < deadline, "resource revocation observation exceeded the deadline"
+        if result["code"] != "outcome_unknown":
+            return
+        sleep(min(0.05, max(0, deadline - clock())))
+
+
+def self_test_revocation_observation():
+    class Fixture:
+        def __init__(self, responses, delay=0):
+            self.responses, self.delay, self.now, self.calls = responses, delay, 0.0, []
+
+        def rpc(self, value, timeout):
+            assert value == {"type": "artifact", "resource_id": "fixed-resource"}
+            assert 0 < timeout <= 0.2
+            self.calls.append(value.copy())
+            self.now += self.delay
+            return self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
+
+        def sleep(self, delay):
+            self.now += delay
+
+        def observe(self):
+            assert_artifact_revoked(self, "fixed-resource", timeout=0.2,
+                                    clock=lambda: self.now, sleep=self.sleep)
+
+    for code in ("unauthorized", "forbidden"):
+        fixture = Fixture([{"code": "outcome_unknown"}, {"code": code}])
+        fixture.observe()
+        assert len(fixture.calls) == 2
+    for responses, delay in (
+        ([{"code": "ok", "data": {"text": "must not leak"}}], 0),
+        ([{"code": "ok"}], 0),
+        ([{"code": "outcome_unknown", "data": {"text": "must not leak"}}], 0),
+        ([{"code": "forbidden", "data": {}}], 0),
+        ([{"code": "outcome_unknown"}], 0),
+        ([{"code": "forbidden"}], 0.3),
+    ):
+        fixture = Fixture(responses, delay)
+        try:
+            fixture.observe()
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("unsafe or inconclusive revocation observation passed")
+        assert len(fixture.calls) <= 4
+    print("PASS bounded read-only revoke observation rejects data, success, permanent unknown and late denial")
 
 
 def main():
+    self_test_revocation_observation()
     model = ThreadingHTTPServer(("127.0.0.1", 0), Model)
     model.daemon_threads = True
     threading.Thread(target=model.serve_forever, daemon=True).start()
@@ -231,8 +291,7 @@ def main():
                 admin({"type": "revoke_binding", "principal_id": principal, "expected_revision": 1})
                 assert wait_for(lambda: terminal(slow))["status"] == "cancelled"
                 assert task(slow)["stop_reason"] == "remote_permission_revoked"
-                denied = browser.rpc({"type": "artifact", "resource_id": resource})
-                assert denied["code"] in {"unauthorized", "forbidden"}, denied
+                assert_artifact_revoked(browser, resource)
                 Model.hold.set()
                 print("PASS active remote task revoke and resource authorization revoked without replay")
 
