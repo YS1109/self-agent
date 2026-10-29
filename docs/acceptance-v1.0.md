@@ -53,3 +53,9 @@
 真实性能测量和保留失败详见 performance-v1.0：两组空闲 CPU 约 1.5%，20k 回放两组各 3/3 通过，原 seed/历史摘要不变；5,000 任务 status/单任务各 3/3 仍超客户端容量，runner 如实 exit 2。该性能失败正在后续分页切片处理，不计为全部通过。真实 GUI/OS vault/外部服务/安装发布仍未验证。
 
 索引切片最终冻结：core **9** / daemon **603** / CLI **37** / gateway **17** 全量通过；fmt、全 targets Clippy `-D warnings`、三个后台/CLI/gateway 构建及 **18 个后台 smoke** 通过。smoke 使用冻结源码与构建后私有副本，不受下一片并行构建影响；benchmark self-test / Python 编译通过，独立源码及文档复核闭环。本片没有前端修改，未重跑 GUI/全前端门禁；此前 3160a4e2 Desktop 成功不能替代新 SHA CI。性能容量失败仍如上一段单列，不因回归套件通过而隐去。新提交三平台 CI 发布后另行跟踪。
+
+## v3 基准自测 Windows 清理修复
+
+`03322fedc395c3b4d9e191dc4211c86e96261b44` 的 push `40795769321` / PR `40795775886` 均为 **5/6**：三平台 Desktop、Ubuntu/macOS Rust 成功；Windows Rust 的测试、Clippy、构建与 18 个 smoke 均通过，但最后 Python benchmark 自测清理 `copy.sqlite` 因未关闭连接报 WinError 32，整项仍失败。
+
+窄修复仅给四处 SQLite context 增加 `closing`，保留内部事务上下文的提交/回滚语义，不改运行产品、性能数据、断言或门限。本地 self-test、Python 编译及 tracked connection 检查通过（8 个连接全部显式关闭）；parent 只读窄审查通过。没有重跑无变更的 Rust/前端套件，Windows 实际结果等待此修复提交的精确 CI，不用本地结果冒充。

@@ -11,6 +11,7 @@ All tasks are synthetic completed records; no model, tool, vault or QQ is invoke
 """
 
 import argparse
+from contextlib import closing
 import hashlib
 import json
 import math
@@ -318,20 +319,21 @@ def inspect_fixture_history(path):
     """Read-only logical fingerprint; includes immutable messages and receipts."""
     digest = hashlib.sha256()
     counts = {}
-    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
-        for table, columns in (("sessions", "id,body"), ("tasks", "id,body"),
-                               ("commands", "id,envelope,receipt"), ("events", "sequence,id,body")):
-            count = 0
-            for row in db.execute(f"SELECT {columns} FROM {table} ORDER BY id"):
-                digest.update((table + ":" + compact(row) + "\n").encode())
-                count += 1
-            counts[table] = count
-        counts["messages"] = db.execute("SELECT coalesce(sum(json_array_length(json_extract(body,'$.messages'))),0) FROM sessions").fetchone()[0]
-        counts["not_completed_tasks"] = db.execute("SELECT count(*) FROM tasks WHERE json_extract(body,'$.status')!='completed'").fetchone()[0]
-        counts["event_cursor"] = db.execute("SELECT coalesce(max(sequence),0) FROM events").fetchone()[0]
-        return {"counts": counts, "history_sha256": digest.hexdigest(),
-                "schema_version": db.execute("PRAGMA user_version").fetchone()[0],
-                "database_bytes": db.execute("PRAGMA page_count").fetchone()[0] * db.execute("PRAGMA page_size").fetchone()[0]}
+    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+        with db:
+            for table, columns in (("sessions", "id,body"), ("tasks", "id,body"),
+                                   ("commands", "id,envelope,receipt"), ("events", "sequence,id,body")):
+                count = 0
+                for row in db.execute(f"SELECT {columns} FROM {table} ORDER BY id"):
+                    digest.update((table + ":" + compact(row) + "\n").encode())
+                    count += 1
+                counts[table] = count
+            counts["messages"] = db.execute("SELECT coalesce(sum(json_array_length(json_extract(body,'$.messages'))),0) FROM sessions").fetchone()[0]
+            counts["not_completed_tasks"] = db.execute("SELECT count(*) FROM tasks WHERE json_extract(body,'$.status')!='completed'").fetchone()[0]
+            counts["event_cursor"] = db.execute("SELECT coalesce(max(sequence),0) FROM events").fetchone()[0]
+            return {"counts": counts, "history_sha256": digest.hexdigest(),
+                    "schema_version": db.execute("PRAGMA user_version").fetchone()[0],
+                    "database_bytes": db.execute("PRAGMA page_count").fetchone()[0] * db.execute("PRAGMA page_size").fetchone()[0]}
 
 
 def archived_seeds(result_paths):
@@ -611,22 +613,25 @@ def self_test():
     assert stats["failed"] == 1 and stats["p95_ms"] == 2
     with tempfile.TemporaryDirectory(prefix="self-agent-bench-test-") as directory:
         path = Path(directory) / "fixture.sqlite"
-        with sqlite3.connect(path) as db:
-            db.executescript("CREATE TABLE sessions(id TEXT PRIMARY KEY,body TEXT NOT NULL);"
-                "CREATE TABLE tasks(id TEXT PRIMARY KEY,body TEXT NOT NULL);"
-                "CREATE TABLE commands(id TEXT PRIMARY KEY,envelope TEXT NOT NULL,receipt TEXT NOT NULL);"
-                "CREATE TABLE events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,body TEXT NOT NULL);")
+        with closing(sqlite3.connect(path)) as db:
+            with db:
+                db.executescript("CREATE TABLE sessions(id TEXT PRIMARY KEY,body TEXT NOT NULL);"
+                    "CREATE TABLE tasks(id TEXT PRIMARY KEY,body TEXT NOT NULL);"
+                    "CREATE TABLE commands(id TEXT PRIMARY KEY,envelope TEXT NOT NULL,receipt TEXT NOT NULL);"
+                    "CREATE TABLE events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,body TEXT NOT NULL);")
         summary = seed_database(path, Path(directory), (2, 3, 32, 64))
         assert summary["tasks"] == 6 and summary["messages"] == 12 and summary["events_retained"] == 120
-        with sqlite3.connect(path) as db:
-            assert all(json.loads(row[0])["status"] == "completed" for row in db.execute("SELECT body FROM tasks"))
-            assert db.execute("SELECT seq FROM sqlite_sequence WHERE name='events'").fetchone()[0] == 120
+        with closing(sqlite3.connect(path)) as db:
+            with db:
+                assert all(json.loads(row[0])["status"] == "completed" for row in db.execute("SELECT body FROM tasks"))
+                assert db.execute("SELECT seq FROM sqlite_sequence WHERE name='events'").fetchone()[0] == 120
         original = inspect_fixture_history(path)
         copy = Path(directory) / "copy.sqlite"
         shutil.copyfile(path, copy)
         assert inspect_fixture_history(copy) == original
-        with sqlite3.connect(copy) as db:
-            db.execute("UPDATE tasks SET body=json_set(body,'$.result','changed') WHERE id=?", (identifier("task", 0),))
+        with closing(sqlite3.connect(copy)) as db:
+            with db:
+                db.execute("UPDATE tasks SET body=json_set(body,'$.result','changed') WHERE id=?", (identifier("task", 0),))
         assert inspect_fixture_history(copy)["history_sha256"] != original["history_sha256"]
         try:
             seed_database(path, Path(directory), (2, 3, 32, 64))
