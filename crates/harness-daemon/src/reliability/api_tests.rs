@@ -386,3 +386,51 @@ async fn online_backup_never_switches_from_open_store_to_replaced_main_file() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[tokio::test]
+async fn actual_owner_router_authenticates_update_handshake_and_rejects_generation_before_trust() {
+    let f = Fixture::open().await;
+    for path in ["/api/v1/compatibility", "/api/v1/reliability/updates"] {
+        let response = f
+            .client
+            .get(format!("{}{path}", f.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    let handshake = f
+        .client
+        .get(format!("{}/api/v1/compatibility", f.base))
+        .bearer_auth(OWNER)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(handshake.status(), reqwest::StatusCode::OK);
+    assert_eq!(handshake.headers()["cache-control"], "no-store");
+    let bytes = handshake.bytes().await.unwrap();
+    let negotiated = harness_core::compatibility::negotiate(
+        &bytes,
+        harness_core::compatibility::ProtocolRange::local(),
+    )
+    .unwrap();
+    assert_eq!(negotiated.bounded_history_schema, 1);
+    for generation in ["0", "2", "01"] {
+        let response = f
+            .client
+            .post(format!("{}/api/v1/reliability/updates/trust", f.base))
+            .bearer_auth(OWNER)
+            .header("X-Self-Agent-Protocol", generation)
+            .json(&json!({"private-canary":"must-not-parse-or-commit"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
+        assert!(!response.text().await.unwrap().contains("private-canary"));
+    }
+    let status = f.get("/api/v1/reliability/updates").await;
+    assert_eq!(status["mode"], "verification_disabled");
+    assert!(status["configuration"].is_null());
+    assert_eq!(status["automatic_update_enabled"], false);
+    assert_eq!(status["installed"], false);
+}

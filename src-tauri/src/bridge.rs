@@ -10,12 +10,13 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tauri::{ipc::Channel, AppHandle, Manager, State, WebviewWindow};
+use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State, WebviewWindow};
 use tokio::sync::Mutex;
 
 pub struct Bridge {
     client: Client,
-    startup: Mutex<()>,
+    startup: Mutex<crate::startup::Startup>,
+    startup_observation: crate::startup::Observations,
     subscriptions: Arc<Subscriptions>,
 }
 
@@ -29,59 +30,74 @@ impl Bridge {
                 .timeout(Duration::from_secs(20))
                 .build()
                 .expect("无法创建本机服务客户端"),
-            startup: Mutex::new(()),
+            startup: Mutex::new(crate::startup::Startup::default()),
+            startup_observation: crate::startup::Observations::default(),
             subscriptions: Arc::new(Subscriptions::default()),
         }
     }
 
-    pub async fn ensure_daemon(&self, app: &AppHandle) -> Result<DaemonInfo, String> {
-        let _guard = self.startup.lock().await;
-        if let Ok(info) = read_daemon_info().await {
-            if self.healthy(&info).await? {
-                return Ok(info);
+    pub async fn ensure_daemon(&self, app: &AppHandle) -> Result<(DaemonInfo, u16), String> {
+        let result = self.ensure_daemon_inner(app).await;
+        // Report EVERY exit, including preflight metadata/incompatibility and
+        // launch failures; bounded history errors must not hide the reason.
+        self.report_startup(app, crate::startup::result_event(&result));
+        result
+    }
+    fn report_startup(&self, app: &AppHandle, value: Value) {
+        let _ = app.emit("daemon-status", self.startup_observation.record(value));
+    }
+    async fn ensure_daemon_inner(&self, app: &AppHandle) -> Result<(DaemonInfo, u16), String> {
+        let mut startup = self.startup.lock().await;
+        if let Some(info) = read_daemon_info().await? {
+            if let Some(protocol) = self
+                .healthy(&info)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok((info, protocol));
             }
         }
-
-        let binary = daemon_binary(app)?;
-        start_detached(&binary)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
-        while tokio::time::Instant::now() < deadline {
-            if let Ok(info) = read_daemon_info().await {
-                if self.healthy(&info).await? {
-                    return Ok(info);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Err("后台服务未能在 6 秒内就绪，请检查安装文件和本机服务端口。".into())
+        startup.start_once(|| start_detached(&daemon_binary(app)?))?;
+        let mut reported = None;
+        startup
+            .observe(
+                || async {
+                    let Some(info) = read_daemon_info().await? else {
+                        return Ok(None);
+                    };
+                    match self.healthy(&info).await {
+                        Ok(value) => Ok(value.map(|protocol| (info, protocol))),
+                        Err(crate::compatibility::ProbeError::Unavailable) => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                    }
+                },
+                crate::startup::READY_BUDGET,
+                |elapsed| {
+                    if reported != Some(elapsed) {
+                        reported = Some(elapsed);
+                        let message = format!(
+                            "正在等待本机后台就绪并校验协议（{}秒，最多30秒）；不会重复启动进程。",
+                            elapsed
+                        );
+                        self.report_startup(
+                            app,
+                            serde_json::json!({"status":"starting","message":message}),
+                        );
+                    }
+                },
+            )
+            .await
     }
 
-    async fn healthy(&self, info: &DaemonInfo) -> Result<bool, String> {
-        let Ok(base) = validate_base_url(&info.base_url) else {
-            return Ok(false);
-        };
-        let Ok(url) = base.join("health") else {
-            return Ok(false);
-        };
-        let Ok(response) = self
-            .client
-            .get(url)
-            .timeout(Duration::from_millis(400))
-            .send()
+    async fn healthy(
+        &self,
+        info: &DaemonInfo,
+    ) -> Result<Option<u16>, crate::compatibility::ProbeError> {
+        let base = validate_base_url(&info.base_url)
+            .map_err(|_| crate::compatibility::ProbeError::Incompatible)?;
+        crate::compatibility::probe(&self.client, &base, &info.token)
             .await
-        else {
-            return Ok(false);
-        };
-        if !response.status().is_success() {
-            return Ok(false);
-        }
-        let Ok(health) = response.json::<Value>().await else {
-            return Ok(false);
-        };
-        if health["version"].as_str() != Some(env!("CARGO_PKG_VERSION")) {
-            return Err("检测到仍在运行的旧版后台服务。请先结束旧版后台进程，再重新打开桌面；已有会话会保留。".into());
-        }
-        Ok(health["status"] == "ok")
+            .map(|value| value.map(|v| v.protocol))
     }
 }
 
@@ -89,6 +105,11 @@ impl Bridge {
     pub fn stop_window(&self, label: &str) {
         self.subscriptions.stop_window(label);
     }
+}
+
+#[tauri::command]
+pub fn daemon_startup_status(bridge: State<'_, Bridge>) -> Value {
+    bridge.startup_observation.snapshot()
 }
 
 #[tauri::command]
@@ -166,7 +187,7 @@ pub async fn api_request(
     let bounded = (method == Method::GET)
         .then(|| history::limit(&path))
         .flatten();
-    let info = bridge.ensure_daemon(&app).await.map_err(|error| {
+    let (info, protocol) = bridge.ensure_daemon(&app).await.map_err(|error| {
         if bounded.is_some() {
             "HISTORY_UNAVAILABLE".into()
         } else {
@@ -177,7 +198,11 @@ pub async fn api_request(
     let url = base
         .join(&path)
         .map_err(|_| "本机接口路径无效".to_string())?;
-    let mut request = bridge.client.request(method, url).bearer_auth(&info.token);
+    let mut request = bridge
+        .client
+        .request(method, url)
+        .bearer_auth(&info.token)
+        .header("X-Self-Agent-Protocol", protocol.to_string());
     if path == "/api/v1/settings/check" {
         request = request.timeout(Duration::from_secs(35));
     }
@@ -196,17 +221,8 @@ pub async fn api_request(
     history::response(response, bounded).await
 }
 
-async fn read_daemon_info() -> Result<DaemonInfo, String> {
-    let contents = tokio::fs::read(data_dir().join("daemon.json"))
-        .await
-        .map_err(|_| "未找到本机后台服务信息".to_string())?;
-    let info: DaemonInfo =
-        serde_json::from_slice(&contents).map_err(|_| "本机后台服务信息格式无效".to_string())?;
-    validate_base_url(&info.base_url)?;
-    if info.token.is_empty() {
-        return Err("缺少本机后台服务凭据".into());
-    }
-    Ok(info)
+async fn read_daemon_info() -> Result<Option<DaemonInfo>, String> {
+    crate::startup::read_info(&data_dir().join("daemon.json")).await
 }
 
 fn validate_base_url(base_url: &str) -> Result<Url, String> {
@@ -339,6 +355,14 @@ fn reliability_route(method: &str, path: &str) -> bool {
 }
 
 fn validate_route(method: &str, path: &str) -> Result<Method, String> {
+    if method == "GET"
+        && (path == "/api/v1/reliability/updates"
+            || path
+                .strip_prefix("/api/v1/reliability/updates/verifications/")
+                .is_some_and(scoped_uuid))
+    {
+        return Ok(Method::GET);
+    }
     if method == "GET" && history::limit(path).is_some() {
         return Ok(Method::GET);
     }
@@ -434,7 +458,7 @@ fn daemon_binary(app: &AppHandle) -> Result<PathBuf, String> {
         .ok_or_else(|| "缺少后台服务程序，请先构建桌面附带服务再启动应用。".into())
 }
 
-fn start_detached(binary: &Path) -> Result<(), String> {
+fn start_detached(binary: &Path) -> Result<Arc<std::sync::atomic::AtomicBool>, String> {
     let mut command = Command::new(binary);
     command
         .stdin(Stdio::null())
@@ -463,10 +487,13 @@ fn start_detached(binary: &Path) -> Result<(), String> {
     let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动后台服务：{error}"))?;
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marker = exited.clone();
     std::thread::spawn(move || {
         let _ = child.wait();
+        marker.store(true, std::sync::atomic::Ordering::Release);
     });
-    Ok(())
+    Ok(exited)
 }
 
 #[cfg(test)]
@@ -677,5 +704,34 @@ mod gateway_route_tests {
             assert!(validate_route(method, &format!("/api/v1/gateway/credentials/{id}")).is_err());
         }
         assert!(validate_route("POST", "/api/v1/gateway/credentials/../providers").is_err());
+    }
+}
+
+#[cfg(test)]
+mod updates_route_tests {
+    use super::*;
+    #[test]
+    fn verifier_ui_is_read_only_without_staging_trust_or_install_proxy() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let base = "/api/v1/reliability/updates";
+        for path in [base.to_string(), format!("{base}/verifications/{id}")] {
+            assert!(validate_route("GET", &path).is_ok());
+            for method in ["POST", "PUT", "DELETE"] {
+                assert!(validate_route(method, &path).is_err());
+            }
+            assert!(validate_route("GET", &format!("{path}?path=private")).is_err());
+        }
+        for path in [
+            format!("{base}/trust"),
+            format!("{base}/verifications"),
+            format!("{base}/verifications/{id}/artifact"),
+            format!("{base}/verifications/{id}/cancel"),
+            format!("{base}/stages/{id}/discard"),
+            format!("{base}/install"),
+        ] {
+            for method in ["GET", "POST", "PUT", "DELETE"] {
+                assert!(validate_route(method, &path).is_err());
+            }
+        }
     }
 }

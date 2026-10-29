@@ -20,6 +20,9 @@ libc.workspace = true
 fs2 = "0.4"
 harness-core = { path = "../harness-core" }
 reqwest.workspace = true
+ring = "=0.17.14"
+semver = "=1.0.28"
+url = "=2.5.8"
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -44,3 +47,7 @@ apple-native-keyring-store = { version = "=1.0.2", default-features = false, fea
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemServices", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+
+[[example]]
+name = "update_fixture"
+path = "../../scripts/update_fixture.rs"

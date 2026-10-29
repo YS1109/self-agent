@@ -117,7 +117,7 @@ describe("在线备份一次提交和GET恢复", () => {
 describe("本机可靠性界面", () => {
   it("入口接线到真实client，私有备份/固定诊断/离线恢复边界清楚，无隐式导出", () => {
     const { client, recovery } = fixture(); const html = renderToStaticMarkup(<ReliabilitySettings client={client} recovery={recovery} />);
-    for (const text of ["不是脱敏诊断", "128 MiB", "256 条", "恢复仅限离线 CLI", "更新功能禁用", "连接检查历史未记录", "最多 16 KiB"]) expect(html).toContain(text);
+    for (const text of ["不是脱敏诊断", "128 MiB", "256 条", "恢复仅限离线 CLI", "生产自动更新与安装仍禁用", "连接检查历史未记录", "最多 16 KiB"]) expect(html).toContain(text);
     expect(html).toMatch(/<button[^>]*disabled[^>]*>创建一次备份/); expect(client.backup).not.toHaveBeenCalled(); expect(client.diagnostics).not.toHaveBeenCalled();
     const app = readFileSync("src/App.tsx", "utf8"); expect(app).toContain('<ReliabilitySettings client={reliabilityClient}'); expect(app).toContain('setModal("reliability")');
   });

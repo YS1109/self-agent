@@ -188,3 +188,9 @@ MCP 环境凭据后续切片见 protocol-v9 附节与 acceptance-mcp-credentials
 历史页首面也保存 `current_cursor`，返回/刷新不混入新记录；实例重启使旧游标失效，不重放命令。CLI status/follow 使用原任务 ID，不下载全历史；桌面固定目标离窗时保留 ID/草稿并阻止转投，QQ/H5 本机授权表单不允许隐藏会话被提交。活动主任务前序检查只读取活动状态，保留精确 u64 顺序。
 
 本片不包含尚未接线的生命周期、更新暂存或兼容握手。大历史同 seed 的实际结果、冻结门禁和精确 CI 分别记录于 performance-v1.0 / acceptance-v1.0；不能用页面单测或历史 CI 冒充容量、完整 GUI 或安装验证。
+
+## 1.0 校验/暂存与兼容接手
+
+协议v15/schema v4 的更新代码位于 `reliability/update*.rs`，实际同Store适配器在 `store/updates.rs`；floor与数据目录下独立pinned witness共同保留下限，恢复不得删除/降低witness。只允许本机owner配置verification-only信任，生产下载/安装不开放。CLI updates可实际暂存惰性字节，UI仅观察。
+
+compatibility由core唯一wire类型驱动；Native `startup.rs` 保留单次进程尝试、有界metadata读取和revision状态，不能在不兼容/超时后自动替换后台。生命周期后续必须注册真正上传/metadata blocking worker并与Store admission同锁闭合，不能把HTTP observer drop当settled。本切片没有宣称drain已交付；验收和未运行项见 `acceptance-update-v1.0.md`。

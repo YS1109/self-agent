@@ -294,33 +294,19 @@ pub fn validate_base_url(base: &str) -> Result<Url, String> {
 }
 
 async fn metadata(path: &Path) -> Result<DaemonInfo, String> {
-    use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|_| "未找到本机后台服务信息")?;
-    let mut bytes = Vec::new();
-    file.take(16 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|_| "无法读取本机后台服务信息")?;
-    if bytes.len() > 16 * 1024 {
-        return Err("后台元数据超过限制".into());
-    }
-    let info: DaemonInfo = serde_json::from_slice(&bytes).map_err(|_| "后台元数据格式无效")?;
-    validate_base_url(&info.base_url)?;
-    if info.token.is_empty() {
-        return Err("缺少后台服务凭据".into());
-    }
-    Ok(info)
+    crate::startup::read_info(path)
+        .await?
+        .ok_or_else(|| "未找到本机后台服务信息".into())
 }
 
-async fn snapshot(client: &Client, info: &DaemonInfo) -> Result<Value, String> {
+async fn snapshot(client: &Client, info: &DaemonInfo, protocol: u16) -> Result<Value, String> {
     let url = validate_base_url(&info.base_url)?
         .join("api/v1/snapshot?window=1")
         .map_err(|_| "本机接口路径无效")?;
     let mut response = client
         .get(url)
         .bearer_auth(&info.token)
+        .header("X-Self-Agent-Protocol", protocol.to_string())
         .timeout(Duration::from_secs(20))
         .send()
         .await
@@ -370,8 +356,20 @@ pub async fn run(path: &Path, after: Option<u64>, mut sink: Sink) {
         return;
     }
     loop {
+        let mut compatibility_rejected = false;
         let result: Result<(), String> = async {
             let info = metadata(path).await?;
+            let negotiated = crate::compatibility::probe(
+                &client,
+                &validate_base_url(&info.base_url)?,
+                &info.token,
+            )
+            .await
+            .map_err(|error| {
+                compatibility_rejected = error.permanent();
+                error.to_string()
+            })?
+            .ok_or("后台连接暂不可用")?;
             let next_identity = (info.base_url.clone(), info.token.clone(), info.pid);
             if identity.as_ref().is_some_and(|old| old != &next_identity) {
                 cursor = None;
@@ -379,7 +377,7 @@ pub async fn run(path: &Path, after: Option<u64>, mut sink: Sink) {
             }
             identity = Some(next_identity);
             if cursor.is_none() {
-                let value = snapshot(&client, &info).await?;
+                let value = snapshot(&client, &info, negotiated.protocol).await?;
                 let next = value["event_cursor"].as_u64().unwrap();
                 reset_snapshot |= snapshot_floor.is_some_and(|old| next < old);
                 snapshot_floor = None;
@@ -396,6 +394,7 @@ pub async fn run(path: &Path, after: Option<u64>, mut sink: Sink) {
             let mut response = client
                 .get(url)
                 .bearer_auth(&info.token)
+                .header("X-Self-Agent-Protocol", negotiated.protocol.to_string())
                 .send()
                 .await
                 .map_err(|_| "事件连接暂不可用")?;
@@ -447,6 +446,13 @@ pub async fn run(path: &Path, after: Option<u64>, mut sink: Sink) {
             }
         }
         .await;
+        if compatibility_rejected {
+            sink.status(
+                "error",
+                "后台协议不兼容，已停止事件读取；未替换后台。请使用匹配版本后重新连接。",
+            );
+            return;
+        }
         if result.is_err()
             && !sink.status("reconnecting", "事件连接中断，正在恢复；后台任务继续执行")
         {
@@ -650,6 +656,32 @@ mod tests {
         socket.shutdown().await.unwrap();
     }
 
+    async fn accept_application(
+        listener: &tokio::net::TcpListener,
+    ) -> (tokio::net::TcpStream, String) {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            if !request.starts_with("GET /api/v1/compatibility ") {
+                return (socket, request);
+            }
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer "));
+            let body = harness_core::compatibility::handshake(
+                harness_core::compatibility::LifecycleState::Running,
+            )
+            .unwrap();
+            serve_response(
+                &mut socket,
+                "200 OK",
+                "application/json",
+                std::str::from_utf8(&body).unwrap(),
+            )
+            .await;
+        }
+    }
+
     async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
@@ -718,8 +750,7 @@ mod tests {
         .unwrap();
         let server = tokio::spawn(async move {
             for phase in 0..5 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let request = read_request(&mut socket).await;
+                let (mut socket, request) = accept_application(&listener).await;
                 assert!(request
                     .to_ascii_lowercase()
                     .contains("authorization: bearer fixture-token"));
@@ -814,15 +845,13 @@ mod tests {
         .unwrap();
         let server_path = path.clone();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = first.accept().await.unwrap();
-            assert!(read_request(&mut socket)
-                .await
+            let (mut socket, request) = accept_application(&first).await;
+            assert!(request
                 .to_ascii_lowercase()
                 .contains("authorization: bearer old-fixture"));
             tokio::fs::write(&server_path, json!({"base_url":format!("http://{second_address}"),"token":"new-fixture","pid":2}).to_string()).await.unwrap();
             serve_response(&mut socket, "200 OK", "text/event-stream", &frame(1)).await;
-            let (mut socket, _) = second.accept().await.unwrap();
-            let request = read_request(&mut socket).await;
+            let (mut socket, request) = accept_application(&second).await;
             assert!(request.starts_with("GET /api/v1/snapshot?window=1 "));
             assert!(request
                 .to_ascii_lowercase()
@@ -834,8 +863,7 @@ mod tests {
                 "{\"event_cursor\":1,\"tasks\":[]}",
             )
             .await;
-            let (mut socket, _) = second.accept().await.unwrap();
-            let request = read_request(&mut socket).await;
+            let (mut socket, request) = accept_application(&second).await;
             assert!(request.starts_with("GET /api/v1/events?after=1 "));
             assert!(request
                 .to_ascii_lowercase()
@@ -890,7 +918,7 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(1), snapshot(&client, &info))
+        let error = tokio::time::timeout(Duration::from_secs(1), snapshot(&client, &info, 1))
             .await
             .unwrap()
             .unwrap_err();

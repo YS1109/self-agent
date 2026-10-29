@@ -27,6 +27,7 @@ ORIGIN = "http://127.0.0.1:1420"
 class Backend(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     token = "fixture-local-token-a"
+    incompatible = False
     seen = []
     errors = []
     disconnected = threading.Event()
@@ -40,6 +41,19 @@ class Backend(BaseHTTPRequestHandler):
             self.send_error(401)
             return
         type(self).seen.append(self.path)
+        if self.path == "/api/v1/compatibility":
+            value = {} if type(self).incompatible else {"handshake_schema": 1, "application": "self-agent", "protocol_current": 1, "protocol_min": 1, "lifecycle": "running", "capabilities": {"bounded_history": 1}}
+            body = json.dumps(value).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.headers.get("X-Self-Agent-Protocol") != "1":
+            type(self).errors.append("Missing negotiated generation")
+            self.send_error(426)
+            return
         if self.path.endswith("after=999"):
             body = json.dumps({"code": "snapshot_required", "error": "游标过期"}).encode()
             self.send_response(409)
@@ -200,6 +214,16 @@ def main():
 
                     wait_for(ready, timeout=30, description="isolated Vite startup")
                     check_proxy()
+                    Backend.incompatible = True
+                    count = len(Backend.seen)
+                    try:
+                        with open_event():
+                            raise AssertionError("Incompatible upstream reached application request")
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 503
+                    assert Backend.seen[count:] == ["/api/v1/compatibility"]
+                    Backend.incompatible = False
+                    print("PASS: incompatible authenticated peer blocks downstream request without replacement")
                     Backend.token = "fixture-local-token-b"
                     save_metadata()
                     Backend.disconnected.clear()

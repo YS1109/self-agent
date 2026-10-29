@@ -48,6 +48,10 @@ jobs:
       - run: python scripts/reliability_smoke.py
       - run: python scripts/history_smoke.py
       - run: python scripts/history_benchmark.py --self-test
+      - run: cargo build -p harness-daemon --example update_fixture
+      - run: python scripts/update_control_smoke.py
+      - run: python scripts/package_lifecycle_smoke.py --self-test
+      - run: python scripts/package_lifecycle_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}

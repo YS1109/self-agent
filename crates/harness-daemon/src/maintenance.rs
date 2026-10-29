@@ -72,6 +72,10 @@ pub fn restore_backup(directory: &Path, bundle: &Path, expected_sha256: &str) ->
         crate::store::prepare_database,
         |tx| {
             crate::reliability::jobs::recover_interrupted(tx)?;
+            crate::reliability::update_state::restore(
+                tx,
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            )?;
             crate::qq::restore::invalidate(tx)?;
             crate::store::reliability::restore_gateway(tx)?;
             crate::store::reliability::validate_records(tx)?;

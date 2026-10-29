@@ -13,6 +13,7 @@ export function historyProxyPath(path: string): boolean {
 const routes: Record<string, string> = {
   "GET /api/v1/snapshot?window=1": "GET",
   "GET /api/v1/reliability": "GET",
+  "GET /api/v1/reliability/updates": "GET",
   "GET /api/v1/reliability/diagnostics": "GET",
   "POST /api/v1/reliability/backups": "POST",
   "GET /api/v1/gateway": "GET",
@@ -78,7 +79,7 @@ export function allowDevelopmentProxy(
   fetchSite: string | undefined,
   contentType: string | undefined,
 ): boolean {
-  if (!gatewayProxyPath(method,path) && !qqProxyPath(method,path) && !mcpCredentialProxyPath(method,path) && !Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (historyProxyPath(path) || backupReceiptProxyPath(path) || eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
+  if (!gatewayProxyPath(method,path) && !qqProxyPath(method,path) && !mcpCredentialProxyPath(method,path) && !Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (historyProxyPath(path) || /^\/api\/v1\/reliability\/updates\/verifications\/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(path) || backupReceiptProxyPath(path) || eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
   if (fetchSite === "cross-site") return false;
   if (origin && !localOrigins.has(origin)) return false;
   return (

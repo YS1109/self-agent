@@ -52,7 +52,7 @@ export function ReliabilitySettings({ client, disabled = false, recovery = local
     </form>
     <div className="reliability-history">{jobs.length ? jobs.map(job => <BackupReceiptCard key={job.id} receipt={job} />) : <p className="help-text">{state.status ? "尚无已登记的备份记录；这不能判断未确认网络请求是否最终送达。" : "尚未读取备份历史。"}</p>}</div>
     <h4>恢复与更新边界</h4><p className="help-text">恢复仅限离线 CLI：先停止后台，独立核对可信备份和完整 SHA-256，再按 CLI 帮助确认。这里没有在线恢复或后台启停按钮；不能在后台运行时替换数据库。恢复会撤销旧执行与远端授权、禁用服务及引用，不承诺恢复系统 vault 的秘密。</p>
-    <p className="help-text">未配置可信生产发布源，更新功能禁用；此页不会下载安装器、执行更新或声称已经签名发布。</p>
+    <p className="help-text">生产自动更新与安装仍禁用；下方单独提供本机签名校验/私有暂存状态，不会下载安装器、执行更新或声称已经签名发布。</p>
     <h4>固定字段诊断</h4><p className="help-text">仅导出版本、固定状态和聚合数量（最多 16 KiB），不含凭据、私有引用/摘要、标识符、路径、URL、提示词、工具输出或日志。它不是备份，也不检查或解锁系统 vault。连接检查历史未记录，不能用已配置数量或任务成功数代替连接验证。</p>
     <div className="reliability-actions"><Button type="button" size="small" variant="secondary" disabled={disabled || state.diagnosticLoading} onClick={() => { setDownloadError(""); void controller.current?.diagnostics(); }}>{state.diagnosticLoading ? "读取诊断中…" : "读取固定字段诊断"}</Button>
       <Button type="button" size="small" variant="secondary" disabled={!state.diagnostic || state.diagnosticLoading} onClick={() => { try { downloadDiagnostic(state.diagnostic); setDownloadError(""); } catch { setDownloadError("诊断下载未能启动；没有导出其他数据。"); } }}>下载已展示的诊断 JSON</Button></div>

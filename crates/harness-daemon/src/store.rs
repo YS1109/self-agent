@@ -24,6 +24,7 @@ pub(crate) mod qq;
 pub(crate) mod reliability;
 mod scheduling;
 mod steering;
+pub(crate) mod updates;
 
 const MAX_NODES: usize = 12;
 const MAX_ROUNDS: u64 = 3;
@@ -96,6 +97,19 @@ pub(crate) fn prepare_database(db: &mut Connection) -> Result<()> {
         |tx| {
             reliability::validate_v2_records(tx)?;
             scheduling::migrate(tx)
+        },
+        |tx| {
+            reliability::validate_v3_records(tx)?;
+            let unexpected: u64 = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'update_%'",
+                [],
+                |r| r.get(0),
+            )?;
+            if unexpected != 0 {
+                bail!("旧版本包含未登记的更新验证结构");
+            }
+            crate::reliability::update_state::migrate(tx)?;
+            reliability::validate_records(tx)
         },
     )?;
     reliability::validate_records(db)
@@ -178,6 +192,10 @@ impl Store {
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
         crate::reliability::jobs::recover_interrupted(&tx)?;
+        crate::reliability::update_state::recover(
+            &tx,
+            chrono::Utc::now().timestamp_millis().max(0) as u64,
+        )?;
         capabilities::recover(&tx)?;
         capability_credentials::recover(&tx)?;
         providers::recover(&tx)?;

@@ -166,7 +166,7 @@ mod tests {
         let id = options.command_id.clone();
         let server = tokio::spawn(async move {
             for method in ["POST", "GET"] {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) = crate::tests::accept_application(&listener).await.unwrap();
                 let mut header = Vec::new();
                 while !header.ends_with(b"\r\n\r\n") {
                     let mut byte = [0];

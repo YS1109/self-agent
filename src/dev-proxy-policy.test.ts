@@ -180,3 +180,15 @@ it("windowed snapshot requires exact explicit opt-in, never broad query permissi
   expect(allowDevelopmentProxy("GET", "/api/v1/snapshot?window=1", undefined, "same-origin", undefined)).toBe(true);
   for (const path of ["/api/v1/snapshot", "/api/v1/snapshot?window=0", "/api/v1/snapshot?window=01", "/api/v1/snapshot?window=%31", "/api/v1/snapshot?window=1&window=1", "/api/v1/snapshot?window=1&all=1"]) expect(allowDevelopmentProxy("GET", path, undefined, "same-origin", undefined)).toBe(false);
 });
+
+it("verifier desktop reads do not proxy trust, upload, cancellation or install",()=>{
+ const id="11111111-1111-4111-8111-111111111111",base="/api/v1/reliability/updates";
+ for(const path of [base,`${base}/verifications/${id}`]) {
+   expect(allowDevelopmentProxy("GET",path,undefined,"same-origin",undefined)).toBe(true);
+   for(const method of ["POST","PUT","DELETE"])expect(allowDevelopmentProxy(method,path,undefined,"same-origin","application/json")).toBe(false);
+   expect(allowDevelopmentProxy("GET",path+"?path=private",undefined,"same-origin",undefined)).toBe(false);
+   expect(allowDevelopmentProxy("GET",path,"https://evil.invalid","cross-site",undefined)).toBe(false);
+ }
+ for(const path of [`${base}/trust`,`${base}/verifications`,`${base}/verifications/${id}/artifact`,`${base}/verifications/${id}/cancel`,`${base}/stages/${id}/discard`,`${base}/install`])
+  for(const method of ["GET","POST","PUT","DELETE"])expect(allowDevelopmentProxy(method,path,undefined,"same-origin","application/json")).toBe(false);
+});

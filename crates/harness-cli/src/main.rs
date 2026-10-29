@@ -1,6 +1,7 @@
 mod gateway;
 mod history;
 mod maintenance;
+mod updates;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -15,6 +16,7 @@ const HELP: &str = r#"Self Agent 命令行客户端
 
 用法：self-agent-cli [--data-dir 目录] [--conversation 来源会话] [--command-id 幂等ID] [--wait 秒] [--follow] [--controls JSON文件|-] 命令 [参数]
 
+  updates [status|--help]           本机签名校验/私有暂存，绝不自动下载安装
   diagnostics                      导出固定字段脱敏诊断（不读取系统密钥）
   backups                          查看备份功能与持久操作记录
   backup <目标父目录> <新名称>      创建私有备份；--wait可等待，POST不重试
@@ -189,10 +191,23 @@ fn loopback_url(base: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+#[derive(Debug)]
+enum CompatibilityUnavailable {
+    Transport,
+    Authentication,
+}
+impl std::fmt::Display for CompatibilityUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("后台兼容性读取暂未确认；未发送后续请求")
+    }
+}
+impl std::error::Error for CompatibilityUnavailable {}
+
 struct Client {
     http: reqwest::Client,
     base: reqwest::Url,
     token: String,
+    protocol: tokio::sync::OnceCell<u16>,
 }
 
 impl Client {
@@ -208,14 +223,58 @@ impl Client {
                 .build()?,
             base: loopback_url(&info.base_url)?,
             token: info.token,
+            protocol: tokio::sync::OnceCell::new(),
         })
     }
 
+    async fn compatible(&self) -> Result<u16> {
+        use harness_core::compatibility::{negotiate, ProtocolRange, MAX_HANDSHAKE_BYTES};
+        Ok(*self
+            .protocol
+            .get_or_try_init(|| async {
+                let invalid = || anyhow::anyhow!("后台协议元数据缺失或不兼容；未发送后续请求");
+                let mut response = self
+                    .http
+                    .get(self.base.join("/api/v1/compatibility")?)
+                    .bearer_auth(&self.token)
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                    .map_err(|_| CompatibilityUnavailable::Transport)?;
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    return Err(CompatibilityUnavailable::Authentication.into());
+                }
+                if !response.status().is_success()
+                    || response
+                        .content_length()
+                        .is_some_and(|n| n > MAX_HANDSHAKE_BYTES as u64)
+                {
+                    return Err(invalid());
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| CompatibilityUnavailable::Transport)?
+                {
+                    if chunk.len() > MAX_HANDSHAKE_BYTES.saturating_sub(bytes.len()) {
+                        return Err(invalid());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                negotiate(&bytes, ProtocolRange::local())
+                    .map(|v| v.protocol)
+                    .map_err(anyhow::Error::from)
+            })
+            .await?)
+    }
     async fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        let protocol = self.compatible().await?;
         let mut request = self
             .http
             .request(method.parse()?, self.base.join(path)?)
-            .bearer_auth(&self.token);
+            .bearer_auth(&self.token)
+            .header("X-Self-Agent-Protocol", protocol.to_string());
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -909,6 +968,25 @@ async fn follow_loop(
             }
             Err(error) => return Err(error),
         };
+        let protocol = match client.compatible().await {
+            Ok(protocol) => protocol,
+            Err(error) if error.downcast_ref::<CompatibilityUnavailable>().is_some() => {
+                if matches!(
+                    error.downcast_ref::<CompatibilityUnavailable>(),
+                    Some(CompatibilityUnavailable::Authentication)
+                ) {
+                    if rejected_auth {
+                        bail!("本机后台认证失败，请检查所选数据目录并重新运行");
+                    }
+                    rejected_auth = true;
+                }
+                // Only read-only follow recovery retries a transient handshake.
+                // Metadata is reloaded on the next iteration; no mutation replays.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let request = client
             .http
             .get(
@@ -916,7 +994,8 @@ async fn follow_loop(
                     .base
                     .join(&format!("/api/v1/events?after={cursor}"))?,
             )
-            .bearer_auth(&client.token);
+            .bearer_auth(&client.token)
+            .header("X-Self-Agent-Protocol", protocol.to_string());
         let response = request.send().await;
         let mut response = match response {
             Ok(response) => response,
@@ -1085,6 +1164,15 @@ async fn wait_for_task(
 
 async fn run(options: Options) -> Result<()> {
     if maintenance::run(&options).await? {
+        return Ok(());
+    }
+    if options.command == "updates" {
+        if updates::help(&options) {
+            return Ok(());
+        }
+        let client = Client::open(&options.directory)?;
+        client.compatible().await?;
+        updates::run(&options, &client).await?;
         return Ok(());
     }
     let command = command(&options)?;
@@ -1678,6 +1766,49 @@ mod tests {
         assert!(snapshot_cursor(&json!({})).is_err());
     }
 
+    /// Existing feature fixtures transparently answer the new mandatory
+    /// authenticated handshake; their application request assertions stay intact.
+    pub(super) async fn accept_application(
+        listener: &tokio::net::TcpListener,
+    ) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut socket, address) = listener.accept().await?;
+            let mut preview = [0; 8192];
+            let size = loop {
+                let size = socket.peek(&mut preview).await?;
+                if size == 0 || preview[..size].windows(4).any(|v| v == b"\r\n\r\n") {
+                    break size;
+                }
+                if size == preview.len() {
+                    return Err(std::io::Error::other("fixture request too large"));
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+            if !preview[..size].starts_with(b"GET /api/v1/compatibility HTTP/1.1\r\n") {
+                return Ok((socket, address));
+            }
+            let mut bytes = vec![0; size];
+            socket.read_exact(&mut bytes).await?;
+            assert!(String::from_utf8_lossy(&bytes)
+                .to_ascii_lowercase()
+                .contains("authorization: bearer "));
+            let body = harness_core::compatibility::handshake(
+                harness_core::compatibility::LifecycleState::Running,
+            )
+            .unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            socket.write_all(&body).await?;
+        }
+    }
     pub(super) async fn cli_fixture(
         args: &[&str],
         replies: Vec<(&str, &str, Option<Value>, Option<String>)>,
@@ -1698,7 +1829,7 @@ mod tests {
         let server = tokio::spawn(async move {
             for (method, path, command, body) in replies {
                 let (mut socket, _) =
-                    tokio::time::timeout(Duration::from_secs(4), listener.accept())
+                    tokio::time::timeout(Duration::from_secs(4), accept_application(&listener))
                         .await
                         .unwrap()
                         .unwrap();
@@ -1733,6 +1864,7 @@ mod tests {
                         || path.starts_with("/api/v1/gateway/credentials/")
                         || path.starts_with("/api/v1/capabilities/mcp/")
                         || path.starts_with("/api/v1/capability-credential-operations/")
+                        || path.starts_with("/api/v1/reliability/updates/")
                     {
                         assert_eq!(envelope, command);
                     } else {
@@ -1896,7 +2028,7 @@ mod tests {
         write_metadata("token-a");
         let server = tokio::spawn(async move {
             for reply in replies {
-                let (mut socket, _) = listener.accept().await.unwrap();
+                let (mut socket, _) = accept_application(&listener).await.unwrap();
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") {
                     let mut byte = [0];

@@ -87,7 +87,7 @@ async fn read_fixture(path: &str, status: u16, size: usize, chunked: bool) -> Re
     let base = format!("http://{}", listener.local_addr().unwrap());
     let expected = path.to_owned();
     let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
+        let (mut socket, _) = crate::tests::accept_application(&listener).await.unwrap();
         let mut headers = Vec::new();
         while !headers.ends_with(b"\r\n\r\n") {
             let mut b = [0];
@@ -139,6 +139,7 @@ async fn read_fixture(path: &str, status: u16, size: usize, chunked: bool) -> Re
             .unwrap(),
         base: loopback_url(&base).unwrap(),
         token: "fixture".into(),
+        protocol: tokio::sync::OnceCell::new(),
     };
     let result = client.request("GET", path, None).await;
     server.await.unwrap();
@@ -190,7 +191,7 @@ async fn large_full_snapshot_is_never_read_for_status_or_follow() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         std::fs::write(directory.join("daemon.json"), json!({"base_url":format!("http://{}",listener.local_addr().unwrap()),"token":"fixture","pid":1}).to_string()).unwrap();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = crate::tests::accept_application(&listener).await.unwrap();
             let mut bytes = Vec::new();
             while !bytes.ends_with(b"\r\n\r\n") {
                 let mut b = [0];
@@ -262,11 +263,13 @@ async fn follow_recovery_not_found_or_oversize_is_terminal_and_never_reposts() {
                     },
                 ),
             ] {
-                let (mut socket, _) =
-                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let (mut socket, _) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    crate::tests::accept_application(&listener),
+                )
+                .await
+                .unwrap()
+                .unwrap();
                 let mut bytes = Vec::new();
                 while !bytes.ends_with(b"\r\n\r\n") {
                     let mut b = [0];
@@ -303,7 +306,7 @@ async fn initial_follow_detail_obeys_total_wait_deadline() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     std::fs::write(directory.join("daemon.json"),json!({"base_url":format!("http://{}",listener.local_addr().unwrap()),"token":"fixture","pid":1}).to_string()).unwrap();
     let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
+        let (mut socket, _) = crate::tests::accept_application(&listener).await.unwrap();
         let mut byte = [0];
         socket.read_exact(&mut byte).await.unwrap();
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -364,7 +367,7 @@ async fn authoritative_error_codes_are_required_not_old_route_status_alone() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = crate::tests::accept_application(&listener).await.unwrap();
             let mut bytes = Vec::new();
             while !bytes.ends_with(b"\r\n\r\n") {
                 let mut byte = [0];
@@ -384,6 +387,7 @@ async fn authoritative_error_codes_are_required_not_old_route_status_alone() {
                 .unwrap(),
             base: loopback_url(&base).unwrap(),
             token: "fixture".into(),
+            protocol: tokio::sync::OnceCell::new(),
         };
         let error = client
             .request("GET", "/api/v1/tasks/task", None)
@@ -402,7 +406,7 @@ async fn wait_deadline_preserves_last_observation_or_original_id_without_new_com
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = crate::tests::accept_application(&listener).await.unwrap();
             let mut bytes = Vec::new();
             while !bytes.ends_with(b"\r\n\r\n") {
                 let mut byte = [0];
@@ -427,6 +431,7 @@ async fn wait_deadline_preserves_last_observation_or_original_id_without_new_com
                 .unwrap(),
             base: loopback_url(&base).unwrap(),
             token: "fixture".into(),
+            protocol: tokio::sync::OnceCell::new(),
         };
         let mut output = Vec::new();
         let started = std::time::Instant::now();

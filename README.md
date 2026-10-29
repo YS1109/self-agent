@@ -233,3 +233,9 @@ docs/                     产品计划和当前协议
 ## 有界历史读取（开发分支）
 
 当前工作区窗口与历史页见 [协议 v14](docs/protocol-v14.md)：保留完整历史记录，显式标明遗漏；CLI 单任务查询不再下载全量快照，分页返回固定上界与重启重置信息。原无 query 快照保持全量语义，超预算明确拒绝。实际同 seed 性能与未验证边界见 [性能记录](docs/performance-v1.0.md) 和 [1.0 验收](docs/acceptance-v1.0.md)，不代表生产发布或真实 GUI 已完成。
+
+## 本机发布校验与兼容（1.0 开发切片）
+
+`self-agent-cli updates --help` 提供独立本机 owner 的 verification-only 信任配置、原始签名清单与有界字节暂存、原 UUID 查询/取消/明确清理。生产自动下载与安装始终禁用；桌面可靠性面板只读显示验证状态，不执行产物。schema v4 的独立 witness 防止恢复旧任务库降低仍保留的验证下限。
+
+CLI、Native bridge 与开发代理先进行已认证兼容协商；不兼容后台不接收动作，也不会被自动替换。Native 单次启动具有可见进度、原始30秒就绪观察上限与迟到只读恢复，超时不自动重启。真实本地模拟门禁和未运行的完整 GUI/OS安装/生产签名边界见 [协议 v15](docs/protocol-v15.md) 与 [校验切片验收](docs/acceptance-update-v1.0.md)。

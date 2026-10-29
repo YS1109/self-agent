@@ -1,6 +1,7 @@
 mod capabilities;
 mod changes;
 mod codex;
+mod compatibility_api;
 mod configuration;
 mod context;
 mod continuation;
@@ -192,7 +193,8 @@ impl Settings {
 
 pub struct AppState {
     pub(crate) vault: Arc<capabilities::vault::Vault>,
-    pub store: Mutex<store::Store>,
+    pub store: Arc<Mutex<store::Store>>,
+    pub(crate) updates: Option<Arc<store::updates::Runtime>>,
     pub settings: RwLock<Settings>,
     pub events: broadcast::Sender<RunEvent>,
     pub wake: Notify,
@@ -267,9 +269,20 @@ impl AppState {
         };
         // Reject a preexisting linked probe directory instead of following it.
         project_files::ScopedProject::open(&capability_probe_root)?;
+        let store = Arc::new(Mutex::new(store));
+        let updates = storage_lease.as_ref().and_then(|lease| {
+            match store::updates::runtime(store.clone(), lease.clone()) {
+                Ok(runtime) => Some(runtime),
+                Err(_) => {
+                    tracing::warn!("更新验证私有目录不可用；普通会话继续，未启用更新");
+                    None
+                }
+            }
+        });
         Ok(Arc::new(Self {
             vault,
-            store: Mutex::new(store),
+            store,
+            updates,
             settings: RwLock::new(settings),
             events,
             wake: Notify::new(),
@@ -327,7 +340,24 @@ impl AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let updates = if let Some(runtime) = state.updates.clone() {
+        reliability::update_api::routes(runtime)
+    } else {
+        Router::new().route(
+            "/api/v1/reliability/updates",
+            get(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":"更新验证未取得数据目录能力；未启用下载或安装"})),
+                )
+            }),
+        )
+    };
     let private = Router::new()
+        .merge(updates)
+        .merge(compatibility_api::routes(Arc::new(|| {
+            harness_core::compatibility::LifecycleState::Running
+        })))
         .merge(history_api::routes())
         .merge(capabilities::credential_api::routes())
         .merge(reliability::api::routes())
@@ -395,6 +425,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/codex/status", get(codex_status))
         .route("/api/v1/models", post(models::discover))
         .route("/api/v1/events", get(events))
+        .route_layer(middleware::from_fn(compatibility_api::require_generation))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route(

@@ -1,3 +1,4 @@
+import type { UpdatesClient } from "./updates-client";
 import type {GatewayClient,GatewayCredentialClient} from "./gateway-client";
 import type { ReliabilityClient } from "./reliability-client";
 import type {QqClient,QqCredentialClient} from "./qq-client";
@@ -125,4 +126,9 @@ export const gatewayCredentialClient:GatewayCredentialClient={
  deleteCredential:(id,body,signal)=>gatewayRequest("DELETE",`/gateway/credentials/${gatewayId(id)}`,body,signal),
  cleanupCredential:(id,body,signal)=>gatewayRequest("POST",`/gateway/credentials/cleanup/${gatewayId(id)}`,body,signal),
  operation:(id,signal)=>gatewayRequest("GET",`/gateway/credential-operations/${gatewayId(id)}`,undefined,signal),
+};
+
+export const updatesClient:UpdatesClient={
+ status:signal=>api("GET","/reliability/updates",undefined,signal),
+ receipt:(id,signal)=>{if(!providerUuid(id))throw new Error("验证操作UUID无效");return api("GET",`/reliability/updates/verifications/${id}`,undefined,signal);},
 };

@@ -6,7 +6,7 @@ fn migrate(
     baseline: impl FnOnce(&Transaction<'_>) -> Result<()>,
     upgrade: impl FnOnce(&Transaction<'_>) -> Result<()>,
 ) -> Result<()> {
-    super::migrate(db, baseline, upgrade, |_| Ok(()))
+    super::migrate(db, baseline, upgrade, |_| Ok(()), |_| Ok(()))
 }
 
 struct Root(PathBuf);
@@ -111,7 +111,7 @@ fn migration_is_atomic_and_preserves_legacy_history() {
     assert!(!table_exists(&c, "tasks").unwrap());
     assert_eq!(value(&c), "old");
     migrate(&mut c, schema, |_| Ok(())).unwrap();
-    assert_eq!(preflight(&c).unwrap(), 3);
+    assert_eq!(preflight(&c).unwrap(), SCHEMA_VERSION);
     assert_eq!(value(&c), "old");
 }
 #[test]
@@ -1047,7 +1047,7 @@ fn v1_upgrade_skips_baseline_and_failed_v2_rolls_back_ddl_and_ledger() {
         },
     )
     .unwrap();
-    assert_eq!(preflight(&c).unwrap(), 3);
+    assert_eq!(preflight(&c).unwrap(), SCHEMA_VERSION);
     let records: Vec<(u32, String)> = c
         .prepare("SELECT version,identity FROM storage_migrations ORDER BY version")
         .unwrap()
@@ -1060,7 +1060,8 @@ fn v1_upgrade_skips_baseline_and_failed_v2_rolls_back_ddl_and_ledger() {
         vec![
             (1, LEDGER_V1.into()),
             (2, LEDGER_V2.into()),
-            (3, LEDGER_V3.into())
+            (3, LEDGER_V3.into()),
+            (4, LEDGER_V4.into())
         ]
     );
     migrate(&mut c, |_| panic!("v2 baseline"), |_| panic!("v2 upgrade")).unwrap();
@@ -1079,7 +1080,7 @@ fn fresh_v2_failure_rolls_back_even_the_baseline_and_readonly_ledger_preflight_w
     drop(disk);
     let before = std::fs::read(&path).unwrap();
     let readonly = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    assert_eq!(preflight(&readonly).unwrap(), 3);
+    assert_eq!(preflight(&readonly).unwrap(), SCHEMA_VERSION);
     drop(readonly);
     assert_eq!(before, std::fs::read(&path).unwrap());
     let c = Connection::open(&path).unwrap();

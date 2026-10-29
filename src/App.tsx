@@ -3,6 +3,7 @@ import {EMPTY_GATEWAY} from "./gateway-client";
 import { HistoryBrowser, HistoryTaskView } from "./components/history-browser";
 import type { HistoryKind } from "./history-client";
 import { ReliabilitySettings } from "./components/reliability-settings";
+import { UpdatesSettings } from "./components/updates-settings";
 import {QqSettings} from "./components/qq-settings";
 import {EMPTY_QQ} from "./qq-client";
 import { EMPTY_PROVIDERS, namedModelRequest } from "./providers-client";
@@ -54,8 +55,9 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient, qqClient, qqCredentialClient, gatewayClient, gatewayCredentialClient, reliabilityClient, historyClient } from "./api";
+import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient, qqClient, qqCredentialClient, gatewayClient, gatewayCredentialClient, reliabilityClient, historyClient, updatesClient } from "./api";
 import { useDaemonSnapshot } from "./use-daemon-snapshot";
+import { useDaemonStartup } from "./use-daemon-startup";
 import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
 import { TaskSupplements, ContinueTask } from "./components/task-controls";
 import { TaskChanges } from "./components/task-changes";
@@ -214,6 +216,7 @@ function EmptyPanel({
 
 export default function App() {
   const { snapshot, connected, checked, connectionError, eventStatus, recovering, refresh } = useDaemonSnapshot();
+  const startup=useDaemonStartup();
   const registry = snapshot.managed_capabilities ?? EMPTY_CAPABILITIES;
   const providers = snapshot.named_providers ?? EMPTY_PROVIDERS;
   const [notice, setNotice] = useState("");
@@ -672,10 +675,10 @@ export default function App() {
           <div className="topbar-actions">
             <span
               className={`connection ${connected ? "online" : ""}`}
-              title={connectionError || "本机后台已连接"}
+              title={startup.message || connectionError || "本机后台已连接"}
             >
               <span />
-              {connected ? "后台在线" : checked ? "后台离线" : "连接中"}
+              {connected ? "后台在线" : startup.phase === "starting" ? "后台加载中" : checked ? "后台离线" : "连接中"}
             </span>
             <Button
               variant={panel === "plan" ? "secondary" : "ghost"}
@@ -696,11 +699,11 @@ export default function App() {
             </button>
           </div>
         )}
-        {checked && !connected && (
+        {!connected && (checked || startup.phase !== "idle") && (
           <div className="offline-banner" role="status">
             <WifiOff size={14} />
             <span>
-              {connectionError || "连接后台失败。重新连接后可以继续操作。"}
+              {startup.message || connectionError || "连接后台失败。重新连接后可以继续操作。"}
             </span>
             <button onClick={() => void refresh()}>
               <RefreshCw size={12} />
@@ -1362,7 +1365,7 @@ export default function App() {
       </ModalFrame>
 
       <ModalFrame error="" open={modal === "reliability"} onClose={()=>setModal(null)} title="备份与诊断" description="本机所有者维护入口；私有历史备份与固定字段诊断严格分开。" wide>
-        {modal === "reliability" && <ReliabilitySettings client={reliabilityClient} disabled={!connected}/>}
+        {modal === "reliability" && <><ReliabilitySettings client={reliabilityClient} disabled={!connected}/><UpdatesSettings client={updatesClient} disabled={!connected}/></>}
       </ModalFrame>
 
       <ModalFrame error="" open={modal === "gateway"} onClose={()=>setModal(null)} title="自托管网关 / H5" description="出站设备连接、一次性配对与会话级授权；不是本机管理 API 的公网代理。" wide>

@@ -9,6 +9,35 @@ use crate::reliability::{diagnostics, jobs, storage};
 type ColumnSpec = (&'static str, &'static str, bool, i64);
 const REQUIRED_SCHEMA: &[(&str, &[ColumnSpec])] = &[
     (
+        "update_trust",
+        &[
+            ("singleton", "INTEGER", false, 1),
+            ("revision", "INTEGER", true, 0),
+            ("body", "TEXT", true, 0),
+        ],
+    ),
+    (
+        "update_jobs",
+        &[
+            ("id", "TEXT", false, 1),
+            ("config_revision", "INTEGER", true, 0),
+            ("status", "TEXT", true, 0),
+            ("nonce", "TEXT", false, 0),
+            ("body", "TEXT", true, 0),
+        ],
+    ),
+    (
+        "update_floors",
+        &[
+            ("application", "TEXT", true, 1),
+            ("target", "TEXT", true, 2),
+            ("version", "TEXT", true, 0),
+            ("sequence", "INTEGER", true, 0),
+            ("manifest_sha256", "TEXT", false, 0),
+            ("sha256", "TEXT", false, 0),
+        ],
+    ),
+    (
         "backup_jobs",
         &[
             ("id", "TEXT", false, 1),
@@ -417,6 +446,8 @@ const REQUIRED_SCHEMA: &[(&str, &[ColumnSpec])] = &[
     ),
 ];
 const REQUIRED_UNIQUE_KEYS: &[(&str, &[&str])] = &[
+    ("update_jobs", &["id"]),
+    ("update_floors", &["application", "target"]),
     ("gateway_configuration", &["id"]),
     ("gateway_pairings", &["code_hash"]),
     ("gateway_text_resources", &["task_id", "kind"]),
@@ -505,10 +536,11 @@ fn validate_event_allocator(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn validate_schema_version(db: &Connection, gateway: bool) -> Result<()> {
+fn validate_schema_version(db: &Connection, gateway: bool, updates: bool) -> Result<()> {
     validate_event_allocator(db)?;
     for (table, expected) in REQUIRED_SCHEMA {
-        if !gateway && table.starts_with("gateway_") {
+        if (!gateway && table.starts_with("gateway_")) || (!updates && table.starts_with("update_"))
+        {
             continue;
         }
         let kind: Option<String> = db
@@ -548,7 +580,8 @@ fn validate_schema_version(db: &Connection, gateway: bool) -> Result<()> {
         }
     }
     for (table, expected) in REQUIRED_UNIQUE_KEYS {
-        if !gateway && table.starts_with("gateway_") {
+        if (!gateway && table.starts_with("gateway_")) || (!updates && table.starts_with("update_"))
+        {
             continue;
         }
         let mut query = db.prepare(&format!("PRAGMA index_list({table})"))?;
@@ -697,11 +730,17 @@ fn validate_private_record(table: &str, value: &Value) -> Result<()> {
 }
 
 pub(crate) fn validate_records(db: &Connection) -> Result<()> {
+    validate_records_version(db, true, true)?;
+    validate_gateway_records(db)?;
+    scheduling::validate(db)?;
+    crate::reliability::update_state::validate(db)
+}
+pub(crate) fn validate_v3_records(db: &Connection) -> Result<()> {
     validate_v2_records(db)?;
     scheduling::validate(db)
 }
 pub(crate) fn validate_v2_records(db: &Connection) -> Result<()> {
-    validate_records_version(db, true)?;
+    validate_records_version(db, true, false)?;
     validate_gateway_records(db)
 }
 pub(crate) fn validate_v1_records(db: &Connection) -> Result<()> {
@@ -713,13 +752,13 @@ pub(crate) fn validate_v1_records(db: &Connection) -> Result<()> {
     if unexpected != 0 {
         bail!("旧版本包含未登记的网关结构，未执行升级");
     }
-    validate_records_version(db, false)
+    validate_records_version(db, false, false)
 }
 pub(crate) fn restore_gateway(tx: &Transaction<'_>) -> Result<()> {
     super::gateway::restore(tx)
 }
-fn validate_records_version(db: &Connection, gateway: bool) -> Result<()> {
-    validate_schema_version(db, gateway).context("数据库应用结构无效")?;
+fn validate_records_version(db: &Connection, gateway: bool, updates: bool) -> Result<()> {
+    validate_schema_version(db, gateway, updates).context("数据库应用结构无效")?;
     for table in [
         "sessions",
         "tasks",

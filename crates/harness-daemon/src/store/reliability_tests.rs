@@ -398,6 +398,8 @@ fn event_ddl_accepts_published_alter_quotes_but_not_extra_tokens_or_quoted_keywo
 }
 
 fn downgrade_actual_store_to_v1(db: &Connection) {
+    db.execute_batch("DROP TABLE update_trust; DROP TABLE update_jobs; DROP TABLE update_floors;")
+        .unwrap();
     for (table, _) in REQUIRED_SCHEMA
         .iter()
         .filter(|(name, _)| name.starts_with("gateway_"))
@@ -412,10 +414,12 @@ fn downgrade_actual_store_to_v1(db: &Connection) {
 }
 
 fn downgrade_actual_store_to_v2(db: &Connection) {
+    db.execute_batch("DROP TABLE update_trust; DROP TABLE update_jobs; DROP TABLE update_floors;")
+        .unwrap();
     for (name, _) in scheduling::INDEXES {
         db.execute_batch(&format!("DROP INDEX {name};")).unwrap();
     }
-    db.execute_batch("DELETE FROM storage_migrations WHERE version=3; PRAGMA user_version=2;")
+    db.execute_batch("DELETE FROM storage_migrations WHERE version>=3; PRAGMA user_version=2;")
         .unwrap();
 }
 
@@ -440,7 +444,10 @@ fn actual_v2_history_upgrades_to_indexed_v3_and_old_backup_restores_without_repl
         })
         .unwrap();
     super::super::prepare_database(&mut store.db).unwrap();
-    assert_eq!(storage::preflight(&store.db).unwrap(), 3);
+    assert_eq!(
+        storage::preflight(&store.db).unwrap(),
+        storage::SCHEMA_VERSION
+    );
     validate_records(&store.db).unwrap();
     assert_eq!(
         store
@@ -455,7 +462,10 @@ fn actual_v2_history_upgrades_to_indexed_v3_and_old_backup_restores_without_repl
     let destination = f.0.join("restored-version-two");
     crate::maintenance::restore_backup(&destination, &old_bundle, &old_manifest.sha256).unwrap();
     let mut restored = Store::open(&destination.join("harness.sqlite")).unwrap();
-    assert_eq!(storage::preflight(&restored.db).unwrap(), 3);
+    assert_eq!(
+        storage::preflight(&restored.db).unwrap(),
+        storage::SCHEMA_VERSION
+    );
     assert_eq!(
         record(&restored.db, "tasks", "history").unwrap()["result"],
         completed["result"]
@@ -476,7 +486,8 @@ fn failed_v3_index_migration_rolls_back_without_repeating_baseline_or_gateway() 
             validate_v2_records(tx)?;
             scheduling::migrate(tx)?;
             bail!("fixture after index creation")
-        }
+        },
+        |_| panic!("must not advance after failed v3")
     )
     .is_err());
     assert_eq!(storage::preflight(&store.db).unwrap(), 2);
@@ -552,7 +563,8 @@ fn real_v1_migration_only_adds_gateway_preserves_history_and_ledger_identity() {
         [
             "self-agent-schema-v1-atomic-baseline",
             "self-agent-schema-v2-gateway",
-            "self-agent-schema-v3-indexed-scheduling"
+            "self-agent-schema-v3-indexed-scheduling",
+            "self-agent-schema-v4-update-verification"
         ]
     );
 }
@@ -577,6 +589,7 @@ fn real_v1_failed_gateway_upgrade_rolls_back_all_gateway_tables() {
             super::super::gateway::migrate(tx)?;
             bail!("fixture after gateway DDL")
         },
+        |_| panic!("must not advance after failed v2"),
         |_| panic!("must not advance after failed v2")
     )
     .is_err());

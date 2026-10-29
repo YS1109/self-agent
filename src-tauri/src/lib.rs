@@ -1,9 +1,14 @@
 mod bridge;
+mod compatibility;
 mod event_stream;
 mod menu;
+mod startup;
 
-use bridge::{ack_event_stream, api_request, start_event_stream, stop_event_stream, Bridge};
-use tauri::{Emitter, Manager};
+use bridge::{
+    ack_event_stream, api_request, daemon_startup_status, start_event_stream, stop_event_stream,
+    Bridge,
+};
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -12,6 +17,7 @@ pub fn run() {
         .manage(Bridge::new())
         .invoke_handler(tauri::generate_handler![
             api_request,
+            daemon_startup_status,
             start_event_stream,
             stop_event_stream,
             ack_event_stream
@@ -25,11 +31,7 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let bridge = handle.state::<Bridge>();
-                let status = match bridge.ensure_daemon(&handle).await {
-                    Ok(_) => serde_json::json!({ "status": "connected" }),
-                    Err(message) => serde_json::json!({ "status": "error", "message": message }),
-                };
-                let _ = handle.emit("daemon-status", status);
+                let _ = bridge.ensure_daemon(&handle).await;
             });
             Ok(())
         })

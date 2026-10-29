@@ -1,4 +1,5 @@
 import { defineConfig, type Plugin } from "vite";
+import { fetchDaemonCompatibility } from "./scripts/daemon_compatibility";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { readFile } from "node:fs/promises";
@@ -66,6 +67,7 @@ function daemonProxy(): Plugin {
             target.hash
           )
             throw new Error("Invalid daemon endpoint");
+          const negotiated=await fetchDaemonCompatibility(target,info.token,controller.signal);
           const chunks: Buffer[] = [];
           let size = 0;
           for await (const chunk of req) {
@@ -78,6 +80,7 @@ function daemonProxy(): Plugin {
             headers: {
               Authorization: `Bearer ${info.token}`,
               "Content-Type": "application/json",
+              "X-Self-Agent-Protocol": String(negotiated.protocol),
             },
             body: chunks.length ? Buffer.concat(chunks) : undefined,
             signal: controller.signal,

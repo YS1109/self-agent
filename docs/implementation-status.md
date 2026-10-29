@@ -278,3 +278,11 @@ H5 的 task/session/result/event/diff/纯文本产物读取都按实时授权；
 历史页首面也保存 `current_cursor`，返回/刷新不混入新记录；实例重启使旧游标失效，不重放命令。CLI status/follow 使用原任务 ID，不下载全历史；桌面固定目标离窗时保留 ID/草稿并阻止转投，QQ/H5 本机授权表单不允许隐藏会话被提交。活动主任务前序检查只读取活动状态，保留精确 u64 顺序。
 
 本片不包含尚未接线的生命周期、更新暂存或兼容握手。大历史同 seed 的实际结果、冻结门禁和精确 CI 分别记录于 performance-v1.0 / acceptance-v1.0；不能用页面单测或历史 CI 冒充容量、完整 GUI 或安装验证。
+
+## 1.0 本机校验/暂存、兼容与启动观察切片
+
+真实 Store/DataLease/schema v4、owner API、CLI updates 与只读桌面状态已接线；独立verification-only信任与请求分开，生产自动更新始终禁用。已签名原始清单、实际文件字节、当前配置/下限/有效期均需匹配；旧库恢复停用信任且外部witness不回滚，历史成功不是当前暂存权威或安装事实。
+
+CLI/bridge/开发代理已认证协商wire generation，旧或畸形peer不接收动作且不被自动替换。Native保留单次启动与退出观察，原始30秒等待和可见状态、早期错误重读、迟到只读恢复已实现；不改变之前5,000任务启动测量，也不是启动性能优化或真实GUI验收。
+
+冻结门禁、独立审查和精确CI见 [acceptance-update-v1.0.md](acceptance-update-v1.0.md)，合同见 [protocol-v15.md](protocol-v15.md)。本切片不完成后续统一worker drain、真实OS安装器、生产签名/自动更新、真实外部服务或公网部署；未登记用户生产信任根。

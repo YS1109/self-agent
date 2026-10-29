@@ -22,11 +22,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 pub(crate) const MAX_DATABASE_BYTES: usize = 128 * 1024 * 1024;
 const LEDGER_V1: &str = "self-agent-schema-v1-atomic-baseline";
 const LEDGER_V2: &str = "self-agent-schema-v2-gateway";
 const LEDGER_V3: &str = "self-agent-schema-v3-indexed-scheduling";
+const LEDGER_V4: &str = "self-agent-schema-v4-update-verification";
 const MAIN: &str = "harness.sqlite";
 const JOURNAL: &str = ".restore-journal.json";
 const COMMIT: &str = ".restore-committed.json";
@@ -69,6 +70,9 @@ fn preflight_inner(db: &Connection) -> Result<u32> {
         if version >= 3 {
             expected.push((3, LEDGER_V3.into()));
         }
+        if version >= 4 {
+            expected.push((4, LEDGER_V4.into()));
+        }
         if records != expected {
             bail!("数据库迁移记录不受支持；未修改原数据");
         }
@@ -83,8 +87,9 @@ pub(crate) fn migrate(
     baseline: impl FnOnce(&Transaction<'_>) -> Result<()>,
     upgrade: impl FnOnce(&Transaction<'_>) -> Result<()>,
     upgrade_v3: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    upgrade_v4: impl FnOnce(&Transaction<'_>) -> Result<()>,
 ) -> Result<()> {
-    migrate_inner(db, baseline, upgrade, upgrade_v3)
+    migrate_inner(db, baseline, upgrade, upgrade_v3, upgrade_v4)
         .map_err(|_| anyhow::anyhow!("数据库迁移失败；事务已回滚，未重建或删除原数据"))
 }
 fn migrate_inner(
@@ -92,6 +97,7 @@ fn migrate_inner(
     baseline: impl FnOnce(&Transaction<'_>) -> Result<()>,
     upgrade: impl FnOnce(&Transaction<'_>) -> Result<()>,
     upgrade_v3: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    upgrade_v4: impl FnOnce(&Transaction<'_>) -> Result<()>,
 ) -> Result<()> {
     let version = preflight(db)?;
     if version == SCHEMA_VERSION {
@@ -115,6 +121,11 @@ fn migrate_inner(
         upgrade_v3(&tx)?;
         tx.execute("INSERT INTO storage_migrations VALUES(3,?1)", [LEDGER_V3])?;
         tx.execute_batch("PRAGMA user_version=3;")?;
+    }
+    if version < 4 {
+        upgrade_v4(&tx)?;
+        tx.execute("INSERT INTO storage_migrations VALUES(4,?1)", [LEDGER_V4])?;
+        tx.execute_batch("PRAGMA user_version=4;")?;
     }
     tx.commit()?;
     Ok(())
@@ -665,6 +676,30 @@ impl StorageGuard {
         self.dir.open_dir_nofollow("capability-probes")?;
         self.check_source_identity(None)?;
         Ok(self.root_path.join("capability-probes"))
+    }
+    /// Relative capability opens only: never canonicalize/reopen ambient paths.
+    pub(crate) fn update_directories(&self) -> Result<(Dir, Dir)> {
+        self.check_source_identity(None)?;
+        let mut directories = Vec::new();
+        for name in ["updates-stage", "updates-witness"] {
+            let mut builder = cap_std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use cap_std::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match self.dir.create_dir_with(name, &builder) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            directories.push(self.dir.open_dir_nofollow(name)?);
+        }
+        sync_directory(&self.dir)?;
+        self.check_source_identity(None)?;
+        let witness = directories.pop().unwrap();
+        let stage = directories.pop().unwrap();
+        Ok((stage, witness))
     }
     pub(crate) fn write_daemon_metadata(&self, content: &[u8]) -> Result<()> {
         self.check_source_identity(None)?;
