@@ -1,8 +1,10 @@
 # 1.0 实际后台生命周期验收记录
 
-状态（2026-10-29 06:34 UTC）：v16 已推送开发分支，精确提交 `925e6cf2d924141a0cff972113d5b37556891de9`（tree `29fb0f4b0ce4c42cada299f773a5ad1e5ff5b251`）。两轮精确 CI 均终态 **4/6**，macOS / Windows Rust 尚未通过，窄修复已完成独立复核和本地完整门禁，随本文提交、仍待新精确 CI；不能写成全绿或 1.0 正式发行。下列本地冻结、独立审查和模拟门禁是此前保留的证据，不是本次重新运行或新 CI 结果。
+状态（2026-10-29 07:28 UTC）：当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
 
-## 已取得的定向证据
+本片源码、API、协议及授权的模拟实现已交付；下文保留各次失败与本地冻结记录，不以最终成功抹去旧提交的失败，也不把构建/模拟门禁称为完整生产 1.0 或实机 GUI/安装验收。
+
+## 原本地冻结的定向证据
 
 - lifecycle runtime/control/Store 当前过滤 **76/76** 通过，包含实例绑定、真实 worker registry、两次 quiesce、observer 断连、tracked settings 读取、启动失败真实清理与 SQL 已提交后 Err 不误称回滚。
 - 真实 owner HTTP / worker 定向：命名 Provider **7/7**、MCP 凭据 **6/6**、vault **18/18**、MCP stderr 真实析构等待 **1/1**、backup API **10/10**、history API **4/4**。覆盖 vault backend Drop 阻塞不得误报停止、关闭后新意图拒绝、配置/历史读取 observer 断连仍等待原 worker。
@@ -62,12 +64,12 @@
 - 网关撤权夹具修复 `c73a62afe446ed089ff6a80087b447c5eb7610de` 的 [push 40821487804](https://github.com/YS1109/self-agent/actions/runs/40821487804) / [PR 40821493624](https://github.com/YS1109/self-agent/actions/runs/40821493624) 均 **6/6 成功**，不借用为后续 v15/v16 的结果。
 - v15 `7aea4f15f04a4ce3ffdbf944fdc454160dcc465c` 两轮 CI（push `40827179414` / PR `40827184463`）均终态 **5/6**，仅 Windows Rust 被 `storage.rs` 的 `unused_mut` 阻断，Windows 后续测试未运行；后续生产等价 cfg 窄修复 `43d12ee3bc7f708cbe55101b7a12ce63480f0f68` 的两轮 CI（push `40828345766` / PR `40828352198`）也均终态 **5/6**：macOS / Ubuntu Rust 全部 smoke 与三平台 Desktop 成功；Windows 产品 Rust / update 4 组已通过，仅最终 package smoke 中文输出遇到 Python cp1252 编码失败。两次失败均保留；详情见 [更新验收](acceptance-update-v1.0.md)。
 - v16 `925e6cf2d924141a0cff972113d5b37556891de9` 的 [push 40828936545](https://github.com/YS1109/self-agent/actions/runs/40828936545) / [PR 40828942266](https://github.com/YS1109/self-agent/actions/runs/40828942266) 均终态 **4/6**：三平台 Desktop 与 Ubuntu Rust 成功；macOS daemon **790/791**，僵尸进程组仍可被信号探测的夹具失败；Windows daemon **728/730**，两个新 CMD / Job 复合脚本夹具失败。平台测试已实际运行，不能再称 Windows 仅交叉编译，但也不能声称这些平台的完整生命周期链路已经通过。
-- 进程夹具及 package 输出编码的窄修复已完成，**本地重新验证见下节；新精确 CI 尚未取得**。本地旧冻结 core13 / daemon791 / CLI53 / gateway17 / UI343、22 个 smoke、Web 4 组仍只证明原固定候选，不自动证明这些修复或远端全绿。
+- 当时进程夹具及 package 输出编码的窄修复已完成，**本地重新验证见下节；该时点尚未取得新精确 CI**。后续 `df065790` / `8a5b980a` 的实际结果见文末。本地旧冻结 core 13 / daemon 791 / CLI 53 / gateway 17 / UI 343、22 个 smoke、Web 4 组仍只证明原固定候选，不自动证明这些修复或远端全绿。
 - 此前 GitHub 内容上传曾因额外披露确认暂停；用户随后已明确授权 v15/v16 与 QQ 相关代码的开发分支发布，阻塞已解除。该历史拒绝不再是当前待办，也未扩大为真实 QQ 通讯、部署或正式发行授权。
 
 ## 未运行 / 仍待处理
 
-- 发布已独立复核及重新验证的窄修复，跟踪其精确 push / PR CI；当前失败之后未运行的后续阶段不能算通过。
+- 当前代码基线的开发分支发布及精确 push / PR CI 已闭环。旧失败提交在失败后未运行的阶段仍不回写为通过；新提交的独立结果见文末。
 - 实机 GUI、真实 OS vault、真实模型/QQ、公网 nginx、原生安装/升级/卸载、生产签名/发行均未运行。用户授权的是模拟验证和开发分支，不是部署或正式发行。
 
 ## 本次跨平台 CI 修复的重新冻结（2026-10-29 06:46 UTC）
@@ -80,7 +82,7 @@
 
 已重新运行并终态通过：core **13** / daemon **791** / CLI **53** / gateway **17**，fmt、四 crate all-target Clippy、daemon/CLI/gateway 与 update fixture 构建；全部 **22 个后台 smoke**（含真实关闭 6 组）以及 history benchmark self-test、package **6 项** self-test。另在 cp1252 环境下单独运行同一 6 项 package self-test，通过。源码与 4 个二进制前后 SHA-256 一致，证据为 `drain-ci-fix-gate-receipt.json` 和 `/tmp/drain-ci-fix-{fmt,rust,clippy,build,smokes,package-self-tests,history-self-tests}.log`。
 
-独立源码复核通过；Linux Native 52 / Codex 47 定向通过。Windows **13 项仅交叉编译及 Clippy**，不是新 Windows 执行结果；修复后的真实 Windows/macOS 运行仍须新精确提交 CI，不能沿用失败父提交或本地 Linux 结果。前端未修改，此次未重跑 GUI/前端；前述 343 与原三平台 Desktop CI 是其各自的历史证据。
+独立源码复核通过；Linux Native 52 / Codex 47 定向通过。当时 Windows **13 项仅交叉编译及 Clippy**，不等于 Windows 执行；后续真实 Windows/macOS 结果见 `df065790` / `8a5b980a` 记录，不能沿用失败父提交或本地 Linux 结果。前端未修改，此次未重跑 GUI/前端；前述 343 与原三平台 Desktop CI 是其各自的历史证据。
 
 ## Windows 旧运行时路径跟进（2026-10-29 07:07 UTC）
 
@@ -90,6 +92,19 @@
 
 回归在同一 Job/环境/脚本条件下先运行普通 DOS，再观察旧设备拼写；每次仍独立限 10 秒并等待原 Job 清理，只输出退出码/超时/固定异常分类。正常路径仍严格要求 exit 7、原引号/运算符 stdout、指定 stderr 和 Job 空；旧路径失败不是通过条件，也没有生产自动重试/回退开关。
 
-独立源码复核通过；Linux Native **52/52**、Codex **47/47**、daemon all-target Clippy、fmt / diff check 通过；Windows **14 项交叉编译及 Clippy** 通过。本次改动完全在 Windows cfg 模块，未重新运行完整 Linux/前端或复用旧二进制假称新 smoke。真实 Windows A/B 和完整门禁须在本次精确提交 CI 验证，当前仍未确认有效性。
+独立源码复核通过；Linux Native **52/52**、Codex **47/47**、daemon all-target Clippy、fmt / diff check 通过；Windows **14 项交叉编译及 Clippy** 通过。本次改动完全在 Windows cfg 模块，未重新运行完整 Linux/前端或复用旧二进制假称新 smoke。在该记录时点，真实 Windows A/B 和完整门禁尚未取得，未提前确认有效性；后续精确提交结果见下节。
 
 证据：`/tmp/drain-powershell-path-{native,codex,clippy}.log`、`drain-ci-fix-ci-final.json`；Windows 源码 SHA-256 `e2463a90b83f952062773f1c88b0dcfe0fdc63a7a3c12062324c0883c92ed6b4`。
+
+
+## 最终代码基线与精确 CI 闭环（2026-10-29 07:28 UTC）
+
+当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+
+两轮 Windows daemon 均 **734/734**，全部后台 smoke 通过，包括 update **4 组**、package **4 组**和实际 shutdown **3 组**。macOS / Linux 的信号关闭覆盖另为 **6 组**，不把 Windows 3 组扩写成 Unix 信号验证。
+
+真实 Windows A/B 在相同 Job / 环境 / 脚本条件下观察到：旧 extended 路径 exit **-65536**、`ServicePointManager=true`；普通 DOS 路径 exit **7**、`ServicePointManager=false`，两者均未超时。修复从已持有的同一 no-follow handle 取得 canonical image/cwd，再严格验证普通 DOS 等价表示；只支持可表示为 UTF-8、少于 260 个 UTF-16 code unit 的普通本地固定盘符路径。祖先/程序锁、原 Job、权限、输出及清理断言均保留，没有自动重试或不安全路径回退。这证明该实际夹具的路径兼容差异，不声称所有 PowerShell 初始化异常都同根因。
+
+精确 run 与全部作业记录：工作区 `powershell-path-ci-final.json`；Windows 证明日志 `/tmp/powershell-path-windows-{push,pr}-proof.log`。原固定 Linux core 13 / daemon 791 / CLI 53 / gateway 17 / UI 343、22 个 smoke 和 Web 4 组仍属于各自原冻结记录，本次文档更新未重跑或替换这些证据。
+
+运行包版本仍为 `0.6.0`；交付在开发分支 / 草稿 PR，合并由用户本地审核决定，没有 merge、tag、release、生产签名或部署。真实模型、QQ、OS vault、完整 GUI、nginx 和三平台原生安装/升级/卸载仍未验证。普通 Unix 进程组 / Windows Job 的所有权边界不变，Unix 故意 `setsid` 脱离仍不在保证内。

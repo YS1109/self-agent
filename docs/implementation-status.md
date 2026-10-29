@@ -1,8 +1,8 @@
 # 实施状态
 
-更新日期：2026-10-29 06:34 UTC
+更新日期：2026-10-29 07:28 UTC
 
-运行包版本仍为 0.6.0，未提升版本、打标签或正式发行。开发分支已发布至 v16 `925e6cf2d924141a0cff972113d5b37556891de9`（tree `29fb0f4b0ce4c42cada299f773a5ad1e5ff5b251`）；两轮精确 CI 均终态 4/6，跨平台窄修复已完成本地门禁并随本文提交，仍待新精确 CI，不能称全绿。下文保留各历史阶段边界，最新状态以末尾 v15/v16 和验收矩阵为准。
+运行包版本仍为 `0.6.0`，未提升版本、打标签或正式发行。当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。源码、API、协议与授权模拟实现已交付；下文保留历史阶段边界，完整生产 1.0 和外部实机验收不由这些门禁代替。
 
 ## 已实现的 v0 边界
 
@@ -263,7 +263,7 @@ H5 的 task/session/result/event/diff/纯文本产物读取都按实时授权；
 
 最终冻结/源码复核/精确 SHA CI 以 [acceptance-v0.10.md](acceptance-v0.10.md) 为准。浏览器会话仅内存、网关重启需重新配对；headless Chromium 被环境沙箱阻止，真实手机视觉、OS vault、公网 nginx/TLS、实际部署均未验证。0.10 不替代仍待交付的完整 1.0 生命周期/生产更新。
 
-0.10 最终本地冻结：core9 / daemon595 / CLI37 / gateway17 / 前端265、18个后台smoke、Web流式代理3组、桥路由提取4项、fmt/Clippy/构建均通过；独立实际集成审查clear。精确提交CI不能用这些本地证据替代。
+0.10 最终本地冻结：core9 / daemon595 / CLI37 / gateway 17 / 前端265、18个后台smoke、Web流式代理3组、桥路由提取4项、fmt/Clippy/构建均通过；独立实际集成审查clear。精确提交CI不能用这些本地证据替代。
 
 ## 1.0 性能第一切片：索引调度与保留失败
 
@@ -287,20 +287,31 @@ CLI/bridge/开发代理已认证协商wire generation，旧或畸形peer不接�
 
 冻结门禁、独立审查和精确CI见 [acceptance-update-v1.0.md](acceptance-update-v1.0.md)，合同见 [protocol-v15.md](protocol-v15.md)。本切片不完成后续统一worker drain、真实OS安装器、生产签名/自动更新、真实外部服务或公网部署；未登记用户生产信任根。
 
-## 1.0 实际后台停止切片（已发布，精确 CI 待修复）
+## 1.0 实际后台停止切片（已发布，最新精确 CI 已通过）
 
 AppState、调度/编排、凭据 OS 线程、MCP、阻塞读取/备份、更新上传、QQ/Gateway 已接到同一真实 worker registry；同 Store 锁关闭新 admission，保留已接受工作的结算，再完成两次 quiesce。控制 HTTP/CLI/桌面固定实例 UUID，观察超时不取消原清理、不自动重发或替换后台。
 
-源码独立审查、定向回归与完整冻结门禁分别记录于 [acceptance-lifecycle-v1.0.md](acceptance-lifecycle-v1.0.md)，协议为 [v16](protocol-v16.md)。原本地冻结 Rust 13/791/53/17、前端343、22个后台 smoke 与 Web 代理4组已通过；真实 Linux HTTP/CLI/SIGINT/SIGTERM 和 paused 计划取消已覆盖。这些是保留的固定候选证据，不是本次重跑或新 CI。开发分支 v16 的 push `40828936545` / PR `40828942266` 均终态 4/6：三平台 Desktop 与 Ubuntu Rust 成功，macOS daemon 790/791（僵尸进程组信号探测夹具）和 Windows daemon 728/730（两个新 CMD / Job 复合脚本夹具）失败。当前窄修复已完成本地门禁，随本文提交但仍待新精确 CI，失败后的阶段及完整 GUI/原生安装不能算通过。全路线图映射见 [验收矩阵](roadmap-acceptance-matrix.md)。
+源码独立审查、定向回归与完整冻结门禁分别记录于 [acceptance-lifecycle-v1.0.md](acceptance-lifecycle-v1.0.md)，协议为 [v16](protocol-v16.md)。原本地冻结 Rust 13/791/53/17、前端343、22个后台 smoke 与 Web 代理4组已通过；真实 Linux HTTP/CLI/SIGINT/SIGTERM 和 paused 计划取消已覆盖。这些是保留的固定候选证据，不是本次重跑或新 CI。开发分支 v16 的 push `40828936545` / PR `40828942266` 均终态 4/6：三平台 Desktop 与 Ubuntu Rust 成功，macOS daemon 790/791（僵尸进程组信号探测夹具）和 Windows daemon 728/730（两个新 CMD / Job 复合脚本夹具）失败。这些是 `925e6cf2` 的历史失败；后续 `df065790` / `8a5b980a` 结果见下文，不把后续成功回写到旧 SHA。完整 GUI/原生安装仍不能算通过。全路线图映射见 [验收矩阵](roadmap-acceptance-matrix.md)。
 
 
-### 当前发布与历史失败（2026-10-29 06:34 UTC）
+### 历史发布与失败（2026-10-29 06:34 UTC）
 
 - 网关撤权夹具修复 `c73a62a` 的 push `40821487804` / PR `40821493624` 均 6/6 成功；该结果不代替后续提交。
-- v15 `7aea4f15` 已发布，两轮 CI（`40827179414` / `40827184463`）各 5/6，仅 Windows `storage.rs` 的 `unused_mut` 阻断、后续 tests 未跑；生产等价 cfg 修复 `43d12ee3` 的两轮（`40828345766` / `40828352198`）也各 5/6，macOS / Ubuntu Rust 全部 smoke 与三平台 Desktop 成功，Windows 产品 Rust / update 4 组通过，仅最后 package smoke 中文输出 cp1252 编码失败。原失败与修复范围见 [更新验收](acceptance-update-v1.0.md)，当前 package / 进程夹具修复仍在工作树中。
+- v15 `7aea4f15` 已发布，两轮 CI（`40827179414` / `40827184463`）各 5/6，仅 Windows `storage.rs` 的 `unused_mut` 阻断、后续 tests 未跑；生产等价 cfg 修复 `43d12ee3` 的两轮（`40828345766` / `40828352198`）也各 5/6，macOS / Ubuntu Rust 全部 smoke 与三平台 Desktop 成功，Windows 产品 Rust / update 4 组通过，仅最后 package smoke 中文输出 cp1252 编码失败。原失败与修复范围见 [更新验收](acceptance-update-v1.0.md)，该时点 package / 进程夹具修复尚在工作树，后续发布和验证见下文。
 - 此前内容披露确认阻塞已由用户对 v15/v16 和 QQ 相关代码开发分支发布的明确授权解除；不再等待该确认。没有因此调用真实模型、发送真实 QQ 消息、登记 OS vault、部署、签名或正式发行。
 - managed ChatGPT Codex 继续采用安全 fresh thread + 应用历史回退；进程清理仅覆盖普通 Unix 进程组 / Windows Job 后代，Unix 故意 `setsid` 脱离不在保证内，不是恶意进程沙箱。
 
 ### 本次 CI 窄修复本地重验（2026-10-29 06:46 UTC）
 
-CMD 固定脚本编码、macOS WNOWAIT 观察夹具及 package UTF-8 输出修复已独立复核。重新完整通过 Rust **13 / 791 / 53 / 17**、fmt / all-target Clippy / 后台构建、**22 个 smoke**、history self-test 和 package **6 项** self-test；新 Windows 13 项仍仅交叉编译，真实跨平台结果等新提交 CI。原失败保留，详细证据与未运行项见 [生命周期验收](acceptance-lifecycle-v1.0.md#本次跨平台-ci-修复的重新冻结2026-10-29-0646-utc)。本地通过不等于正式发行或实机验收。
+CMD 固定脚本编码、macOS WNOWAIT 观察夹具及 package UTF-8 输出修复已独立复核。重新完整通过 Rust **13 / 791 / 53 / 17**、fmt / all-target Clippy / 后台构建、**22 个 smoke**、history self-test 和 package **6 项** self-test；该时点新 Windows 13 项仅交叉编译，后续实际结果见下文。原失败保留，详细证据与未运行项见 [生命周期验收](acceptance-lifecycle-v1.0.md#本次跨平台-ci-修复的重新冻结2026-10-29-0646-utc)。本地通过不等于正式发行或实机验收。
+
+
+### 最新代码交付与精确 CI（2026-10-29 07:28 UTC）
+
+`df065790` 的 push `40831626789` / PR `40831632978` 均终态 **5/6**，仅 Windows 新 PowerShell 初始化夹具失败（daemon **732/733**）；macOS / Ubuntu Rust 全部 smoke 与三平台 Desktop 成功，失败后的 Windows smoke 未运行。
+
+当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+
+两轮 Windows daemon **734/734** 与全部 smoke（update 4 / package 4 / 实际 shutdown 3 组）通过；macOS / Linux 信号关闭另为 6 组。真实 A/B 旧 extended 路径 exit -65536 / ServicePointManager=true，DOS 路径 exit 7 / false，两者均未超时。修复保持 no-follow handle 的 canonical 身份、Job、权限与清理确认，普通本地 image/cwd 须可表示为 UTF-8 且少于 260 个 UTF-16 code unit，不是任意长路径支持。
+
+剩余实现限制与外部验证分开：managed Codex 安全 fresh-history 回退、未支持的严格 Codex 预算维度、QQ 文本范围和 verification-only 更新保持不变；真实 OS vault、模型/QQ、GUI、nginx、原生安装器与生产信任/签名尚未验证。可选 0.11 已排除。详见 [验收矩阵](roadmap-acceptance-matrix.md)，无 merge、tag、release 或部署。

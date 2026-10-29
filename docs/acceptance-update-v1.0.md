@@ -1,5 +1,7 @@
 # 1.0 本机签名校验、暂存与兼容切片验收
 
+当前状态（2026-10-29 07:28 UTC）：当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+
 本记录只覆盖协议 v15 / schema v4 的开发实现，不把它称作生产更新器、安装发布或整个 1.0 完成。所有签名材料均来自临时进程内 Ed25519 key；没有登记用户信任根、生产密钥或访问真实更新源。
 
 ## 已交付边界
@@ -33,7 +35,7 @@
 
 创建失败不能删除未拥有的.part；witness FIFO非阻塞拒绝；签名有效期在实际成功边界复验；写前预留两个名称槽；散列后重查撤权/floor；完整 raw manifest digest 必须匹配 CLI 回执，错digest真实HTTP夹具证明零PUT。UI刷新即清旧stage观察；启动初查及事件重连共享有界metadata读取、Windows显式拒绝reparse；早期错误进入可重读的有修订状态。
 
-文件写入、flush/fsync、seek/同句柄复读、link/remove 留在实际被持有的 staging blocking worker 中；只有输入读取可取消，避免 drop Tokio 文件 I/O future 后留下未被持有的内部工作。私有文件移除仍是 best-effort；未清理 orphan 不获得暂存/安装权威，本片不声称已接统一物理 drain 证明。该两文件修复已独立复读 clear。
+文件写入、flush/fsync、seek/同句柄复读、link/remove 留在实际被持有的 staging blocking worker 中；只有输入读取可取消，避免 drop Tokio 文件 I/O future 后留下未被持有的内部工作。私有文件移除仍是 best-effort；未清理 orphan 不获得暂存/安装权威，v15 原片当时未接统一物理 drain；后续 v16 已接线，独立证据见 [生命周期验收](acceptance-lifecycle-v1.0.md)。该两文件修复已独立复读 clear。
 
 ## 同一 5,000 任务数据的实际就绪补验
 
@@ -59,24 +61,35 @@
 - 当前容器完整 `cargo check -p self-agent-desktop` 因缺少 `gobject-2.0`/WebKit系统库受阻；纯源提取测试不能替代完整 Native 三平台 CI。未进行真实原生 GUI 或手机视觉验收。
 - 包夹具是临时布局/进程与数据保留检查，不是 OS 安装器、真实卸载、生产签名、自动更新或优雅 drain 证明。没有执行任何待验证产物、网络下载、生产 key/source enrollment 或部署。
 - 30秒是明确就绪观察产品边界，不改变既有5,000任务测量，不宣称数据库启动优化/任意磁盘I/O可抢占或死锁已消除。
-- 新的完整生命周期/drain仍属后续独立切片；本片握手报告running，不伪造已接线draining/stopped。所有更新worker后续必须接真正统一registry，不可用HTTP观察者结束冒充OS工作settled。
+- v15 原片不含完整 lifecycle / drain；后续 v16 已把更新 worker 接入统一 registry，真实停止证据见生命周期验收。仍不能用 HTTP 观察者结束冒充 OS 工作 settled，也不把临时包布局当原生安装器。
 - floor/witness依赖受保护数据目录；不防同用户恶意删除整个数据根，不宣称硬件单调计数器或通用断电安装事务。生产自动下载与安装始终禁用。
 
-精确提交/CI：待此冻结树发布后跟踪，不能用本地门禁或其它 SHA 的 CI 替代。
+原冻结时尚待发布/CI；后续各精确提交结果见下文与顶部当前状态。本地门禁或其它 SHA 的 CI 不替代原提交结果。
 
 
 ## 首次精确 CI 与 Windows 条件编译窄修复（2026-10-29）
 
-`7aea4f15f04a4ce3ffdbf944fdc454160dcc465c` 的 push `40827179414` / PR `40827184463` 均在 Windows Rust Clippy 报 `storage.rs` 的 `unused_mut`；该平台后续测试、构建及 smoke 尚未运行，不记作通过。三平台 Desktop 和 Ubuntu Rust 已通过，macOS Rust 后台烟测继续跟踪。
+`7aea4f15f04a4ce3ffdbf944fdc454160dcc465c` 的 push `40827179414` / PR `40827184463` 两轮均终态 **5/6**，仅在 Windows Rust Clippy 报 `storage.rs` 的 `unused_mut`；该平台后续测试、构建及 smoke 尚未运行，不记作通过。三平台 Desktop、Ubuntu / macOS Rust 均成功。
 
 修复仅将目录 builder 的可变绑定放入 Unix cfg 块：Unix 仍设置 0700，Windows 使用原默认 builder，创建、AlreadyExists、no-follow capability 和身份复核逻辑不变。独立静态复核通过；隔离源码的 storage 34 / Store updates 4、fmt、四 crate all-target Clippy 通过。精确生产 builder 片段的 Windows GNU compile-only Clippy 通过；完整 daemon Windows 交叉检查因本地缺少 `x86_64-w64-mingw32-gcc`（ring C 构建）未完成，不能冒充 Windows 执行通过。后续修复精确提交 CI 单独跟踪。
 
 ## Windows 控制台编码夹具修复
 
-`43d12ee3bc7f708cbe55101b7a12ce63480f0f68` 的 push `40828345766` / PR `40828352198` 已在真实 Windows 越过原 Clippy 阻塞，Rust 测试、构建、既有后台 smoke、新 update 4 组与 package self-test 均通过；最后实际 package smoke 的首条中文 PASS 输出被 Python cp1252 stdout 拒绝，失败处理的中文消息同样不能编码。此结果不等于产品更新流程失败，但完整 CI 仍不记作通过。
+`43d12ee3bc7f708cbe55101b7a12ce63480f0f68` 的 push `40828345766` / PR `40828352198` 均终态 **5/6**，仅 Windows 失败；已在真实 Windows 越过原 Clippy 阻塞，Rust 测试、构建、既有后台 smoke、新 update 4 组与 package self-test 均通过；最后实际 package smoke 的首条中文 PASS 输出被 Python cp1252 stdout 拒绝，失败处理的中文消息同样不能编码。此结果不等于产品更新流程失败，但完整 CI 仍不记作通过。
 
 后续修复仅在 package 夹具入口显式将 stdout/stderr 设为严格 UTF-8，不改变产品、动作、断言、超时或二进制来源检查。继承 v16 的 freshness 回归后共 6 项 self-test 通过：新增真实子进程 `PYTHONIOENCODING=cp1252` 下中文 help 与两路诊断输出解码验证。以完全相同修改后脚本源码、固定 v16 私有候选普通二进制运行的实际 package 4 组全部通过，完整保留 freshness/hash/原数据检查；未改写冻结候选源码或构建产物。此为 Linux 上模拟 cp1252 的本地回归，不能替代新精确 Windows CI。
 
 证据：`/tmp/package-utf8-self-tests.log`、`/tmp/package-utf8-actual.log`。没有真实安装、生产签名/更新、GUI 或外部服务行为。
 
-本次与生命周期平台修复联合冻结后，又用新构建二进制运行完整 **22 个后台 smoke**（包括 update 4 / package 4 / shutdown 6 组）、完整 Rust **13 / 791 / 53 / 17**、fmt / all-target Clippy / 构建与 package **6 项** self-test，均通过。日志见生命周期验收的新 CI 修复段；真实 Windows 编码修复终态仍待新精确 CI，不以本地 cp1252 模拟替代。
+本次与生命周期平台修复联合冻结后，又用新构建二进制运行完整 **22 个后台 smoke**（包括 update 4 / package 4 / shutdown 6 组）、完整 Rust **13 / 791 / 53 / 17**、fmt / all-target Clippy / 构建与 package **6 项** self-test，均通过。日志见生命周期验收的新 CI 修复段；该冻结时真实 Windows 编码修复终态尚未取得；后续结果见下节，不以本地 cp1252 模拟替代。
+
+
+## 最新提交的跨平台实际结果（2026-10-29 07:28 UTC）
+
+`df0657906a7b41f77c49ebac5ef9e0ee48da655f` 的 push `40831626789` / PR `40831632978` 均终态 **5/6**：macOS / Ubuntu Rust 全部 smoke 和三平台 Desktop 成功；Windows **732/733**，新 PowerShell 初始化夹具失败，失败后的 smoke 未运行。原编码、CMD 与路径问题按精确提交分别保留，不相互覆盖。
+
+当前已验证代码基线为 `8a5b980a9675d64ed74e192c8fad28fe94cf0ca1`（tree `8c99cc7475d099d3ed497b5457d1364f5898da91`）。[push 40833625420](https://github.com/YS1109/self-agent/actions/runs/40833625420) / [PR 40833632597](https://github.com/YS1109/self-agent/actions/runs/40833632597) 均终态 **6/6 成功**，分别于 2026-10-29 07:27:46 / 07:26:37 UTC 完成，三平台 Rust 与三平台 Desktop 共 12 个作业均成功。此结论仅属于该代码提交，不是尚未提交的本次文档刷新之 CI。
+
+两轮 Windows 产品 daemon **734/734** 与全部 smoke 成功，包含 update **4 组**、package **4 组**和实际 shutdown **3 组**；macOS / Linux 信号关闭另为 **6 组**。真实旧 extended 路径 / DOS 等价路径 A/B 分别 exit -65536 / 7，`ServicePointManager` 异常分类分别 true / false，均未超时。固定 handle 身份、Job、权限和清理规则没有放松；Windows 普通本地路径的 UTF-8 与少于 260 个 UTF-16 code unit 限制见协议 v16，不是通用长路径支持。
+
+证据为工作区 `powershell-path-ci-final.json` 与 `/tmp/powershell-path-windows-{push,pr}-proof.log`。这确认代码基线的模拟与跨平台门禁，不是运行待验证 artifact、生产更新源/信任根、签名身份、自动安装或原生安装器验收。包版本仍为 `0.6.0`，没有 merge、tag 或正式 release。
