@@ -2,7 +2,10 @@
 """Persistent Native budgets, permission ceilings and repair gates; local fixtures only."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
+import shlex
+import sys
 import tempfile
 import threading
 import time
@@ -12,6 +15,15 @@ from smoke import Daemon, wait_for
 
 TERMINAL = {"completed", "failed", "cancelled"}
 SECRET = "fixture-budget-secret"
+
+
+def python_command(script):
+    arguments = [sys.executable, script]
+    if os.name == "nt":
+        # Native commands use PowerShell; preserve both spaces and exit codes.
+        quoted = " ".join("'" + argument.replace("'", "''") + "'" for argument in arguments)
+        return f"& {quoted}; exit $LASTEXITCODE"
+    return shlex.join(arguments)
 
 
 class Model(BaseHTTPRequestHandler):
@@ -45,9 +57,9 @@ class Model(BaseHTTPRequestHandler):
             if not request.get("tools"):
                 message = {"role": "assistant", "content": "早期历史摘要：保留目标与已完成事实。"}
             elif model == "fixture-stdout":
-                message = self.call("run_command", {"command": "python loud.py"}, turn)
+                message = self.call("run_command", {"command": python_command("loud.py")}, turn)
             elif model == "fixture-command-deadline":
-                message = self.call("run_command", {"command": "python long.py"}, turn)
+                message = self.call("run_command", {"command": python_command("long.py")}, turn)
             elif model in {"fixture-limit", "fixture-snapshot"}:
                 message = self.call("list_files", {"path": "."}, turn)
             elif model == "fixture-output":
@@ -137,7 +149,7 @@ def main():
                 def loud(project):
                     (project / "loud.py").write_text("print('OUTPUT_SENTINEL_' * 750)\n")
 
-                for model, acceptance in [("fixture-stdout", []), ("fixture-verification-stdout", ["python loud.py"])]:
+                for model, acceptance in [("fixture-stdout", []), ("fixture-verification-stdout", [python_command("loud.py")])]:
                     overflowing, _ = run(model, {"budget": {"max_output_bytes": 1024}, "acceptance_commands": acceptance}, loud)
                     assert overflowing["status"] == "failed", overflowing
                     assert overflowing["stop_reason"] == "output_budget_exhausted", overflowing
@@ -222,7 +234,7 @@ def main():
                 daemon.request("PUT", "/api/v1/settings", {"execution_controls": {"budget": {"max_retries": 0}}})
                 print("PASS explicit transient rejection retry consumes shared request budget")
 
-                repaired, project = run("fixture-repair", {"acceptance_commands": ["python check.py", "python check_second.py"]}, checker)
+                repaired, project = run("fixture-repair", {"acceptance_commands": [python_command("check.py"), python_command("check_second.py")]}, checker)
                 assert repaired["status"] == "completed", repaired
                 attempts = repaired["verification_attempts"]
                 assert [attempt["exit_code"] for attempt in attempts] == [1, 1, 0, 0], repaired
@@ -232,7 +244,7 @@ def main():
                 assert (project / "result.txt").read_text() == "fixed"
                 print("PASS real failure -> repair -> exact-command reverify, original failure retained")
 
-                exhausted, project = run("fixture-repair-zero", {"budget": {"max_repair_attempts": 0}, "acceptance_commands": ["python check.py"]}, checker)
+                exhausted, project = run("fixture-repair-zero", {"budget": {"max_repair_attempts": 0}, "acceptance_commands": [python_command("check.py")]}, checker)
                 assert exhausted["status"] == "failed", exhausted
                 assert exhausted["stop_reason"] == "repair_budget_exhausted", exhausted
                 assert exhausted["verification_attempts"][0]["exit_code"] == 1

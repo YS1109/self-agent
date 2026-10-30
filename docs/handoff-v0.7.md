@@ -1,6 +1,12 @@
 # Self Agent 0.7 开发交接
 
-## 当前跟进状态（2026-10-29 07:54 UTC）
+## PR #1 接手复核（2026-10-30）
+
+已重新获取 main `5b1e5417` 与开发分支 HEAD `33fddb6e`，其 push `40840446627` / PR `40840455181` 均终态 **6/6 成功**。此前 `d8533feb` 失败记录保留于下方历史段。
+
+本轮修复 H5 离线列表/快照/事件流无法自行恢复、恢复后旧通知未清，以及 Python/Chrome 夹具可移植性问题。macOS 本机 Rust **881**、桌面 Rust **27**、前端 **354**、22 个后台 smoke、Web proxy 4 组及真实 Chrome H5 夹具通过。精确范围、原失败、源码入口和未验证项目见 [PR #1 审核报告](review-pr1-2026-10-30.md)。修复提交的新 CI 单独跟踪，不沿用父提交全绿；未合并 main。
+
+## 历史跟进状态（2026-10-29 07:54 UTC）
 
 文档提交 `d8533feb8c82ad6ebff97e28fd4259f52cabdf96` 的 [push 40836552098](https://github.com/YS1109/self-agent/actions/runs/40836552098) / [PR 40836559612](https://github.com/YS1109/self-agent/actions/runs/40836559612) 均终态 **5/6（失败）**：push 的 Ubuntu MCP 夹具把尚未写完的 PID 文件视为就绪；PR 的 Windows PowerShell 夹具未区分冷启动和脚本执行，超过原 10 秒观察期。其它作业均成功。下文 `8a5b980a` 的两轮 6/6 是保留的历史证据，不覆盖这些重复运行暴露的竞态。
 

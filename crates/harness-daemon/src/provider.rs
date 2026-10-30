@@ -310,9 +310,12 @@ async fn execute_inner(
     };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("无法初始化模型服务连接")?;
+        .redirect(reqwest::redirect::Policy::none());
+    // Unit fixtures observe the local transport itself, never a host proxy's
+    // synthetic response or retries. Production keeps the configured proxy.
+    #[cfg(test)]
+    let client = client.no_proxy();
+    let client = client.build().context("无法初始化模型服务连接")?;
     let endpoint = format!(
         "{}/chat/completions",
         settings.base_url.trim_end_matches('/')
@@ -2247,6 +2250,7 @@ mod tests {
 
     #[tokio::test]
     async fn uncertain_transport_leaves_claimed_inputs_unacknowledged_without_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2254,6 +2258,13 @@ mod tests {
             let mut bytes = [0; 8192];
             assert!(connection.read(&mut bytes).await.unwrap() > 0);
             // Close without HTTP headers: delivery is unknown, never "applied".
+            drop(connection);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err(),
+                "Unknown request must not open a second connection"
+            );
         });
         let settings = Settings {
             base_url: format!("http://{address}/v1"),
@@ -2261,13 +2272,15 @@ mod tests {
             provider_source: "manual".into(),
             ..Settings::default()
         };
-        assert!(execute_with_control(
+        let claims = AtomicUsize::new(0);
+        let acknowledgements = AtomicUsize::new(0);
+        let error = execute_with_control(
             &settings,
             &fixture_temp_dir(),
             ExecutionInput {
                 objective: "GOAL",
                 history: &[],
-                config: &ModelContextConfig::default()
+                config: &ModelContextConfig::default(),
             },
             |_| {},
             || false,
@@ -2275,13 +2288,20 @@ mod tests {
             |_| Ok(()),
             None,
             |_| Ok(()),
-            || Ok(vec![supplement("input", "UPDATE")]),
-            |_, _| bail!("Unknown transport must not ACK")
+            || {
+                claims.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![supplement("input", "UPDATE")])
+            },
+            |_, outcome| {
+                acknowledgements.fetch_add(1, Ordering::SeqCst);
+                bail!("Unknown transport must not ACK: {outcome:?}")
+            },
         )
         .await
-        .unwrap_err()
-        .to_string()
-        .contains("请求失败"));
+        .unwrap_err();
+        assert!(error.to_string().contains("请求失败"), "{error:#}");
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
         server.await.unwrap();
     }
 

@@ -25,6 +25,8 @@ wire version 为 `1`，定义见 `harness-core/src/gateway.rs`（由 core 导出
 
 连接、帧、请求并发与浏览器会话有界。无离线 queue。心跳独立于 SQLite 处理。活动设备凭据或 principal 撤销时关闭相关连接/流；所有新请求在 daemon 重新检查实时配置和 ACL。已提交任务的停止与清理状态沿用执行控制协议，不将断开浏览器等同于撤回副作用。
 
+H5 已配对后，会话列表、所选会话快照或 SSE 遇到 `device_offline` / `busy` / `internal` / `outcome_unknown` 或网络中断，以 2 秒间隔仅恢复只读请求；重取权威快照后再订阅其游标。`unauthorized` / `forbidden` / 无效请求不自动重连，切会话、退出或销毁取消旧恢复。有效事件确认后移除本次离线提示；未知命令 ID 与只读回执约束始终保留，恢复在线不重发命令或宣称原命令成功。
+
 ## 浏览器边界
 
 同源 `/gateway/api/`：会话引导、配对/状态、受限 RPC、事件 SSE、退出。响应 `Cache-Control: no-store`；生产 cookie 为 `__Host-`、Path=/、HttpOnly、Secure、SameSite=Strict、不设置 Domain。写请求同时要求精确 Origin 与会话 CSRF；不开放 CORS。显式 fixture 模式仅允许 numeric loopback HTTP，不能作为生产降级。
@@ -49,7 +51,7 @@ wire version 为 `1`，定义见 `harness-core/src/gateway.rs`（由 core 导出
 - H5 原命令未知元数据仅在 sessionStorage 保存 command/session/device/principal ID，不保存目标正文或任何 token。成功回执必须匹配原 command_id；只读未找到或错 ID 不解除未知状态。已失效 cookie 不会继承旧身份的未知命令或权限。
 - nginx 例子对 bootstrap/pair 使用独立入口限速，不对 SSE/普通 RPC 使用该低额度；空限速键不计数。API 无缓存、SSE 无缓冲、mutation 不代理重试。
 
-已运行隔离单元、loopback 与实际主程序本地联合验证；这不等于真实公网/TLS、OS 凭据或原生 GUI 验收。当前 headless Chromium 启动受执行环境沙箱限制，未取得手机截图，也没有以静态 SSR 测试代替真实视觉验证。
+已运行隔离单元、loopback 与实际主程序本地联合验证；这不等于真实公网/TLS、OS 凭据或原生 GUI 验收。原执行环境曾阻止 headless Chromium 启动；2026-10-30 已在 macOS 本机 Chrome 的 390×844 夹具中验证离线恢复、未知命令只读回执和文本转义并检查截图，详见 `review-pr1-2026-10-30.md`。仍未进行真实手机、移动网络或公网部署验证。
 
 ### 已接受的桌面任务输入与撤权
 

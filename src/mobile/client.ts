@@ -24,6 +24,7 @@ export interface MobileApi {
  watch(sessionId:string,after:number,receive:(result:GatewayResult<EventBatch>)=>void,failed:()=>void):()=>void;
 }
 const CODES = new Set<GatewayCode>(["ok","device_offline","outcome_unknown","unauthorized","forbidden","invalid_request","conflict","busy","not_found","cursor_expired","internal"]);
+const RETRYABLE_READ_CODES = new Set<GatewayCode>(["device_offline","busy","internal","outcome_unknown"]);
 export function validId(id:string):boolean{return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);}
 export function inputError(text:string):string|null{return !text.trim()||text.includes("\0")||new TextEncoder().encode(text).length>8192?"请输入非空文本，最多 8192 UTF-8 字节。":null;}
 export const codeMessage=(code:GatewayCode):string=>({ok:"已确认",device_offline:"设备离线，未排队执行。",outcome_unknown:"结果未知；仅检查原命令回执，不自动重发。",unauthorized:"登录或设备凭据已失效，请重新配对。",forbidden:"当前授权不允许此操作，或授权已撤销。",invalid_request:"请求字段无效，未扩大权限。",conflict:"标识或修订冲突，请刷新核对。",busy:"在线请求已达上限；没有加入离线队列。",not_found:"暂未找到记录；这不能证明未知命令永远不会提交。",cursor_expired:"事件游标已失效，正在读取权威快照。",internal:"后台无法确认请求，请检查原命令回执。"})[code];
@@ -71,36 +72,60 @@ const initial=():MobileState=>({session:null,sessions:[],selected:null,snapshot:
  * reconciliation uses the original identity after timeout, Close or refresh. */
 export function createMobileController(api:MobileApi,changed:(state:MobileState)=>void,options:{uuid?:()=>string;storage?:MobileStorage}={}) {
  let state=initial(),disposed=false,epoch=0,readRevision=0,closeStream:(()=>void)|null=null,reconnect:ReturnType<typeof setTimeout>|null=null;
- let cursor=0,refreshingEpoch:number|null=null,refreshAgain=false,restartAgain=false;const observers=new Set<AbortController>();
+ let cursor=0,refreshingEpoch:number|null=null,refreshAgain=false,restartAgain=false,recoveryNotice:string|null=null;const observers=new Set<AbortController>();
  const emit=(patch:Partial<MobileState>)=>{if(disposed)return;state={...state,...patch};changed(state);};
  const observer=()=>{const controller=new AbortController();observers.add(controller);return controller;};
  const runRead=async<T>(f:(signal:AbortSignal)=>Promise<T>)=>{const c=observer();try{return await f(c.signal);}finally{observers.delete(c);}};
  const persist=(value:UnknownCommand|null)=>{try{if(value)options.storage?.setItem(UNKNOWN_KEY,JSON.stringify(value));else options.storage?.removeItem(UNKNOWN_KEY);}catch{/* Memory still keeps the original command; UI never claims durable login. */}};
  function restoreUnknown(session:BrowserSession):UnknownCommand|null {try{const raw=options.storage?.getItem(UNKNOWN_KEY);if(!raw)return null;const value=JSON.parse(raw) as UnknownCommand;if(validId(value.command_id)&&validId(value.session_id)&&value.device_id===session.device_id&&value.principal_id===session.principal_id)return value;}catch{}return null;}
  function stopStream(){closeStream?.();closeStream=null;if(reconnect)clearTimeout(reconnect);reconnect=null;}
+ function recoverRead(viewEpoch:number,notice:string){
+  if(disposed||viewEpoch!==epoch||!state.session?.paired)return;
+  stopStream();
+  recoveryNotice=notice;emit({connected:false,notice});
+  // Refresh authoritative state before resubscribing. This timer never retries
+  // a mutation or clears the original unknown command's reconciliation ID.
+  reconnect=setTimeout(()=>{reconnect=null;if(disposed||viewEpoch!==epoch)return;if(state.selected)void refresh(viewEpoch,true);else void list();},2000);
+ }
  function startStream(viewEpoch:number){
   stopStream();if(disposed||viewEpoch!==epoch||!state.selected||!state.session?.paired)return;
   const sessionId=state.selected;
   closeStream=api.watch(sessionId,cursor,result=>{
    if(disposed||viewEpoch!==epoch)return;
    if(result.code==="cursor_expired"){stopStream();const recoveryEpoch=++epoch;++readRevision;cursor=0;emit({connected:false,notice:codeMessage(result.code)});void refresh(recoveryEpoch,true);return;}
-   if(result.code!=="ok"){stopStream();emit({connected:false,notice:codeMessage(result.code)});return;}
+   if(result.code!=="ok"){if(RETRYABLE_READ_CODES.has(result.code))recoverRead(viewEpoch,codeMessage(result.code));else{stopStream();emit({connected:false,notice:codeMessage(result.code)});}return;}
    const next=result.data?.cursor;if(typeof next!=="number"||!Number.isSafeInteger(next)||next<cursor)return;
-   emit({connected:true});if(next>cursor){cursor=next;void refresh(viewEpoch,false);}
-  },()=>{if(disposed||viewEpoch!==epoch)return;emit({connected:false,notice:"连接中断；任务仍由本机后台保存。正在只读恢复事件。"});reconnect=setTimeout(()=>startStream(viewEpoch),2000);});
+   emit({connected:true,...(state.notice===recoveryNotice?{notice:state.unknown?codeMessage("outcome_unknown"):""}:{})});recoveryNotice=null;if(next>cursor){cursor=next;void refresh(viewEpoch,false);}
+  },()=>recoverRead(viewEpoch,"连接中断；任务仍由本机后台保存。正在只读恢复事件。"));
  }
  async function refresh(viewEpoch=epoch,restart=false):Promise<void>{
   if(!state.selected||!state.session?.paired||viewEpoch!==epoch)return;
   if(refreshingEpoch===viewEpoch){refreshAgain=true;restartAgain ||=restart;return;}refreshingEpoch=viewEpoch;refreshAgain=false;restartAgain=false;const selected=state.selected,revision=++readRevision;
   try{const result=await runRead(signal=>api.rpc<SessionSnapshot>({type:"session",session_id:selected},signal));if(disposed||viewEpoch!==epoch||revision!==readRevision)return;
-   if(result.code!=="ok"||!result.data){stopStream();emit({notice:codeMessage(result.code),connected:false});return;}
+   if(result.code!=="ok"||!result.data){if(RETRYABLE_READ_CODES.has(result.code))recoverRead(viewEpoch,codeMessage(result.code));else{stopStream();emit({notice:codeMessage(result.code),connected:false});}return;}
    if(result.data.session.id!==selected||!Number.isSafeInteger(result.data.cursor)||result.data.cursor<0)throw new Error();
    cursor=Math.max(cursor,result.data.cursor);emit({snapshot:result.data});if(restart)startStream(viewEpoch);
-  }catch{if(!disposed&&viewEpoch===epoch)emit({notice:"暂时无法读取会话，未发送执行命令。",connected:false});}
+  }catch{if(!disposed&&viewEpoch===epoch&&revision===readRevision)recoverRead(viewEpoch,"暂时无法读取会话，正在只读恢复；未发送执行命令。");}
   finally{if(refreshingEpoch===viewEpoch){refreshingEpoch=null;if(refreshAgain&&!disposed){const nextRestart=restartAgain;refreshAgain=false;restartAgain=false;void refresh(epoch,nextRestart);}}}
  }
  async function select(id:string){if(!validId(id)||!state.sessions.some(s=>s.id===id))return;stopStream();epoch++;readRevision++;cursor=0;emit({selected:id,snapshot:null,connected:false});await refresh(epoch,true);}
- async function list(){const viewEpoch=epoch;const result=await runRead(signal=>api.rpc<{sessions:SessionSummary[]}>({type:"sessions"},signal));if(disposed||viewEpoch!==epoch)return;if(result.code==="ok"&&result.data){emit({sessions:result.data.sessions});if(!state.selected&&result.data.sessions[0])await select(result.data.sessions[0].id);}else emit({notice:codeMessage(result.code)});}
+ async function list(){
+  const viewEpoch=epoch;
+  try{
+   const result=await runRead(signal=>api.rpc<{sessions:SessionSummary[]}>({type:"sessions"},signal));
+   if(disposed||viewEpoch!==epoch)return;
+   if(result.code==="ok"&&result.data){
+    emit({sessions:result.data.sessions});
+    if(!state.selected&&result.data.sessions[0])await select(result.data.sessions[0].id);
+   }else if(RETRYABLE_READ_CODES.has(result.code)){
+    recoverRead(viewEpoch,codeMessage(result.code));
+   }else{
+    stopStream();emit({notice:codeMessage(result.code),connected:false});
+   }
+  }catch{
+   if(!disposed&&viewEpoch===epoch)recoverRead(viewEpoch,"暂时无法读取会话列表，正在只读恢复；未发送执行命令。");
+  }
+ }
  async function open(){const current=++epoch;try{const result=await runRead(signal=>api.session(signal));if(disposed||current!==epoch)return;if(result.code!=="ok"||!result.data){emit({notice:codeMessage(result.code)});return;}emit({session:result.data,unknown:restoreUnknown(result.data),notice:result.data.paired?"":"请使用本机签发的配对码。网关重启后需要重新配对。"});if(result.data.paired)await list();}catch{if(!disposed&&current===epoch)emit({notice:"无法连接自托管网关。没有向设备发送命令。"});}}
  async function pair(body:{device_id:string;code:string;label:string}){
   if(state.busy||state.session?.paired||!validId(body.device_id)||!/^[0-9a-f]{64}$/.test(body.code)||!body.label.trim()||body.label.length>80)return;

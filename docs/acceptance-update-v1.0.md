@@ -1,6 +1,12 @@
 # 1.0 本机签名校验、暂存与兼容切片验收
 
-## 当前跟进状态（2026-10-29 07:54 UTC）
+## PR #1 接手复核（2026-10-30）
+
+`33fddb6e` 的 push `40840446627` / PR `40840455181` 已核验为双轮 **6/6 成功**，下方失败为历史。macOS 本机已重新通过完整 Rust、实际 update 4 组、package 4 组及 6 项 package self-test；完整桌面 crate check/27 项测试亦通过。详细固定范围、失败和未验证项见 [审核报告](review-pr1-2026-10-30.md)。
+
+本轮没有生产信任源、真实系统凭据、签名或安装；verification-only 边界不变。H5/夹具修复后的新精确 CI 单独跟踪，不借父提交结果。
+
+## 历史跟进状态（2026-10-29 07:54 UTC）
 
 文档提交 `d8533feb8c82ad6ebff97e28fd4259f52cabdf96` 的 [push 40836552098](https://github.com/YS1109/self-agent/actions/runs/40836552098) / [PR 40836559612](https://github.com/YS1109/self-agent/actions/runs/40836559612) 均终态 **5/6（失败）**：push 的 Ubuntu MCP 夹具把尚未写完的 PID 文件视为就绪；PR 的 Windows PowerShell 夹具未区分冷启动和脚本执行，超过原 10 秒观察期。其它作业均成功。下文 `8a5b980a` 的两轮 6/6 是保留的历史证据，不覆盖这些重复运行暴露的竞态。
 

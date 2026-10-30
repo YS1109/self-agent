@@ -8,6 +8,80 @@ function deferred<T>(){let resolve!:(v:T)=>void,reject!:(v?:unknown)=>void;const
 function fixture(){const watchers:{session:string;after:number;receive:(r:GatewayResult<EventBatch>)=>void;failed:()=>void;closed:boolean}[]=[];const values=new Map<string,string>();const api:MobileApi={session:vi.fn().mockResolvedValue({code:"ok",data:browser}),pair:vi.fn(),pairStatus:vi.fn(),logout:vi.fn().mockResolvedValue({code:"ok"}),rpc:vi.fn().mockImplementation(async(rpc:MobileRpc)=>rpc.type==="sessions"?{code:"ok",data:{sessions:[{id:SESSION,title:"one"},{id:OTHER,title:"two"}]}}:rpc.type==="session"?{code:"ok",data:snapshot(rpc.session_id)}:{code:"ok",data:{command_id:COMMAND,session_id:SESSION,status:"accepted"}}),watch:(session,after,receive,failed)=>{const item={session,after,receive,failed,closed:false};watchers.push(item);return()=>{item.closed=true;};}};const states:MobileState[]=[];const storage={getItem:(k:string)=>values.get(k)??null,setItem:(k:string,v:string)=>{values.set(k,v);},removeItem:(k:string)=>{values.delete(k);}};const controller=createMobileController(api,s=>states.push(s),{uuid:()=>COMMAND,storage});return{api,watchers,values,states,controller,storage};}
 const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
 describe("H5 scoped one-shot controller",()=>{
+ it.each(["device_offline","busy","network"] as const)("recovers an initial %s session list without a command",async failure=>{
+  vi.useFakeTimers();const f=fixture();const base=f.api.rpc;let first=true;
+  f.api.rpc=vi.fn().mockImplementation((rpc:MobileRpc,signal:AbortSignal)=>{
+   if(rpc.type==="sessions"&&first){first=false;return failure==="network"?Promise.reject(new Error("network lost")):Promise.resolve({code:failure});}
+   return base(rpc,signal);
+  });
+  try{
+   await f.controller.open();expect(f.controller.getState().selected).toBeNull();
+   await vi.advanceTimersByTimeAsync(2000);
+   expect(f.controller.getState().snapshot?.session.id).toBe(SESSION);
+   expect(f.watchers).toHaveLength(1);
+   expect(vi.mocked(f.api.rpc).mock.calls.every(c=>c[0].type!=="command")).toBe(true);
+  }finally{f.controller.dispose();vi.useRealTimers();}
+ });
+ it.each(["device_offline","busy","internal"] as const)("recovers %s events through a fresh read without replaying an unknown command",async code=>{
+  vi.useFakeTimers();const f=fixture();
+  try{
+   await f.controller.open();
+   const base=f.api.rpc;
+   f.api.rpc=vi.fn().mockImplementation((rpc:MobileRpc,signal:AbortSignal)=>rpc.type==="command"?Promise.reject(new Error("response lost")):rpc.type==="session"?Promise.resolve({code:"ok",data:snapshot(SESSION,7)}):base(rpc,signal));
+   await f.controller.submit({type:"run",content:"only once"});
+   const old=f.watchers[0];old.receive({code});
+   expect(old.closed).toBe(true);
+   await vi.advanceTimersByTimeAsync(2000);
+   expect(f.controller.getState().snapshot?.cursor).toBe(7);
+   expect(f.watchers.at(-1)?.after).toBe(7);
+   f.watchers.at(-1)!.receive({code:"ok",data:{cursor:7,events:[]}});
+   expect(f.controller.getState().connected).toBe(true);
+   expect(f.controller.getState().notice).toContain("结果未知");
+   expect(f.controller.getState().unknown?.command_id).toBe(COMMAND);
+   expect(vi.mocked(f.api.rpc).mock.calls.filter(c=>c[0].type==="command")).toHaveLength(1);
+  }finally{f.controller.dispose();vi.useRealTimers();}
+ });
+ it("retries a read-only snapshot when the selected device starts offline",async()=>{
+  vi.useFakeTimers();const f=fixture();const base=f.api.rpc;let online=false;
+  f.api.rpc=vi.fn().mockImplementation((rpc:MobileRpc,signal:AbortSignal)=>rpc.type==="session"&&!online?Promise.resolve({code:"device_offline"}):base(rpc,signal));
+  try{
+   await f.controller.open();expect(f.watchers).toHaveLength(0);
+   online=true;await vi.advanceTimersByTimeAsync(2000);
+   expect(f.controller.getState().snapshot?.session.id).toBe(SESSION);
+   expect(f.watchers).toHaveLength(1);
+   f.watchers[0].receive({code:"ok",data:{cursor:0,events:[]}});
+   expect(f.controller.getState().notice).toBe("");
+   expect(vi.mocked(f.api.rpc).mock.calls.every(c=>c[0].type!=="command")).toBe(true);
+  }finally{f.controller.dispose();vi.useRealTimers();}
+ });
+ it("transport recovery refreshes the snapshot and is cancelled on selection changes or disposal",async()=>{
+  vi.useFakeTimers();const f=fixture();
+  try{
+   await f.controller.open();const old=f.watchers[0];old.failed();
+   await f.controller.select(OTHER);const count=vi.mocked(f.api.rpc).mock.calls.length;
+   old.failed();expect(f.watchers.at(-1)?.closed).toBe(false);
+   await vi.advanceTimersByTimeAsync(2000);
+   expect(vi.mocked(f.api.rpc).mock.calls).toHaveLength(count);
+   f.watchers.at(-1)!.failed();
+   await vi.advanceTimersByTimeAsync(2000);
+   expect(vi.mocked(f.api.rpc).mock.calls.at(-1)?.[0]).toEqual({type:"session",session_id:OTHER});
+   expect(f.watchers.at(-1)?.session).toBe(OTHER);
+   f.watchers.at(-1)!.failed();f.controller.dispose();
+   const finalCount=vi.mocked(f.api.rpc).mock.calls.length;
+   await vi.advanceTimersByTimeAsync(4000);
+   expect(vi.mocked(f.api.rpc).mock.calls).toHaveLength(finalCount);
+  }finally{f.controller.dispose();vi.useRealTimers();}
+ });
+ it.each(["unauthorized","forbidden","invalid_request"] as const)("does not reconnect an event stream rejected with %s",async code=>{
+  vi.useFakeTimers();const f=fixture();
+  try{
+   await f.controller.open();const count=vi.mocked(f.api.rpc).mock.calls.length;
+   f.watchers[0].receive({code});await vi.advanceTimersByTimeAsync(6000);
+   expect(f.watchers).toHaveLength(1);
+   expect(vi.mocked(f.api.rpc).mock.calls).toHaveLength(count);
+   expect(f.controller.getState().connected).toBe(false);
+  }finally{f.controller.dispose();vi.useRealTimers();}
+ });
  it("opens through read-only state and never submits a task implicitly",async()=>{const f=fixture();await f.controller.open();expect(f.controller.getState().selected).toBe(SESSION);expect(vi.mocked(f.api.rpc).mock.calls.map(c=>c[0].type)).toEqual(["sessions","session"]);expect(f.watchers[0].after).toBe(0);f.controller.dispose();expect(f.watchers[0].closed).toBe(true);});
  it("double-click/unknown preserves the original ID and only reconciles reads",async()=>{const f=fixture();await f.controller.open();const pending=deferred<GatewayResult>();const base=f.api.rpc;f.api.rpc=vi.fn().mockImplementation((rpc:MobileRpc,signal:AbortSignal)=>rpc.type==="command"?pending.promise:rpc.type==="receipt"?Promise.resolve({code:"not_found"}):base(rpc,signal));const first=f.controller.submit({type:"run",content:"do one thing"});await f.controller.submit({type:"run",content:"duplicate"});expect(vi.mocked(f.api.rpc).mock.calls.filter(c=>c[0].type==="command")).toHaveLength(1);pending.reject(new Error("connection lost"));await first;expect(f.controller.getState().unknown?.command_id).toBe(COMMAND);await f.controller.reconcile();expect(f.controller.getState().unknown?.command_id).toBe(COMMAND);await f.controller.submit({type:"run",content:"not automatically restarted"});expect(vi.mocked(f.api.rpc).mock.calls.filter(c=>c[0].type==="command")).toHaveLength(1);expect(f.values.size).toBe(1);f.controller.dispose();});
  it("refresh restores only same-principal unknown metadata, never payload or a replay",async()=>{const f=fixture();await f.controller.open();f.api.rpc=vi.fn().mockRejectedValue(new Error());await f.controller.submit({type:"run",content:"SECRET_PROMPT_NOT_STORED"});expect([...f.values.values()].join()).not.toContain("SECRET_PROMPT");f.controller.dispose();const next=createMobileController({...f.api,rpc:vi.fn().mockResolvedValue({code:"ok",data:{sessions:[]}})},()=>{}, {storage:f.storage});await next.open();expect(next.getState().unknown?.command_id).toBe(COMMAND);next.dispose();const different=createMobileController({...f.api,session:vi.fn().mockResolvedValue({code:"ok",data:{...browser,principal_id:OTHER}}),rpc:vi.fn().mockResolvedValue({code:"ok",data:{sessions:[]}})},()=>{},{storage:f.storage});await different.open();expect(different.getState().unknown).toBeNull();different.dispose();});
