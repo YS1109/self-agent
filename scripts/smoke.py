@@ -40,7 +40,10 @@ def wait_for(check, timeout=15, description="condition"):
 
 class Daemon:
     def __init__(self, directory, extra_env=None):
-        self.directory = Path(directory)
+        # A fixture selects its existing directory once, as the owner does.
+        # macOS exposes temporary directories through /var -> /private/var;
+        # the production data-dir guard deliberately refuses linked ancestors.
+        self.directory = Path(directory).resolve()
         self.port = available_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.token = ""
@@ -92,6 +95,19 @@ class Daemon:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
+        if self.log:
+            self.log.close()
+
+    def crash(self):
+        """Deliberately bypass graceful drain for crash-recovery fixtures only.
+
+        Killing the daemon is never evidence that its original side effects
+        settled; the restart assertions must retain interrupted/unknown states.
+        """
+        if self.process is None or self.process.poll() is not None:
+            raise AssertionError("Crash fixture requires a live daemon")
+        self.process.kill()
+        assert self.process.wait(timeout=5) != 0
         if self.log:
             self.log.close()
 

@@ -1,0 +1,12 @@
+.providers-settings { display: grid; gap: 14px; min-width: 0; }
+.provider-heading,.provider-actions { display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap; }
+.provider-heading span { color:var(--secondary);font-size:12px; }
+.provider-card,.provider-editor,.provider-operation { padding:12px;border:1px solid var(--line);background:var(--surface-2);border-radius:10px;min-width:0; }
+.provider-card { display:grid;gap:10px; }
+.provider-fields { display:grid;gap:12px;padding-top:12px; }
+.provider-fields > label { display:grid;gap:6px;font-size:13px;color:var(--secondary); }
+.provider-fields > .execution-checkbox { display:flex; }
+.provider-fields input:not([type="checkbox"]) { padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--ink);width:100%; }
+.provider-card p,.provider-operation p { margin:0;overflow-wrap:anywhere; }
+.provider-notice { padding:10px;background:var(--accent-light);color:var(--accent);border-radius:7px; }
+.provider-operation { margin-top:10px;display:grid;gap:8px; }

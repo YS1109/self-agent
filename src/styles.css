@@ -3001,3 +3001,72 @@ textarea {
   .instruction-scope { gap: 7px; }
   .instruction-scope .select-trigger { max-width: 170px; }
 }
+
+/* 持久化事件：实际回复与工具记录，不展示推测的思考过程。 */
+.event-connection { color: var(--secondary); font-size: 12px; margin-left: auto; }
+.event-connection-connected { color: var(--accent); }
+.message-stream .message-text { border-color: var(--accent-light); }
+.tool-activity { font-size: 13px; color: var(--secondary); margin-top: 12px; min-width: 0; }
+.tool-activity > summary { cursor: pointer; color: var(--ink); display: flex; align-items: center; gap: 7px; }
+.tool-activity > p { margin: 9px 0; line-height: 1.7; }
+.tool-activity-item { border: 1px solid var(--line); border-radius: 6px; padding: 9px 11px; margin: 7px 0; }
+.tool-activity-item > summary { cursor: pointer; display: flex; justify-content: space-between; gap: 12px; overflow-wrap: anywhere; }
+.tool-activity-item > summary > span:last-child { color: var(--accent); flex-shrink: 0; }
+.tool-failed > summary > span:last-child { color: var(--danger); }
+.tool-interrupted > summary > span:last-child { color: var(--secondary); }
+.tool-activity-item pre, .task-stream-detail pre { max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75; font-size: 13px; margin-top: 9px; }
+.task-stream-detail { margin-top: 15px; font-size: 14px; }
+.task-stream-detail summary { cursor: pointer; color: var(--ink); }
+@media (max-width: 760px) { .composer-context { flex-wrap: wrap; } .event-connection { margin-left: 0; } }
+.context-state { border-left: 2px solid var(--accent); padding: 8px 10px; margin-top: 13px; font-size: 13px; line-height: 1.7; color: var(--secondary); }
+.context-state strong { color: var(--ink); font-weight: 500; }
+.context-state p { margin-top: 4px; overflow-wrap: anywhere; }
+.task-usage { margin-top: 9px; color: var(--secondary); font-size: 12px; line-height: 1.7; }
+
+/* P1 controls remain neutral gray/blue; statuses do not imply model compliance. */
+.input-routing { margin-bottom: 8px; display: grid; gap: 7px; }
+.input-route-options { display: flex; gap: 6px; }
+.input-routing .help-text { margin: 0; overflow-wrap: anywhere; }
+.input-routing .select-trigger { max-width: 100%; }
+.task-context, .task-supplements, .continue-task { margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); font-size: 12px; }
+.task-context p, .task-supplements p, .continue-task p { line-height: 1.6; }
+.task-supplements h3, .continue-task h3, .changes-report h3 { margin: 5px 0 10px; font-size: 13px; }
+.supplement-item { padding: 10px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.supplement-item p { white-space: pre-wrap; margin: 5px 0; }
+.supplement-item small { color: var(--muted); }
+.continue-task textarea { width: 100%; margin: 8px 0; resize: vertical; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+.changes-report { margin-top: 14px; font-size: 12px; }
+.changes-notice, .changes-warning { border-left: 2px solid var(--accent); padding: 8px 10px; line-height: 1.7; }
+.changes-file, .changes-git, .changes-skipped { border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin: 10px 0; }
+.changes-report summary { cursor: pointer; overflow-wrap: anywhere; }
+.changes-file summary span { margin-right: 8px; }
+.changes-git ul, .changes-skipped ul { padding-left: 16px; }
+.changes-git li, .changes-skipped li { overflow-wrap: anywhere; margin: 6px 0; }
+.changes-git li span { display: block; color: var(--muted); }
+.changes-diff { overflow: auto; max-height: 420px; padding: 10px; background: var(--surface); white-space: pre; font-size: 11px; border-radius: 4px; }
+
+.execution-settings, .task-execution-details { margin: 16px 0; border: 1px solid var(--line); border-radius: 9px; padding: 13px; }
+.execution-settings h3, .task-execution-details h3, .execution-request h3 { font-size: 14px; margin: 0 0 10px; }
+.execution-budget-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }
+.execution-settings label { display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
+.execution-settings input[type="number"], .execution-settings textarea, .execution-request textarea { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); }
+.execution-settings textarea, .execution-request textarea { resize: vertical; }
+.execution-settings small { color: var(--muted); }
+.execution-permissions { display: grid; gap: 10px; margin: 14px 0; }
+.execution-settings label.execution-checkbox, label.execution-checkbox { display: flex; flex-direction: row; align-items: center; gap: 8px; margin: 10px 0; font-size: 12px; }
+.execution-checkbox input { width: 15px; height: 15px; accent-color: var(--accent); }
+.execution-warning { font-size: 12px; line-height: 1.7; padding: 8px 10px; background: var(--accent-light); border-left: 2px solid var(--accent); }
+.next-execution-controls { margin: 8px 0; font-size: 12px; max-height: 45vh; overflow-y: auto; }
+.next-execution-controls summary, .execution-requests summary { cursor: pointer; padding: 5px 0; }
+.execution-request { margin: 14px 0; padding: 14px; border: 1px solid var(--accent); border-radius: 9px; background: var(--surface); font-size: 13px; }
+.execution-request-prompt, .execution-answer { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.execution-request .help-text, .execution-digest { overflow-wrap: anywhere; font-size: 11px; }
+.execution-action, .verification-attempt pre { overflow: auto; max-height: 260px; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; background: var(--surface-2); font-size: 11px; border-radius: 5px; }
+.execution-request-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.task-budget-list { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px; }
+.task-budget-list dt { color: var(--muted); }.task-budget-list dd { margin: 0; }
+.verification-attempt { border-top: 1px solid var(--line); padding: 9px 0; font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 760px) { .execution-budget-fields { grid-template-columns: 1fr; } }
+
+.execution-cleanup { margin: 10px 0; padding: 9px 11px; border-left: 2px solid var(--accent); background: var(--accent-light); font-size: 12px; line-height: 1.6; text-align: left; }
+.execution-cleanup p { margin: 5px 0; }.execution-cleanup small { color: var(--muted); }

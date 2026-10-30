@@ -1,0 +1,55 @@
+# 示例，不会申请证书或部署。替换域名、证书和静态 H5 目录后自行审查。
+# Gateway: --db /var/lib/self-agent-gateway/devices.db serve \
+#   --origin https://agent.example.invalid --bind 127.0.0.1:8788
+map $http_upgrade $gateway_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+# Only anonymous bootstrap/pairing consumes this per-client admission bucket.
+# Empty keys are not accounted; established RPC/SSE is not throttled by it.
+map $uri $gateway_admission_key {
+    default "";
+    /gateway/api/session $binary_remote_addr;
+    /gateway/api/pair $binary_remote_addr;
+}
+limit_req_zone $gateway_admission_key zone=gateway_admission:10m rate=6r/m;
+server {
+    listen 443 ssl;
+    server_name agent.example.invalid;
+    ssl_certificate /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+    client_max_body_size 256k;
+    # 不记录请求 URI、配对码、正文、Cookie 或认证头。
+    access_log off;
+    error_log /var/log/nginx/self-agent-gateway-error.log crit;
+    location /gateway/ {
+        limit_req zone=gateway_admission burst=6 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:8788;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $gateway_connection_upgrade;
+        proxy_set_header Host $host;
+        # 应用不信任 forwarded headers 来重建 Origin。
+        proxy_set_header X-Forwarded-Host "";
+        proxy_set_header X-Forwarded-Proto "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_request_buffering on;
+        proxy_next_upstream off;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 10s;
+        send_timeout 10s;
+        add_header Cache-Control "no-store" always;
+        add_header X-Accel-Buffering "no" always;
+    }
+    # H5 构建目录由用户安装；此示例不代理 daemon 的本机 owner API。
+    location / {
+        root /srv/self-agent-h5;
+        try_files $uri $uri/ /mobile.html;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" always;
+    }
+}

@@ -4,7 +4,10 @@ use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::{AppState, Settings};
+use crate::{
+    reliability::lifecycle::{WorkerExit, WorkerKind},
+    AppState, Settings,
+};
 
 const MAX_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
@@ -33,31 +36,51 @@ const SYSTEM_PROMPT: &str = r#"你是本地编程工作台的主 Agent。默认�
 已有失败记录会保留；只有完成的验收节点带有实际成功命令证据时，后台才设置原失败节点的 resolved_by。所有节点已完成或失败已被验收解决，且目标达成，才可 complete。未解决失败、缺少证据时不得虚构成功。"#;
 
 /// The coordinator has its own worker so model latency never occupies a task worker.
-pub fn spawn(state: Arc<AppState>) {
-    tokio::spawn(async move {
+pub fn spawn(state: Arc<AppState>) -> Result<()> {
+    let lifecycle = state.lifecycle.clone();
+    lifecycle.spawn(WorkerKind::Coordinator, async move {
+        let stop = state.lifecycle.signal();
         loop {
-            let claimed = state.store.lock().unwrap().claim_coordinator_job();
+            let claimed = {
+                let mut store = state.store.lock().unwrap();
+                if state.lifecycle.check_locked(&store).is_err() { return WorkerExit::Settled; }
+                store.claim_coordinator_job()
+            };
             match claimed {
                 Ok(Some(job)) => {
                     let job_id = match job["id"].as_str() {
                         Some(id) => id.to_owned(),
                         None => {
                             tracing::error!("主 Agent 作业缺少标识");
-                            continue;
+                            return WorkerExit::Unknown;
                         }
                     };
                     let context = state.store.lock().unwrap().coordinator_context(&job);
                     let settings = state.settings.read().unwrap().clone();
                     let result = match context {
                         Ok(context) => {
-                            let request = execute(&settings, &job, &context);
+                            let request = async {
+                                let effective = if job["execution_mode"] == "demo" {
+                                    settings.clone()
+                                } else {
+                                    crate::capabilities::provider_runtime::coordinator_settings(
+                                        &state, &job_id, &settings,
+                                    )
+                                    .await?
+                                };
+                                execute(&effective, &job, &context).await
+                            };
                             tokio::pin!(request);
                             loop {
                                 tokio::select! {
+                                    _ = stop.cancelled() => break Err(anyhow::anyhow!("后台正在关闭，未应用编排结果")),
                                     result = &mut request => break result,
                                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                                        let active = state.store.lock().unwrap()
-                                            .coordinator_job_active(&job_id).unwrap_or(false);
+                                        let active = {
+                                            let store=state.store.lock().unwrap();
+                                            store.coordinator_job_active(&job_id).unwrap_or(false)
+                                                && store.check_coordinator_provider(&job_id).is_ok()
+                                        };
                                         if !active {
                                             break Err(anyhow::anyhow!("主 Agent 作业已取消或过期"));
                                         }
@@ -67,11 +90,18 @@ pub fn spawn(state: Arc<AppState>) {
                         }
                         Err(_) => Err(anyhow::anyhow!("无法读取主 Agent 的会话上下文")),
                     };
-                    let completed = state
-                        .store
-                        .lock()
-                        .unwrap()
-                        .complete_coordinator_job(&job_id, result);
+                    let completed = {
+                        let mut store = state.store.lock().unwrap();
+                        if state.lifecycle.check_locked(&store).is_err() {
+                            match store.quiesce_for_shutdown() {
+                                Ok(report) => { for event in report.events { state.publish(event); } }
+                                Err(_) => return WorkerExit::Unknown,
+                            }
+                        }
+                        // Quiescence precedes this late settlement, so no plan,
+                        // dependent child or waiting state can be resurrected.
+                        store.complete_coordinator_job(&job_id, result)
+                    };
                     match completed {
                         Ok(events) => {
                             for event in events {
@@ -79,22 +109,27 @@ pub fn spawn(state: Arc<AppState>) {
                             }
                             state.wake.notify_waiters();
                         }
-                        Err(error) => tracing::error!(%error, "无法保存主 Agent 的处理结果"),
+                        Err(_) => {
+                            tracing::error!("无法确认主 Agent 结果记录；未重放");
+                            return WorkerExit::Unknown;
+                        },
                     }
                 }
                 Ok(None) => {
                     tokio::select! {
+                        _ = stop.cancelled() => return WorkerExit::Settled,
                         _ = state.wake.notified() => {},
                         _ = tokio::time::sleep(Duration::from_millis(250)) => {},
                     }
                 }
-                Err(error) => {
-                    tracing::error!(%error, "无法领取主 Agent 作业");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(_) => {
+                    tracing::error!("无法确认主 Agent 作业领取；停止新工作，未重放");
+                    return WorkerExit::Unknown;
                 }
             }
         }
-    });
+    })?;
+    Ok(())
 }
 
 async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Value> {
@@ -110,8 +145,11 @@ async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Va
         return Ok(demo(kind, context));
     }
     let settings = crate::configuration::resolve(settings)?;
-    let context_text = serde_json::to_string(&json!({"job":job,"context":context}))
-        .context("无法编码主 Agent 会话上下文")?;
+    let context_text = serde_json::to_string(&crate::provider::redact_value(
+        &settings,
+        &json!({"job":job,"context":context}),
+    ))
+    .context("无法编码主 Agent 会话上下文")?;
     if context_text.len() > MAX_CONTEXT_BYTES {
         bail!("会话上下文超过主 Agent 的 512 KiB 预算，请缩小目标或新建会话");
     }
@@ -157,17 +195,8 @@ async fn execute(settings: &Settings, job: &Value, context: &Value) -> Result<Va
         }
         let body: Value = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("主 Agent 模型服务返回了无效 JSON"))?;
-        let mut parsed = parse_response(kind, &body)?;
-        redact(&mut parsed, &settings.api_key);
-        for value in settings.provider_headers.values() {
-            if let Ok(value) = value.to_str() {
-                redact(&mut parsed, value);
-                if let Some(secret) = value.strip_prefix("Bearer ") {
-                    redact(&mut parsed, secret);
-                }
-            }
-        }
-        Ok(parsed)
+        let parsed = parse_response(kind, &body)?;
+        Ok(crate::provider::redact_value(&settings, &parsed))
     })
     .await
     .map_err(|_| anyhow::anyhow!("主 Agent 模型请求超过 120 秒，请重试或调整模型服务"))?
@@ -293,6 +322,7 @@ fn required_text(value: &Value, field: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn redact(value: &mut Value, secret: &str) {
     if secret.is_empty() {
         return;
@@ -497,5 +527,41 @@ mod tests {
         .to_string();
         assert!(error.contains("512 KiB"));
         assert!(!error.contains("secret-credential"));
+    }
+    #[tokio::test]
+    async fn coordinator_redacts_semantic_context_before_json_escaping() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        let secret = "coordinator\"\\private-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app=Router::new().route("/chat/completions",post(move |headers:HeaderMap,Json(body):Json<Value>| async move {
+            assert_eq!(headers["authorization"],format!("Bearer {secret}"));
+            let context=body["messages"][1]["content"].as_str().unwrap();
+            let value:Value=serde_json::from_str(context).unwrap();
+            assert_eq!(value["job"]["content"],"[凭证已隐藏]");
+            assert_eq!(value["context"]["messages"][0]["content"],"[凭证已隐藏]");
+            assert!(!value["context"].as_object().unwrap().contains_key(secret));
+            Json(json!({"choices":[{"message":{"content":json!({"action":"reply","message":secret}).to_string()}}]}))
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let settings = Settings {
+            base_url: base,
+            model: "fixture".into(),
+            api_key: secret.into(),
+            provider_source: "manual".into(),
+            ..Settings::default()
+        };
+        let reply = execute(
+            &settings,
+            &json!({"kind":"message","content":secret}),
+            &json!({secret:"hidden key","messages":[{"role":"user","content":secret}]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["message"], "[凭证已隐藏]");
+        server.abort();
+        let _ = server.await;
     }
 }

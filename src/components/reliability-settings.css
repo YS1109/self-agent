@@ -1,0 +1,15 @@
+.reliability-settings { display: grid; gap: 14px; min-width: 0; }
+.reliability-settings h3, .reliability-settings h4, .reliability-settings p { margin: 0; }
+.reliability-actions, .reliability-lookup { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.reliability-actions > span { color: var(--secondary); font-size: 13px; }
+.reliability-fields { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.reliability-fields > label:not(.execution-checkbox), .reliability-lookup > label { display: grid; gap: 6px; font-size: 13px; color: var(--secondary); }
+.reliability-fields input:not([type="checkbox"]), .reliability-lookup input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); }
+.reliability-notice { padding: 10px; border-radius: 7px; background: var(--accent-light); color: var(--accent); }
+.reliability-history { display: grid; gap: 10px; max-height: 420px; overflow: auto; }
+.reliability-receipt { display: grid; gap: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface-2); }
+.reliability-receipt dl { margin: 0; display: grid; gap: 5px; }
+.reliability-receipt dt { font-size: 12px; color: var(--secondary); }
+.reliability-receipt dd { margin: 0; }
+.reliability-settings code { overflow-wrap: anywhere; }
+.reliability-diagnostic { margin: 0; overflow: auto; max-height: 400px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }

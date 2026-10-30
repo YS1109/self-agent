@@ -1,3 +1,15 @@
+import { LifecycleSettings } from "./components/lifecycle-settings";
+import { lifecycleClient } from "./api";
+import {GatewaySettings} from "./components/gateway-settings";
+import {EMPTY_GATEWAY} from "./gateway-client";
+import { HistoryBrowser, HistoryTaskView } from "./components/history-browser";
+import type { HistoryKind } from "./history-client";
+import { ReliabilitySettings } from "./components/reliability-settings";
+import { UpdatesSettings } from "./components/updates-settings";
+import {QqSettings} from "./components/qq-settings";
+import {EMPTY_QQ} from "./qq-client";
+import { EMPTY_PROVIDERS, namedModelRequest } from "./providers-client";
+import { ProvidersSettings } from "./components/providers-settings";
 import {
   useEffect,
   useRef,
@@ -45,7 +57,13 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { api, dispatch } from "./api";
+import { api, dispatch, capabilityClient, providersClient, mcpCredentialClient, qqClient, qqCredentialClient, gatewayClient, gatewayCredentialClient, reliabilityClient, historyClient, updatesClient } from "./api";
+import { useDaemonSnapshot } from "./use-daemon-snapshot";
+import { useDaemonStartup } from "./use-daemon-startup";
+import { LiveTaskMessage, ToolActivity, TaskUsage, TaskContext } from "./components/task-stream";
+import { TaskSupplements, ContinueTask } from "./components/task-controls";
+import { TaskChanges } from "./components/task-changes";
+import { canContinue, canSteer, createCommandGate, inputCommand, type InputTarget } from "./task-controls";
 import { PlanPanel } from "./components/plan-panel";
 import { PlanChanges } from "./components/plan-changes";
 import { ExecutionEvidence } from "./components/execution-evidence";
@@ -53,6 +71,11 @@ import { Status } from "./components/status";
 import { AgentSettings, DEFAULT_AGENT, normalizeSettings } from "./components/agent-settings";
 import { QuickModelSelect, useModelCatalog } from "./components/model-select";
 import { ProviderSettings } from "./components/provider-settings";
+import { ExecutionCleanupNotice, ExecutionSettings, TaskExecutionDetails } from "./components/execution-settings";
+import { CapabilitiesSettings, CapabilityScopeSummary } from "./components/capabilities-settings";
+import { EMPTY_CAPABILITIES } from "./capabilities-client";
+import { ExecutionRequests } from "./components/execution-requests";
+import { defaultExecutionControls, controlsForTask, executionControlsError, settingsExecutionError } from "./execution-controls";
 import { ModelContextSettings } from "./components/model-context-settings";
 import { applyUiScale, DEFAULT_UI_SCALE, readUiScale, saveUiScale, UI_SCALE_OPTIONS } from "./ui-preferences";
 import { syncNativeTheme, type AppTheme } from "./theme";
@@ -60,22 +83,21 @@ import { capabilityLabel, eventLabel, kindLabel, localizeSystemText } from "./la
 import { Button } from "./components/ui/button";
 import { Select } from "./components/ui/select";
 import { agentModelLabel } from "./agent-model";
-import { discardCleanPlanDraft, hasUnsavedPlanDraft, selectedSessionPlan, updatePlanLayouts, type PlanDraft, type PlanLayoutDraft } from "./plan-state";
+import { discardCleanPlanDraft, hasUnsavedPlanDraft, updatePlanLayouts, type PlanDraft, type PlanLayoutDraft } from "./plan-state";
 import {
   activeTask,
   DESKTOP_SOURCE,
-  EMPTY_SNAPSHOT,
   REMOTE_SOURCE,
   sameSource,
   type Command,
   type Settings,
-  type Snapshot,
   type SourceContext,
   type TaskRun,
+  type TaskControls,
 } from "./types";
 
 type Panel = "plan" | "changes" | "artifacts" | "task";
-type Modal = "new" | "settings" | "remote" | "capabilities" | null;
+type Modal = "new" | "settings" | "remote" | "capabilities" | "providers" | "qq" | "gateway" | "reliability" | "history" | null;
 const time = (value: string) =>
   new Date(value).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -165,6 +187,7 @@ function TaskCard({
           </span>
         </div>
         {task.agent && <div className="task-model-preset" title={`模型预设：${agentModelLabel(task.agent)}`}>模型预设：{agentModelLabel(task.agent)}</div>}
+        <ExecutionCleanupNotice task={task} />
         {task.steps.length > 0 && (
           <div className="task-progress">
             <span style={{ width: `${(done / task.steps.length) * 100}%` }} />
@@ -194,13 +217,15 @@ function EmptyPanel({
 }
 
 export default function App() {
-  const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
-  const [connected, setConnected] = useState(false);
-  const [checked, setChecked] = useState(false);
-  const [connectionError, setConnectionError] = useState("");
+  const { snapshot, connected, checked, connectionError, eventStatus, recovering, refresh } = useDaemonSnapshot();
+  const startup=useDaemonStartup();
+  const registry = snapshot.managed_capabilities ?? EMPTY_CAPABILITIES;
+  const providers = snapshot.named_providers ?? EMPTY_PROVIDERS;
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState<Modal>(null);
+  const [historyKind, setHistoryKind] = useState<HistoryKind>("sessions");
+  const openHistory = (kind: HistoryKind) => { setHistoryKind(kind); setModal("history"); };
   const [sidebar, setSidebar] = useState(() => window.innerWidth > 760);
   const [panel, setPanel] = useState<Panel | null>(null);
   const [activity, setActivity] = useState(false);
@@ -208,6 +233,9 @@ export default function App() {
   const [planIds, setPlanIds] = useState<Record<string, string>>({});
   const [planDrafts, setPlanDrafts] = useState<Record<string, PlanDraft>>({});
   const [planLayouts, setPlanLayouts] = useState<Record<string, PlanLayoutDraft>>({});
+  const commandGate = useRef(createCommandGate());
+  const [inputTargets, setInputTargets] = useState<Record<string, InputTarget>>({});
+  const [executionDrafts, setExecutionDrafts] = useState<Record<string, TaskControls | undefined>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [settings, setSettings] = useState<Settings>({
     base_url: "",
@@ -231,10 +259,8 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [codexStatus, setCodexStatus] = useState("");
   const [checkingCodex, setCheckingCodex] = useState(false);
-  const quickModels = useModelCatalog(settings.main_executor === "codex" ? { executor: "codex" } : {
-    provider_source: settings.provider_source ?? "manual", base_url: settings.base_url, models_endpoint: settings.models_endpoint ?? "",
-  }, connected && (settings.main_executor === "codex" || !!settings.base_url || settings.provider_source === "local_codex"));
-  const nativeModels = useModelCatalog({ provider_source: settingsForm.provider_source ?? "manual", base_url: settingsForm.base_url, models_endpoint: settingsForm.models_endpoint ?? "", ...(apiKey ? { api_key: apiKey } : {}) }, connected && modal === "settings" && (!!settingsForm.base_url || settingsForm.provider_source === "local_codex"));
+  const quickModels = useModelCatalog(settings.main_executor === "codex" ? {executor:"codex"} : namedModelRequest(settings),connected && (settings.main_executor === "codex" || !!settings.base_url || settings.provider_source === "local_codex" || (settings.provider_source === "named" && !!settings.provider_id)));
+  const nativeModels = useModelCatalog(namedModelRequest(settingsForm,apiKey),connected && modal === "settings" && (!!settingsForm.base_url || settingsForm.provider_source === "local_codex" || (settingsForm.provider_source === "named" && !!settingsForm.provider_id)));
   const codexModels = useModelCatalog({ executor: "codex" }, connected && modal === "settings"
     && settingsForm.codex_binary === settings.codex_binary && (settingsForm.main_executor === "codex" || settingsForm.agents.some((agent) => agent.executor === "codex")));
   const [inputModes, setInputModes] = useState<Record<string, "goal" | "change">>({});
@@ -244,75 +270,75 @@ export default function App() {
     useState<SourceContext>(REMOTE_SOURCE);
   const [remoteReceipt, setRemoteReceipt] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
-  const sessionId = snapshot.selections.find((s) =>
-    sameSource(s.source, DESKTOP_SOURCE),
-  )?.session_id;
-  const session = snapshot.sessions.find((s) => s.id === sessionId);
+  const followScroll = useRef(true);
+  const desktopSelection = snapshot.selections.find(s => sameSource(s.source, DESKTOP_SOURCE));
+  const selectionUnknown = !desktopSelection && !!snapshot.history?.collections.selections?.has_more;
+  const previousSelection = useRef<{ epoch?: string; id?: string }>({});
+  if (previousSelection.current.epoch !== snapshot.history?.anchor) previousSelection.current = { epoch: snapshot.history?.anchor };
+  if (desktopSelection) previousSelection.current.id = desktopSelection.session_id;
+  else if (!selectionUnknown) previousSelection.current.id = undefined;
+  const sessionId = desktopSelection?.session_id ?? (selectionUnknown ? previousSelection.current.id : undefined);
+  const currentSessionId = useRef(sessionId);
+  currentSessionId.current = sessionId;
+  const session = selectionUnknown ? undefined : snapshot.sessions.find((s) => s.id === sessionId);
+  const messageWindow = sessionId ? snapshot.history?.session_messages[sessionId] : undefined;
+  const incomplete = Object.values(snapshot.history?.collections ?? {}).some(meta => meta.has_more);
+  const pendingUnloaded = snapshot.history?.collections.execution_requests?.pending ?? 0;
   const tasks = snapshot.tasks.filter((t) => t.session_id === sessionId);
   const plans = (snapshot.plans ?? []).filter((p) => p.session_id === sessionId);
-  const selectedPlan = selectedSessionPlan(snapshot.plans, sessionId, planIds);
+  const explicitPlanId = sessionId ? planIds[sessionId] : undefined;
+  const selectedPlan = explicitPlanId ? plans.find(plan => plan.id === explicitPlanId) : plans[0];
   const planId = selectedPlan?.id;
   const selectPlan = (id: string) => {
     if (sessionId) setPlanIds((current) => ({ ...current, [sessionId]: id }));
   };
-  const selectedTask = tasks.find((t) => t.id === taskId) ?? tasks[0];
+  const selectedTask = taskId ? tasks.find((t) => t.id === taskId) : tasks[0];
   const running = snapshot.tasks.filter(
     (t) => t.task_kind !== "plan" && ["queued", "running"].includes(t.status),
   );
   const draftKey = sessionId ?? "new";
   const draft = drafts[draftKey] ?? "";
+  const executionDraft = executionDrafts[draftKey];
+  const sessionRequests = (snapshot.execution_requests ?? []).filter(request => request.session_id === sessionId);
+  const pendingRequestCount = sessionRequests.filter(request => request.status === "pending").length;
+  const inputTarget = inputTargets[draftKey] ?? { mode: "queue" as const };
+  const steerableTasks = tasks.filter(canSteer);
+  const currentRunningTask = tasks.find(task => task.task_kind === "main" && task.status === "running");
+  const steeringTask = inputTarget.mode === "steer" ? tasks.find(task => task.id === inputTarget.taskId) : undefined;
+  const steeringUnavailable = inputTarget.mode === "steer" && !canSteer(steeringTask);
   const events = snapshot.events.filter(
     (e) => !sessionId || e.session_id === sessionId,
   );
-  const remoteSelection =
-    snapshot.selections.find((s) => sameSource(s.source, remoteSource))
-      ?.session_id ?? "";
-  const remoteKey = `${remoteSource.channel_id}:${remoteSource.actor_id}:${remoteSource.conversation_id}:${remoteSelection}`;
-  const remotePlans = snapshot.plans.filter((item) => item.session_id === remoteSelection);
-  const remotePlan = remotePlans.find((item) => item.id === remotePlanIds[remoteKey]) ?? remotePlans[0];
+  const remoteSourceKey = `${remoteSource.channel_id}:${remoteSource.actor_id}:${remoteSource.conversation_id}`;
+  const remoteSelectionRow = snapshot.selections.find(s => sameSource(s.source, remoteSource));
+  const remoteSelectionUnknown = !remoteSelectionRow && !!snapshot.history?.collections.selections?.has_more;
+  const previousRemoteSelections = useRef<{ epoch?: string; ids: Record<string, string> }>({ ids: {} });
+  if (previousRemoteSelections.current.epoch !== snapshot.history?.anchor) previousRemoteSelections.current = { epoch: snapshot.history?.anchor, ids: {} };
+  if (remoteSelectionRow) previousRemoteSelections.current.ids[remoteSourceKey] = remoteSelectionRow.session_id;
+  else if (!remoteSelectionUnknown) delete previousRemoteSelections.current.ids[remoteSourceKey];
+  const remoteSelection = remoteSelectionRow?.session_id ?? (remoteSelectionUnknown ? previousRemoteSelections.current.ids[remoteSourceKey] ?? "" : "");
+  const remoteKey = `${remoteSourceKey}:${remoteSelection}`;
+  const remotePlans = snapshot.plans.filter(item => item.session_id === remoteSelection);
+  const explicitRemotePlanId = remotePlanIds[remoteKey];
+  const remotePlan = remoteSelectionUnknown ? undefined : explicitRemotePlanId ? remotePlans.find(item => item.id === explicitRemotePlanId) : remotePlans[0];
   const remoteMode = inputModes[remoteKey] ?? "goal";
   const currentRemoteText = remoteDrafts[remoteKey] ?? "";
   const changeable = (status?: string) => !!status && ["draft", "running", "paused", "reviewing", "waiting_input"].includes(status);
 
-  async function refresh() {
-    try {
-      const value = await api<Snapshot>("GET", "/snapshot");
-      setSnapshot({ ...value, plans: value.plans ?? [], plan_changes: value.plan_changes ?? [] });
-      setConnected(true);
-      setConnectionError("");
-    } catch (error) {
-      setConnected(false);
-      setConnectionError(errorMessage(error));
-    } finally {
-      setChecked(true);
-    }
-  }
-  useEffect(() => {
-    let alive = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      if (!alive) return;
-      await refresh();
-      if (alive) timer = setTimeout(poll, 1500);
-    };
-    void poll();
-    return () => {
-      alive = false;
-      clearTimeout(timer);
-    };
-  }, []);
   useEffect(() => {
     if (connected)
       api<Settings>("GET", "/settings")
         .then((value) => setSettings(normalizeSettings(value)))
         .catch(() => {});
   }, [connected]);
+  const previousModal = useRef<Modal>(null);
   useEffect(() => {
-    if (modal === "settings") {
+    if (modal === "settings" && previousModal.current !== "providers") {
       setSettingsForm(settings);
       setApiKey("");
       setCodexStatus("");
     }
+    previousModal.current = modal;
   }, [modal]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -344,6 +370,10 @@ export default function App() {
         behavior: "smooth",
       });
   }, [sessionId, session?.messages.length, tasks.length]);
+  const liveTextLength = tasks.filter(task => activeTask(task.status)).reduce((length, task) => length + (task.stream_output?.length ?? 0), 0);
+  useEffect(() => {
+    if (followScroll.current && scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [liveTextLength, pendingRequestCount]);
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key === "n") {
@@ -365,22 +395,24 @@ export default function App() {
       setNotice("该计划在桌面还有未保存的结构修改，请先保存或重新加载草稿，再应用调整建议。");
       return undefined;
     }
-    setBusy(true);
-    setNotice("");
-    try {
-      const receipt = await dispatch(source, value);
-      if (applyingPlan) {
-        setPlanDrafts((current) => discardCleanPlanDraft(applyingPlan, current));
-        setPlanLayouts((current) => updatePlanLayouts(applyingPlan, applyingPlan.nodes, current, current[applyingPlan.id]));
+    return commandGate.current.run(async () => {
+      setBusy(true);
+      setNotice("");
+      try {
+        const receipt = await dispatch(source, value);
+        if (applyingPlan) {
+          setPlanDrafts((current) => discardCleanPlanDraft(applyingPlan, current));
+          setPlanLayouts((current) => updatePlanLayouts(applyingPlan, applyingPlan.nodes, current, current[applyingPlan.id]));
+        }
+        await refresh();
+        return receipt;
+      } catch (error) {
+        setNotice(errorMessage(error));
+        return undefined;
+      } finally {
+        setBusy(false);
       }
-      await refresh();
-      return receipt;
-    } catch (error) {
-      setNotice(errorMessage(error));
-      return undefined;
-    } finally {
-      setBusy(false);
-    }
+    });
   }
   async function createSession(event: FormEvent) {
     event.preventDefault();
@@ -397,22 +429,33 @@ export default function App() {
     }
   }
   async function send() {
-    if (!session || !draft.trim()) return;
+    if (!session || !draft.trim() || busy || !connected) return;
     const key = draftKey;
-    const receipt = await command({ type: "run_agent", session_id: session.id, content: draft.trim() });
+    let value: Command;
+    try {
+      value = inputCommand(session.id, inputTarget, draft, tasks);
+      if (value.type === "run_agent" && executionDraft) value = { ...value, controls: controlsForTask(executionDraft, settings.main_executor ?? "native") };
+    }
+    catch (error) { setNotice(errorMessage(error)); return; }
+    const receipt = await command(value);
     if (receipt) {
       setDrafts((old) => old[key] === draft ? { ...old, [key]: "" } : old);
-      if (receipt.task_id) setTaskId(receipt.task_id);
+      if (value.type === "run_agent" && executionDraft) setExecutionDrafts(current => current[key] === executionDraft ? { ...current, [key]: undefined } : current);
+      if (receipt.task_id && currentSessionId.current === session.id) setTaskId(receipt.task_id);
+      if (receipt.supplement_id) setNotice(`补充已接收 · ${receipt.supplement_id.slice(0, 8)}，等待执行器应用；接收不代表已生效。`);
     }
   }
   async function saveSettings(event: FormEvent) {
     event.preventDefault();
+    const controlsError = settingsExecutionError(settingsForm);
+    if (controlsError) { setNotice(controlsError); return; }
     setBusy(true);
     setNotice("");
     try {
       const value = await api<Settings>("PUT", "/settings", {
         base_url: settingsForm.base_url,
         provider_source: settingsForm.provider_source ?? "manual",
+        provider_id: settingsForm.provider_id ?? null,
         model: settingsForm.model,
         execution_mode: settingsForm.execution_mode,
         agents: settingsForm.agents,
@@ -421,7 +464,8 @@ export default function App() {
         main_executor: settingsForm.main_executor ?? "native",
         models_endpoint: settingsForm.models_endpoint ?? "",
         model_contexts: settingsForm.model_contexts ?? {},
-        ...(apiKey ? { api_key: apiKey } : {}),
+        execution_controls: settingsForm.execution_controls ?? defaultExecutionControls(),
+        ...(apiKey && settingsForm.provider_source !== "named" ? { api_key: apiKey } : {}),
       });
       setSettings(normalizeSettings(value));
       setApiKey("");
@@ -447,7 +491,7 @@ export default function App() {
     }
   }
   async function remoteSend(run: boolean) {
-    if (!currentRemoteText.trim() || !remoteSelection) return;
+    if (!currentRemoteText.trim() || !remoteSelection || remoteSelectionUnknown) return;
     if (!run && remoteMode === "change" && (!remotePlan || !changeable(remotePlan.status))) return;
     const key = remoteKey;
     const receipt = await command(
@@ -513,8 +557,9 @@ export default function App() {
         </Button>
         <div className="sidebar-section">
           <span>工作空间</span>
-          <span className="count-label">{snapshot.sessions.length}</span>
+          <span className="count-label">{snapshot.sessions.length}{snapshot.history && ` / ${snapshot.history.collections.sessions?.total ?? snapshot.sessions.length}`}</span>
         </div>
+        <Button variant="ghost" onClick={() => openHistory("sessions")}>浏览完整历史（分页）</Button>
         <nav className="session-list">
           {groups.map((path) => (
             <div className="project-group" key={path}>
@@ -577,6 +622,9 @@ export default function App() {
               {snapshot.capabilities.filter((c) => c.enabled).length}
             </span>
           </button>
+          <button className="sidebar-link" onClick={() => setModal("reliability")}><ShieldCheck size={16}/><span>备份与诊断</span></button>
+          <button className="sidebar-link" onClick={() => setModal("gateway")}><Radio size={16}/><span>自托管网关 / H5</span></button>
+          <button className="sidebar-link" onClick={() => setModal("qq")}><Radio size={16}/><span>QQ 官方应用</span></button>
           <button className="sidebar-link" onClick={() => setModal("remote")}>
             <Radio size={16} />
             <span>远程入口</span>
@@ -618,7 +666,7 @@ export default function App() {
             )}
             <span className="breadcrumb">工作空间</span>
             <ChevronRight size={12} />
-            <strong>{session?.title ?? "新的开始"}</strong>
+            <strong>{session?.title ?? (sessionId || selectionUnknown ? "所选会话尚未载入" : "新的开始")}</strong>
             {session && (
               <span className="project-chip">
                 <Folder size={12} />
@@ -629,10 +677,10 @@ export default function App() {
           <div className="topbar-actions">
             <span
               className={`connection ${connected ? "online" : ""}`}
-              title={connectionError || "本机后台已连接"}
+              title={startup.message || connectionError || "本机后台已连接"}
             >
               <span />
-              {connected ? "后台在线" : checked ? "后台离线" : "连接中"}
+              {connected ? "后台在线" : startup.phase === "starting" ? "后台加载中" : checked ? "后台离线" : "连接中"}
             </span>
             <Button
               variant={panel === "plan" ? "secondary" : "ghost"}
@@ -653,11 +701,11 @@ export default function App() {
             </button>
           </div>
         )}
-        {checked && !connected && (
+        {!connected && (checked || startup.phase !== "idle") && (
           <div className="offline-banner" role="status">
             <WifiOff size={14} />
             <span>
-              {connectionError || "连接后台失败。重新连接后可以继续操作。"}
+              {startup.message || connectionError || "连接后台失败。重新连接后可以继续操作。"}
             </span>
             <button onClick={() => void refresh()}>
               <RefreshCw size={12} />
@@ -665,10 +713,18 @@ export default function App() {
             </button>
           </div>
         )}
+        {recovering && <p className="help-text" role="status">实时窗口已达到缓存预算，正在获取权威快照；未继续拼接缺失的回复增量。</p>}
+        {incomplete && <section className="help-text" aria-label="历史窗口提示"><p>这里只显示有界最近窗口，不是完整历史。已载入任务 {snapshot.tasks.length} / {snapshot.history?.collections.tasks?.total ?? snapshot.tasks.length}；未载入的活动任务 {snapshot.history?.collections.tasks?.pending ?? 0}。</p><Button size="small" variant="ghost" onClick={() => openHistory("tasks")}>分页查看任务历史</Button></section>}
+        {pendingUnloaded > 0 && <p role="status">还有 {pendingUnloaded} 条待处理问题或授权未载入，不能视为没有待批准。<button onClick={() => openHistory("execution_requests")}>只读查看问题与授权历史</button></p>}
         <div className="main-content">
           <div className="conversation">
-            <div className="conversation-scroll" ref={scrollRef}>
-              {!session ? (
+            <div className="conversation-scroll" ref={scrollRef} onScroll={() => {
+              const area = scrollRef.current;
+              if (area) followScroll.current = area.scrollHeight - area.scrollTop - area.clientHeight < 100;
+            }}>
+              {!session && (sessionId || selectionUnknown) ? (
+                <section className="conversation-empty"><h2>{selectionUnknown ? "当前会话选择未载入" : "所选会话未载入当前窗口"}</h2><p>没有切换到其他会话，也不把窗口缺失解释为会话不存在。请显式选择历史会话或刷新。</p>{sessionId && <code>{sessionId}</code>}<Button onClick={() => openHistory("sessions")}>浏览并选择会话</Button><Button variant="ghost" onClick={() => void refresh()}>只读刷新</Button></section>
+              ) : !session ? (
                 <section className="welcome">
                   <div className="welcome-emblem">
                     <Waypoints size={36} strokeWidth={1.3} />
@@ -737,7 +793,8 @@ export default function App() {
                       · 主智能体 会话
                     </span>
                   </div>
-                  {!session.messages.length && !tasks.length && (
+                  {messageWindow && (messageWindow.has_more_before || !!messageWindow.unavailable?.length) && <section className="help-text" aria-label="消息窗口提示"><p>当前载入 {session.messages.length} / {messageWindow.total} 条消息，起始位置 {messageWindow.offset}；更早或超限内容未载入，不表示历史丢失。</p><Button size="small" variant="ghost" onClick={() => openHistory("messages")}>分页查看更早消息</Button></section>}
+                  {!session.messages.length && !tasks.length && !(messageWindow?.total || snapshot.history?.collections.tasks?.has_more) && (
                     <div className="conversation-empty">
                       <Sparkles size={20} />
                       <p>准备好了，告诉我你的目标。</p>
@@ -771,9 +828,14 @@ export default function App() {
                           )}
                         </div>
                         <div className="message-text">{message.role === "user" ? message.content : localizeSystemText(message.content)}</div>
+                        {message.role === "assistant" && message.task_id && <ToolActivity task={tasks.find(task => task.id === message.task_id)} events={snapshot.events} />}
                       </div>
                     </article>
                   ))}
+                  {tasks.filter(task => task.task_kind === "main" && (task.stream_output || task.status === "running")
+                    && !session.messages.some(message => message.role === "assistant" && message.task_id === task.id))
+                    .slice().reverse().map(task => <LiveTaskMessage key={`stream-${task.id}`} task={task} events={snapshot.events} />)}
+                  <ExecutionRequests requests={sessionRequests} tasks={tasks} disabled={busy || !connected} onCommand={command} />
                   {plans.length > 0 && (
                     <section className="tasks-section">
                       <div className="section-label"><Network size={13} />编排计划<span>{plans.length}</span></div>
@@ -822,7 +884,31 @@ export default function App() {
                     : "准备就绪，随时开始"}
                 </span>
                 {running.length > 0 && <span>主智能体 仍可接收指令</span>}
+                {connected && <span className={`event-connection event-connection-${eventStatus}`} title={eventStatus === "connected" ? "通过持久事件实时更新；断线后自动补发。" : "实时事件暂未连接，仍定期读取权威快照。"}>{eventStatus === "connected" ? "实时更新" : eventStatus === "error" ? "快照更新 · 事件桥暂不可用" : "快照更新 · 正在连接事件"}</span>}
               </div>
+              {session && <div className="input-routing">
+                <div className="input-route-options" role="group" aria-label="指令作用方式">
+                  <Button size="small" variant={inputTarget.mode === "queue" ? "secondary" : "ghost"} disabled={busy} onClick={() => setInputTargets(current => ({ ...current, [draftKey]: { mode: "queue" } }))}>排队下一条</Button>
+                  <Button size="small" variant={inputTarget.mode === "steer" ? "secondary" : "ghost"} disabled={busy || (!steerableTasks.length && inputTarget.mode !== "steer")} onClick={() => {
+                    if (steerableTasks[0]) setInputTargets(current => ({ ...current, [draftKey]: { mode: "steer", taskId: steerableTasks[0].id } }));
+                  }}>补充当前任务</Button>
+                </div>
+                {inputTarget.mode === "steer" ? <>
+                  <Select aria-label="补充目标任务" value={inputTarget.taskId} disabled={busy}
+                    options={[...(steeringUnavailable ? [{ value: inputTarget.taskId, label: `原目标 ${inputTarget.taskId.slice(0, 8)} 已结束或不可用`, disabled: true }] : []),
+                      ...steerableTasks.map(task => ({ value: task.id, label: `${task.status === "running" ? "执行中" : "排队中"} · ${task.id.slice(0, 8)} · ${task.title}` }))]}
+                    onValueChange={taskId => setInputTargets(current => ({ ...current, [draftKey]: { mode: "steer", taskId } }))} />
+                  <p className="help-text">目标会话：{session.title} · 任务：{inputTarget.taskId}。{steeringUnavailable ? "请重新选择目标，或改为排队下一条；不会自动转投新任务。" : "接收后在执行器支持的安全边界应用，不保证立即生效。"}</p>
+                </> : <p className="help-text">目标会话：{session.title} · {session.id.slice(0, 8)}。创建独立主任务，已有任务运行时顺序排队；不会补充当前执行。</p>}
+              </div>}
+              {session && inputTarget.mode === "queue" && <details className="next-execution-controls">
+                <summary>下一条执行预算与权限{executionDraft ? " · 已设置额外限制" : " · 使用后台默认值"}</summary>
+                <label className="execution-checkbox"><input type="checkbox" disabled={busy} checked={!!executionDraft}
+                  onChange={event => setExecutionDrafts(current => ({ ...current, [draftKey]: event.target.checked ? structuredClone(settings.execution_controls ?? defaultExecutionControls()) : undefined }))} />为下一条任务指定更严格限制</label>
+                {executionDraft && <ExecutionSettings registry={registry} value={executionDraft} executor={settings.main_executor ?? "native"} scope="task" disabled={busy}
+                  onChange={value => setExecutionDrafts(current => ({ ...current, [draftKey]: value }))} />}
+                {!executionDraft && <CapabilityScopeSummary registry={registry} value={(settings.execution_controls ?? defaultExecutionControls()).capabilities} label="下一条任务继承的能力范围" />}
+              </details>}
               <div
                 className={`composer ${!session ? "composer-inactive" : ""}`}
               >
@@ -830,7 +916,7 @@ export default function App() {
                   aria-label="向主智能体 发送指令"
                   placeholder={
                     session
-                      ? "告诉主智能体你想做什么，或继续补充当前工作…"
+                      ? inputTarget.mode === "steer" ? "补充所选任务的要求，不会创建下一条任务…" : "输入下一条独立任务，按会话顺序执行…"
                       : "先创建一个会话，开始你的工作…"
                   }
                   value={draft}
@@ -848,8 +934,8 @@ export default function App() {
                 />
                 <div className="composer-toolbar">
                   <div className="composer-options">
-                    <QuickModelSelect value={settings.model} catalog={quickModels} disabled={busy || !connected}
-                      emptyLabel={settings.main_executor === "codex" ? "Codex 本机默认模型" : "请选择模型"}
+                    <QuickModelSelect value={settings.main_executor !== "codex" && settings.provider_source === "named" ? providers.providers.find(provider=>provider.id===settings.provider_id)?.definition.model ?? "" : settings.model} catalog={quickModels} disabled={busy || !connected || (settings.main_executor !== "codex" && settings.provider_source === "named")}
+                      emptyLabel={settings.main_executor === "codex" ? "Codex 本机默认模型" : settings.provider_source === "named" ? "在命名服务中设置默认模型" : "请选择模型"}
                       onChange={(model) => void selectModel(model)} onSettings={() => setModal("settings")} />
                     <span
                       className={`mode-pill ${settings.execution_mode === "demo" ? "mode-demo" : ""}`}
@@ -860,13 +946,15 @@ export default function App() {
                   <div className="composer-submit">
                     <Button
                       size="small"
-                      disabled={!connected || !session || !draft.trim() || busy}
+                      disabled={!connected || !session || !draft.trim() || busy || steeringUnavailable || (inputTarget.mode === "queue" && !!executionDraft && !!executionControlsError(executionDraft, settings.main_executor ?? "native"))}
                       onClick={() => void send()}
                       title="主智能体直接处理（⌘/Ctrl + Enter）"
                     >
                       <ArrowUp size={14} />
-                      <span>发送</span>
+                      <span>{inputTarget.mode === "steer" ? "提交补充" : "排队下一条"}</span>
                     </Button>
+                    {currentRunningTask && <Button size="small" variant="danger" disabled={busy || !connected}
+                      onClick={() => void command({ type: "cancel_task", task_id: currentRunningTask.id })} title={`停止任务 ${currentRunningTask.id}`}><Square size={12} />停止当前 · {currentRunningTask.id.slice(0, 8)}</Button>}
                   </div>
                 </div>
               </div>
@@ -916,7 +1004,7 @@ export default function App() {
                   <X size={15} />
                 </button>
               </div>
-              {panel === "plan" ? (
+              {panel === "plan" && explicitPlanId && !selectedPlan ? <div className="task-detail"><p>已选择的计划 {explicitPlanId} 未载入当前窗口；未切换或覆盖其草稿。</p><Button onClick={() => openHistory("plans")}>只读浏览计划历史</Button></div> : panel === "plan" ? (
                 <PlanPanel
                   plans={plans} selectedId={planId} onSelect={selectPlan}
                   connected={connected} busy={busy} onCommand={command}
@@ -924,12 +1012,10 @@ export default function App() {
                   drafts={planDrafts} setDrafts={setPlanDrafts}
                   layouts={planLayouts} setLayouts={setPlanLayouts}
                 />
+              ) : taskId && !selectedTask ? (
+                <div className="task-detail"><p>已选任务未载入当前窗口；仍使用固定目标 {taskId}，不会静默切换其他任务。</p><HistoryTaskView key={`${snapshot.history?.anchor ?? "legacy"}:${taskId}`} client={historyClient} id={taskId} onClose={() => setPanel(null)} onCommand={command} disabled={busy || !connected} /></div>
               ) : panel === "changes" ? (
-                <EmptyPanel
-                  icon={<FileCode2 />}
-                  title="代码更改"
-                  detail="此版本尚未接入结构化差异视图。任务的真实执行记录可在活动面板中查看。"
-                />
+                selectedTask ? <TaskChanges key={selectedTask.id} task={selectedTask} connected={connected} /> : <EmptyPanel icon={<FileCode2 />} title="代码更改" detail="选择一个任务后读取其只读改动报告。" />
               ) : panel === "artifacts" ? (
                 selectedTask?.result ? (
                   <div className="task-detail">
@@ -965,6 +1051,13 @@ export default function App() {
                     <code>{selectedTask.id.slice(0, 8)}</code>
                   </div>
                   {selectedTask.agent && <p className="task-model-preset">模型预设：{agentModelLabel(selectedTask.agent)}</p>}
+                  {(snapshot.context_states ?? []).filter(item => item.session_id === selectedTask.session_id).map(item => (
+                    <div className="context-state" key={item.executor}>
+                      <strong>{item.executor === "native" ? "Native 摘要" : "Codex 会话"} · {({empty:"尚无摘要",available:"可复用",invalidated:"已失效",ready:"已关联",inflight:"回合执行中",idle:"可续接"} as Record<string,string>)[item.state] ?? "状态待确认"}</strong>
+                      {item.reason && <p>{item.reason}</p>}
+                      {item.executor === "native" && item.covered_messages != null && <p>覆盖 {item.covered_messages} 条历史消息；这不是精确 token 计数。</p>}
+                    </div>
+                  ))}
                   <div className="detail-divider" />
                   <div className="section-label">执行步骤</div>
                   <div className="step-list">
@@ -1001,6 +1094,22 @@ export default function App() {
                       </pre>
                     </div>
                   )}
+                  {selectedTask.stream_output && (
+                    <details className="task-stream-detail" open={activeTask(selectedTask.status)}>
+                      <summary>{activeTask(selectedTask.status) ? "实时回复" : "执行过程回复"}</summary>
+                      <pre>{selectedTask.stream_output}</pre>
+                      {selectedTask.stream_output_truncated && <p className="help-text">过程回复已达到保留上限；最终结果与真实命令记录仍可查看。</p>}
+                    </details>
+                  )}
+                  <ToolActivity task={selectedTask} events={snapshot.events} />
+                  <TaskUsage taskId={selectedTask.id} events={snapshot.events} />
+                  <TaskContext task={selectedTask} events={snapshot.events} />
+                  <TaskSupplements task={selectedTask} />
+                  {selectedTask.managed_provider && <section className="task-execution-details"><h4>任务固定模型服务</h4><p>{selectedTask.managed_provider.name} · 修订 {selectedTask.managed_provider.revision}</p><p>模型 {selectedTask.managed_provider.model}</p><p className="help-text">服务选择不证明请求成功；不会因修改配置静默转投其他服务。</p></section>}
+                  <TaskExecutionDetails task={selectedTask} onCleanupResolved={() => void refresh()} disabled={busy || !connected} />
+                  <ExecutionRequests requests={sessionRequests.filter(request => request.task_id === selectedTask.id)} tasks={[selectedTask]} disabled={busy || !connected} onCommand={command} />
+                  {selectedTask.continued_from && <p className="help-text">继续自任务 {selectedTask.continued_from}；这是新的执行，不是原任务重放。</p>}
+                  {canContinue(selectedTask) && <ContinueTask key={selectedTask.id} task={selectedTask} disabled={busy || !connected} onCommand={command} onCreated={id => { if (currentSessionId.current === selectedTask.session_id) setTaskId(id); }} />}
                   <ExecutionEvidence evidence={selectedTask.evidence} />
                   <div className="detail-divider" />
                   <div className="section-label">指令来源 / 回传位置</div>
@@ -1062,6 +1171,7 @@ export default function App() {
                 <X size={14} />
               </Button>
             </div>
+            <p className="help-text">本地最近事件窗口（最多300条、2 MiB），不是完整执行历史；任务详情可读取后台保留记录。</p>
             <div className="activity-lines">
               {events.length ? (
                 events.slice(-80).map((event) => (
@@ -1073,7 +1183,7 @@ export default function App() {
                 ))
               ) : (
                 <div className="activity-empty">
-                  尚无执行记录。任务启动后会在这里显示真实事件。
+                  当前事件窗口没有可展示记录，不代表完整历史没有执行记录。
                 </div>
               )}
             </div>
@@ -1105,6 +1215,9 @@ export default function App() {
         </footer>
       </main>
 
+      <ModalFrame open={modal === "history"} onClose={() => setModal(null)} title="历史浏览" description="只读分页与固定任务详情；不把旧消息合并进实时对话。" wide>
+        {modal === "history" && <HistoryBrowser open client={historyClient} sessionId={sessionId} epoch={snapshot.history?.anchor} initialKind={historyKind} onClose={() => setModal(null)} onCommand={command} disabled={busy || !connected} onSelectSession={async id => { const receipt = await command({ type: "select_session", session_id: id }); if (receipt) setTaskId(undefined); else throw new Error("选择未确认"); }} />}
+      </ModalFrame>
       <ModalFrame
         error={notice}
         open={modal === "new"}
@@ -1219,10 +1332,12 @@ export default function App() {
               )}
             </button>
           </div>
-          <ProviderSettings settings={settingsForm} saved={settings} onChange={setSettingsForm} apiKey={apiKey}
+          <ProviderSettings providers={providers.providers} onManageProviders={()=>{setApiKey("");setModal("providers");}} settings={settingsForm} saved={settings} onChange={setSettingsForm} apiKey={apiKey}
             onKeyChange={setApiKey} catalog={settingsForm.main_executor === "codex" ? codexModels : nativeModels} disabled={busy || !connected} />
-          <ModelContextSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy} catalogs={[nativeModels, codexModels]} />
-          <AgentSettings settings={settingsForm} onChange={setSettingsForm} disabled={busy}
+          <ExecutionSettings registry={registry} value={settingsForm.execution_controls ?? defaultExecutionControls()} executor={settingsForm.main_executor ?? "native"} disabled={busy}
+            onChange={execution_controls => setSettingsForm(current => ({ ...current, execution_controls }))} />
+          <ModelContextSettings providers={providers.providers} settings={settingsForm} onChange={setSettingsForm} disabled={busy} catalogs={[nativeModels, codexModels]} />
+          <AgentSettings providers={providers.providers} registry={registry} settings={settingsForm} onChange={setSettingsForm} disabled={busy}
             nativeModels={nativeModels} codexModels={codexModels} codexPathChanged={settingsForm.codex_binary !== settings.codex_binary} />
           <div className="codex-check">
             <Button type="button" size="small" variant="secondary" disabled={busy || checkingCodex || !connected || settingsForm.codex_binary !== settings.codex_binary} onClick={() => void checkCodex()}>
@@ -1244,11 +1359,28 @@ export default function App() {
             >
               取消
             </Button>
-            <Button disabled={busy || !connected} type="submit">
+            <Button disabled={busy || !connected || !!settingsExecutionError(settingsForm)} type="submit">
               保存设置
             </Button>
           </div>
         </form>
+      </ModalFrame>
+
+      <ModalFrame error="" open={modal === "reliability"} onClose={()=>setModal(null)} title="备份与诊断" description="本机所有者维护入口；私有历史备份与固定字段诊断严格分开。" wide>
+        {modal === "reliability" && <><ReliabilitySettings client={reliabilityClient} disabled={!connected}/><UpdatesSettings client={updatesClient} disabled={!connected}/><LifecycleSettings client={lifecycleClient} disabled={!connected}/></>}
+      </ModalFrame>
+
+      <ModalFrame error="" open={modal === "gateway"} onClose={()=>setModal(null)} title="自托管网关 / H5" description="出站设备连接、一次性配对与会话级授权；不是本机管理 API 的公网代理。" wide>
+        {modal === "gateway" && <GatewaySettings initialSnapshot={EMPTY_GATEWAY} client={gatewayClient} credentialClient={gatewayCredentialClient} registry={registry} sessions={snapshot.sessions} executor={settings.main_executor==="codex"?"codex":"native"} disabled={!connected}/>}
+      </ModalFrame>
+
+      <ModalFrame error="" open={modal === "qq"} onClose={()=>setModal(null)} title="QQ 官方应用" description="独立应用凭据、精确身份授权与被动回复；不是任意远端管理代理。" wide>
+        {modal === "qq" && <QqSettings initialSnapshot={EMPTY_QQ} client={qqClient} credentialClient={qqCredentialClient} sessions={snapshot.sessions} executor={settings.main_executor==="codex"?"codex":"native"} disabled={!connected}/>}
+      </ModalFrame>
+
+      <ModalFrame error="" open={modal === "providers"} onClose={()=>setModal("settings")} title="命名服务与系统凭据" description="仅本机所有者管理；关闭页面不撤回已经接受的系统操作。" wide>
+        {modal === "providers" && <ProvidersSettings registry={providers} client={providersClient} disabled={!connected} onRegistryChange={()=>void refresh()}/>}
+        <div className="modal-actions"><Button type="button" variant="secondary" onClick={()=>setModal("settings")}>返回设置（保留元数据草稿）</Button></div>
       </ModalFrame>
 
       <ModalFrame
@@ -1256,9 +1388,10 @@ export default function App() {
         open={modal === "capabilities"}
         onClose={() => setModal(null)}
         title="能力目录"
-        description="由后台报告的真实可用能力。更多执行器、MCP 工具和技能将在后续接入。"
+        description="查看后台能力并管理 MCP / Skills。配置、发现、授权和实际使用彼此独立。"
         wide
       >
+        {modal === "capabilities" && <CapabilitiesSettings registry={registry} client={capabilityClient} credentialClient={mcpCredentialClient} disabled={busy || !connected} onRegistryChange={() => void refresh()} />}
         <div className="capability-list">
           {snapshot.capabilities.length ? (
             snapshot.capabilities.map((capability) => (
@@ -1345,18 +1478,20 @@ export default function App() {
                     remoteSource,
                   )
                 }
-                options={[{ value: "", label: "请选择会话" }, ...snapshot.sessions.map((item) => ({ value: item.id, label: item.title }))]}
+                options={[{ value: "", label: remoteSelectionUnknown ? "后台选择尚未载入" : "请选择会话" }, ...(remoteSelection && (remoteSelectionUnknown || !snapshot.sessions.some(item => item.id === remoteSelection)) ? [{value:remoteSelection,label:`${remoteSelectionUnknown ? "上次选择待确认" : "已选会话未载入"} · ${remoteSelection}`,disabled:true}] : []), ...snapshot.sessions.filter(item => !(remoteSelectionUnknown && item.id === remoteSelection)).map((item) => ({ value: item.id, label: item.title }))]}
               />
             </label>
             <p className="help-text">
-              独立于桌面会话选择。任务保存派发时的回传位置。
+              独立于桌面会话选择。任务保存派发时的回传位置。下拉框只列当前窗口，不代表完整会话列表。
             </p>
+            {remoteSelectionUnknown && <p role="status">此远程入口的会话选择尚未载入；保留上次目标与草稿，未切换其他会话。请只读刷新或显式重新选择会话；暂不发送。</p>}
+            {explicitRemotePlanId && !remotePlan && <p role="status">所选计划 {explicitRemotePlanId} 未载入当前窗口；保留原目标和草稿，不会自动改成其他计划。暂不补充或暂停，请刷新或显式选择目标。</p>}
             <div className="instruction-scope remote-instruction-scope">
-              <label>指令用途<Select aria-label="远程指令用途" value={remoteMode} onValueChange={(value) => setInputModes((current) => ({ ...current, [remoteKey]: value as "goal" | "change" }))}
+              <label>指令用途<Select aria-label="远程指令用途" value={remoteMode} onValueChange={(value) => { setInputModes((current) => ({ ...current, [remoteKey]: value as "goal" | "change" })); if (value === "change" && remotePlan && !explicitRemotePlanId) setRemotePlanIds(current => ({...current,[remoteKey]:remotePlan.id})); }}
                 options={[{ value: "goal", label: "新目标" }, { value: "change", label: "补充当前计划" }]}
               /></label>
-              <label>目标计划<Select aria-label="远程目标计划" value={remotePlan?.id ?? ""} onValueChange={(value) => setRemotePlanIds((current) => ({ ...current, [remoteKey]: value }))}
-                options={remotePlans.length ? remotePlans.map((item) => ({ value: item.id, label: `${item.title} · v${item.revision}` })) : [{ value: "", label: "暂无计划" }]}
+              <label>目标计划<Select aria-label="远程目标计划" value={explicitRemotePlanId ?? remotePlan?.id ?? ""} disabled={remoteSelectionUnknown} onValueChange={(value) => setRemotePlanIds((current) => ({ ...current, [remoteKey]: value }))}
+                options={[...(explicitRemotePlanId && !remotePlans.some(item => item.id === explicitRemotePlanId) ? [{value:explicitRemotePlanId,label:`未载入计划 ${explicitRemotePlanId}`,disabled:true}] : []), ...(remotePlans.length ? remotePlans.map((item) => ({ value: item.id, label: `${item.title} · v${item.revision}` })) : [{ value: "", label: remoteSelectionUnknown || snapshot.history?.collections.plans?.has_more ? "计划尚未载入" : "暂无计划" }])]}
               /></label>
             </div>
             {remotePlan && <div className="remote-plan-progress">
@@ -1371,7 +1506,7 @@ export default function App() {
               className="remote-input"
               aria-label="远程指令内容"
               value={currentRemoteText}
-              onChange={(e) => setRemoteDrafts((current) => ({ ...current, [remoteKey]: e.target.value }))}
+              onChange={(e) => { setRemoteDrafts((current) => ({ ...current, [remoteKey]: e.target.value })); if (remoteMode === "change" && remotePlan && !explicitRemotePlanId) setRemotePlanIds(current => ({...current,[remoteKey]:remotePlan.id})); }}
               placeholder={remoteMode === "change" ? "补充对此计划的要求，生成调整建议后审阅应用…" : "模拟手机或通讯工具发来的新目标…"}
               rows={4}
             />
@@ -1379,7 +1514,7 @@ export default function App() {
               <Button
                 size="small"
                 disabled={
-                  !connected || busy || !remoteSelection || !currentRemoteText.trim() || (remoteMode === "change" && !changeable(remotePlan?.status))
+                  !connected || busy || remoteSelectionUnknown || !remoteSelection || !currentRemoteText.trim() || (remoteMode === "change" && !changeable(remotePlan?.status))
                 }
                 onClick={() => void remoteSend(false)}
               >
@@ -1390,7 +1525,7 @@ export default function App() {
                 variant="secondary"
                 size="small"
                 disabled={
-                  !connected || busy || !remoteSelection || !currentRemoteText.trim() || remoteMode === "change"
+                  !connected || busy || remoteSelectionUnknown || !remoteSelection || !currentRemoteText.trim() || remoteMode === "change"
                 }
                 onClick={() => void remoteSend(true)}
               >
@@ -1472,8 +1607,8 @@ export default function App() {
               ) : (
                 <EmptyPanel
                   icon={<Radio />}
-                  title="等待第一条回传"
-                  detail="从此入口派发任务，完成后查看后台实际投递结果。"
+                  title={snapshot.history?.collections.deliveries?.has_more ? "当前窗口未载入此入口的回传" : "等待第一条回传"}
+                  detail="这里只显示当前窗口；请从历史浏览读取更多回传记录，不把未载入解释为未投递。"
                 />
               )}
             </div>

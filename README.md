@@ -8,6 +8,12 @@
 
 ## 当前版本
 
+**0.7–1.0 分切片开发中，未发布**：0.8 执行控制/托管能力/命名服务、0.9 官方 QQ 适配已分别验证并留有独立验收记录。1.0 第一应用切片新增版本化存储、在线一致备份、离线恢复和固定字段诊断，见 [维护协议](docs/protocol-v12.md) 与 [验收跟踪](docs/acceptance-v1.0.md)。生命周期、更新及实际安装验收仍分开推进，不把新模块等同于整份路线图完成。
+
+1.0 长历史实测已发现并分片修复问题：有索引调度显著降低空闲 CPU、恢复完整事件回放；大快照/单任务容量仍待有界读取修复，见 [调度协议](docs/protocol-v13.md) 与 [保留原始失败的性能记录](docs/performance-v1.0.md)。不把局部改善当作完整性能验收。
+
+**0.7 开发分支（未发布）**：已打通 Native/Codex 统一执行事件、桌面/浏览器流式消费、持久游标恢复及 CLI 跟随，新增 Codex 主 thread 续接与 Native 跨任务摘要。详见 [事件与会话协议](docs/protocol-v6.md)。第三切片增加执行中补充、明确排队/继续、持久上下文估算和有界只读区间 diff。第四切片增加不启动 Git 子进程的有界元数据概览，区分 HEAD/index 与原始工作区字节；不冒充完整 Git 转换/忽略语义。托管登录原生续接仍有安全兼容边界，运行版本号暂不变。
+
 当前版本 **0.6.0** 增加主智能体直接执行、可调界面缩放、自定义模型 Endpoint、模型上下文与子角色覆盖，以及无头命令行客户端：
 
 - 桌面默认直接进入主 Agent 工具循环；同会话依次执行，带入前序对话与真实结果。
@@ -37,11 +43,19 @@
 
 远程编排的计划先形成草稿供你审阅，启动后在预算内自动继续。执行中可以调整未开始的节点，已有运行及终态记录保留。失败、取消或阻塞节点需要关联修复与验收任务，并取得实际成功命令证据后，整个计划才允许完成；失败历史仍保留。建议先暂停派发、保存后续调整，再恢复执行。
 
-外部 MCP / Skills 的应用内管理、真实通讯平台和移动端尚未接通。Native 主任务、原生子任务及远程规划与回顾仍使用非流式 Chat Completions；Codex 主任务和子任务通过独立 stdio 协议运行。
+开发分支已接通应用管理的 stdio MCP / Skills，以及下述命名模型服务；真实通讯平台和移动端仍在后续切片。本开发分支 Native 主任务与原生子任务使用流式 Chat Completions（同一响应可兼容 JSON，不重试）；远程规划与回顾仍为非流式；Codex 主任务和子任务通过独立 stdio 协议运行。
+
+## 命名模型服务与系统凭据（开发分支）
+
+设置中的「模型服务」可管理独立 Native 服务，配置默认模型、模型目录地址并明确启停；主 Agent 与子角色可以选择不同服务。密钥只经一次性本机请求交给 macOS Keychain、Windows Credential Manager 或 Linux Secret Service，不写入 SQLite / 设置快照；系统存储不可用时不回退明文或旧手动密钥。新服务默认停用，主机或模型目录改变会解除旧凭据绑定。
+
+任务与显式编排固定服务身份和修订；计划固定角色服务快照，轮换、改址或撤权会阻止旧身份继续发送或派发，不静默换服务。Codex 仍使用自己的本机配置，不注入 Native 服务密钥。凭据设置、轮换、删除和孤立项清理使用持久化的一次性意图；断线或结果未知只查询原回执，不自动重做，清理成功不改写原始未知事实。
+
+桌面、HTTP 和 CLI 共用规则；CLI 设置密钥只接受 `--stdin`，不放在命令行参数。操作方法与限制见 [协议 v9](docs/protocol-v9.md)，验证与未验证项见 [命名服务验收](docs/acceptance-providers-v0.8.md)。当前测试使用内存 vault 与 loopback 模型，尚未实测真实系统凭据授权或 GUI。MCP 环境凭据通过独立声明槽接线：每任务固定服务与私有引用、每槽只读一次 vault，再仅注入指定子进程环境；轮换后必须重新发现。不能把模型服务凭据直接复用为外部工具权限。详情与未验证项见 [MCP 凭据验收](docs/acceptance-mcp-credentials-v0.8.md)。
 
 ## 后续规划与接手
 
-下一阶段为 **0.7：持续会话与实时执行体验**，核心是流式输出与事件恢复、Codex 会话续接及原生摘要复用，随后完善执行中补充要求和代码改动查看。这些能力尚未实现，当前可运行版本仍为 0.6.0。
+下一阶段为 **0.7：持续会话与实时执行体验**，核心是流式输出与事件恢复、Codex 会话续接及原生摘要复用，随后完善执行中补充要求和代码改动查看。本开发分支已实现事件、会话复用、补充控制与区间改动切片，剩余安全兼容边界及联合验收继续推进，完整 0.7 尚未发布。
 
 完整的 0.7 至 1.0 分版目标、依赖与验收见 [分版路线图](docs/roadmap.md)。接手开发先读 [0.7 交接记录](docs/handoff-v0.7.md)，再按 [0.7 迭代计划](docs/iteration-v0.7.md) 推进。后续自主执行、MCP / Skills、真实通讯、H5、候选 App 与稳定发布均已分开记录；平台和上线日期未定的项目明确标注待确认。
 
@@ -63,9 +77,9 @@ Codex 需要先在本机安装、完成登录并配置可用模型。在设置�
 
 桌面提供 80%–120% 本机界面缩放，AI 消息在左、用户消息在右，统一灰蓝主题的下拉菜单支持键盘操作。输入框和选中文字的右键编辑菜单使用中文；空白区域不显示浏览器菜单。
 
-每个 Codex 主任务或子任务使用新的临时会话，通过 `initialize → thread/start → turn/start` 执行，只有收到真实完成状态和最终结果才报告成功。主任务会带入应用中此前对话背景，当前没有恢复复用 Codex thread，也没有人工审批交互。执行权限为 `workspace-write`，禁止命令网络和额外临时目录写入，额外授权请求会被拒绝并终止。它仍继承本机 Codex 的登录和工具配置；第三方 MCP 的远端操作不属于本机文件沙箱的保障范围。
+Codex 主任务在可确认的自定义服务身份、配置、历史和前次成功终态均匹配时复用持久 thread，通过 `thread/resume` 续接；新 thread 只引导应用历史一次。子任务仍使用独立临时会话。未知在途写入、活动 thread 或权限不符不自动重试；只有真实完成状态和最终结果才报告成功。公开 account/read 缺少不可变用户标识；实验工作区 ID 也不能替代 principal。因此 ChatGPT 登录或身份无法可靠绑定时明确新建 thread 并导入完整历史，不冒充原生续接，也不读取认证文件填补缺口。没有人工审批交互。执行权限为 `workspace-write`，禁止命令网络和额外临时目录写入，额外授权请求会被拒绝并终止。它仍继承本机 Codex 的登录和工具配置；第三方 MCP 的远端操作不属于本机文件沙箱的保障范围。
 
-Codex 单任务最多 15 分钟、协议总输出 8 MiB、最终结果 128 KiB；取消时先中断回合，再回收执行器进程及其子进程。已验证本机 `codex-cli 0.163.0` 协议。0.5 在隔离项目完成真实主模型规划与对话修改、真实 Codex「修改→测试失败→修复→复验→回调」联合验收；这是单个受控案例，不代表任意任务的规划质量。
+Codex 单任务最多 15 分钟、协议总输出 8 MiB、最终结果 128 KiB；取消时先中断回合，再回收执行器进程及其子进程。本分支依据本机 `codex-cli 0.166.0-alpha.1` stable schema 和本地夹具验证；未新增真实模型测试。0.5 在隔离项目完成真实主模型规划与对话修改、真实 Codex「修改→测试失败→修复→复验→回调」联合验收；这是单个受控案例，不代表任意任务的规划质量。
 
 ## 开发环境
 
@@ -158,11 +172,16 @@ python3 scripts/agents_smoke.py
 python3 scripts/runtime_smoke.py
 python3 scripts/plan_change_smoke.py
 python3 scripts/headless_smoke.py
+python3 scripts/streaming_smoke.py
+python3 scripts/continuation_smoke.py
+python3 scripts/steering_smoke.py
+python3 scripts/changes_smoke.py
+python3 scripts/web_stream_smoke.py
 pnpm test
 pnpm build:web
 ```
 
-八组 HTTP / CLI smoke 使用独立临时目录与本地端口，覆盖鉴权、指令去重、执行期间管理消息、回传目标、取消、重启、真实文件与命令、计划版本冲突、DAG、依赖结果、追加任务、预算、角色快照、混合执行器、暂停恢复、修复验收、持久化调整建议和独立布局版本。默认采用本地确定性 HTTP / stdio fixture，不消耗云端模型额度。可额外运行 `python3 scripts/runtime_smoke.py --real-codex` 验证真实执行器，或显式配置 `HARNESS_BASE_URL / HARNESS_MODEL / HARNESS_API_KEY` 后运行 `python3 scripts/plan_change_smoke.py --live` 验证真实主模型与 Codex 的联合闭环；这些选项会调用已配置模型。Codex 可执行夹具仅在 Unix 运行，Windows 使用原生角色完成 HTTP 链路验证。
+原八组 HTTP / CLI smoke 和新增流式、续接及代理 smoke 使用独立临时目录与本地端口，覆盖鉴权、指令去重、执行期间管理消息、回传目标、取消、重启、真实文件与命令、计划版本冲突、DAG、依赖结果、追加任务、预算、角色快照、混合执行器、暂停恢复、修复验收、持久化调整建议和独立布局版本。默认采用本地确定性 HTTP / stdio fixture，不消耗云端模型额度。可额外运行 `python3 scripts/runtime_smoke.py --real-codex` 验证真实执行器，或显式配置 `HARNESS_BASE_URL / HARNESS_MODEL / HARNESS_API_KEY` 后运行 `python3 scripts/plan_change_smoke.py --live` 验证真实主模型与 Codex 的联合闭环；这些选项会调用已配置模型。Codex 可执行夹具仅在 Unix 运行，Windows 使用原生角色完成 HTTP 链路验证。
 
 构建当前平台桌面安装包：
 
@@ -184,4 +203,45 @@ scripts/                  开发、sidecar 和端到端验证
 docs/                     产品计划和当前协议
 ```
 
-完整设计见 [产品与架构计划](docs/architecture-plan.md)，当前协议见 [主智能体与无头协议](docs/protocol-v5.md)，画布见 [第五阶段协议](docs/protocol-v4.md)，运行控制见 [第四阶段协议](docs/protocol-v3.md)，角色与执行器见 [第三阶段协议](docs/protocol-v2.md)，基础编排见 [第二阶段协议](docs/protocol-v1-draft.md)。开发进度见 [实施状态](docs/implementation-status.md)。
+完整设计见 [产品与架构计划](docs/architecture-plan.md)，本分支协议见 [持久事件与会话续接](docs/protocol-v6.md)，0.6 基线见 [主智能体与无头协议](docs/protocol-v5.md)，画布见 [第五阶段协议](docs/protocol-v4.md)，运行控制见 [第四阶段协议](docs/protocol-v3.md)，角色与执行器见 [第三阶段协议](docs/protocol-v2.md)，基础编排见 [第二阶段协议](docs/protocol-v1-draft.md)。开发进度见 [实施状态](docs/implementation-status.md)。
+
+### 0.7 开发分支的任务控制
+
+运行中明确选择补充当前任务或排队下一条；补充的接收、交付和实际结果分开展示。停止后可从指定历史任务创建新的继续任务，不重放旧任务。CLI 支持 `steer TASK_ID CONTENT`、`continue TASK_ID [CONTENT]`、`changes TASK_ID`。改动面板只展示有界执行区间差异，保留用户原文件和 index；为避免 Git filters 越权执行，概览只用有界 no-follow 解析器读取受支持的本地 SHA-1 index/HEAD/pack，不运行 Git。暂存元数据与原始工作区字节分列，转换和忽略规则未知；不支持的格式或安全失败明确显示未知。完整验证矩阵见 [0.7 验收跟踪](docs/acceptance-v0.7.md)。
+
+### 0.8 开发分支的执行控制切片
+
+设置、角色和单次任务可收紧预算与权限；Native 支持实际验收失败后的限次修复/复验、持久问题与逐次写入/命令授权。CLI 新增 `requests [TASK_ID]`、`answer REQUEST_ID REVISION TEXT|-`、`approve|deny REQUEST_ID REVISION DIGEST`，`run` 可用 `--controls FILE|-`。Codex 仅支持外层时长与公开输出限制，不支持的逐工具限制会拒绝，不能据此宣称已管理其内部 MCP。取消保留已发生副作用；在途文件写入会继续持有项目执行权直到清理完成，界面明确区分终态与清理状态。详见 [执行控制协议](docs/protocol-v7.md) 与 [0.8 迭代范围](docs/iteration-v0.8.md)。MCP / Skills、命名服务及系统凭据管理尚未由此切片交付。
+
+
+### 0.8 托管能力开发切片
+
+开发分支已实现并通过本地模拟门禁的应用管理 MCP 与固定版本 Skills，详见 [协议 v8](docs/protocol-v8.md)。MCP 注册/发现/启用不等于工具授权或实际执行；默认拒绝外部工具，Native 任务按固定目录和具体审批调用。MCP 是可信本机程序，不是文件/网络沙箱。Skills 只加载明确选择的正文，不自动运行旁边脚本。真实模型、外部服务、系统凭据及本地桌面 GUI 不在本轮模拟验证范围内。
+
+## 0.9 QQ 开发切片（仅本地夹具验收）
+
+官方 QQ 出站 WebSocket 适配器已接入同一 daemon、Store、App 与 CLI：本机配对确认、逐身份/对话范围、受限任务与编排、问题回答（不能批准本机动作）、固定来源被动回复，以及未知投递不重放。QQ 凭据有独立系统存储意图/CAS，不借用模型服务密钥；当前仅通过内存凭据和本地 HTTP/WS/模型夹具检查，未登记真实密钥或发送真实消息。
+
+未配对输入不占控制队列；确认后的安全接收窗口约 30 秒，未来时间异常另有持久阻断，详情见 [协议 v10](docs/protocol-v10.md)。默认被动回复窗口最多 5 分钟，长任务可能无法自动通知，应发新消息查询；没有主动推送后备。实际检查与未验证项见 [0.9 验收记录](docs/acceptance-v0.9.md)，不将模拟通过称为真实 QQ、原生 GUI 或发布完成。
+
+## 0.10 自托管网关与移动 H5 开发切片
+
+独立 `harness-gateway` 仅保存设备认证目录；daemon 保持本机管理端口并主动建立认证 WSS。H5 只获得本机确认的会话/动作/任务限制，不能代理管理令牌、批准工具操作或下载任意工作区文件。任务与回执仍在 daemon SQLite，离线不排队、未知结果不自动重发；网关重启后浏览器必须重新配对。
+
+构建 H5：`pnpm build:mobile`；网关运行与用户自备 nginx HTTPS 示例见 [网关说明](crates/harness-gateway/README.md) 和 `deploy/nginx-gateway.conf.example`。桌面设置与 `self-agent-cli gateway` 管理配对/撤权和独立系统凭据意图。当前仅完成本地协议夹具检查，最终门禁与未运行项见 [0.10 验收](docs/acceptance-v0.10.md)；没有实际公网部署、证书或真实凭据测试。
+
+## 有界历史读取（开发分支）
+
+当前工作区窗口与历史页见 [协议 v14](docs/protocol-v14.md)：保留完整历史记录，显式标明遗漏；CLI 单任务查询不再下载全量快照，分页返回固定上界与重启重置信息。原无 query 快照保持全量语义，超预算明确拒绝。实际同 seed 性能与未验证边界见 [性能记录](docs/performance-v1.0.md) 和 [1.0 验收](docs/acceptance-v1.0.md)，不代表生产发布或真实 GUI 已完成。
+
+## 本机发布校验与兼容（1.0 开发切片）
+
+`self-agent-cli updates --help` 提供独立本机 owner 的 verification-only 信任配置、原始签名清单与有界字节暂存、原 UUID 查询/取消/明确清理。生产自动下载与安装始终禁用；桌面可靠性面板只读显示验证状态，不执行产物。schema v4 的独立 witness 防止恢复旧任务库降低仍保留的验证下限。
+
+CLI、Native bridge 与开发代理先进行已认证兼容协商；不兼容后台不接收动作，也不会被自动替换。Native 单次启动具有可见进度、原始30秒就绪观察上限与迟到只读恢复，超时不自动重启。真实本地模拟门禁和未运行的完整 GUI/OS安装/生产签名边界见 [协议 v15](docs/protocol-v15.md) 与 [校验切片验收](docs/acceptance-update-v1.0.md)。
+
+## 同一后台实例的显式关闭（1.0 开发切片）
+
+可靠性面板和 `self-agent-cli daemon-status` 可只读观察；`self-agent-cli --wait 30 daemon-stop --confirm` 明确关闭共享后台，包括 QQ/H5 入口。关闭请求绑定当前实例 UUID，只发送一次；运行、排队及暂停中的任务和计划会取消，重启不会自动恢复。关闭桌面窗口不等于关闭后台。Ctrl-C 与 Unix SIGTERM 使用同一清理流程；外部强杀不是已清理证明。已写入的文件不会撤销。
+
+清理超时、断连或新实例出现都不等于原实例已停止。客户端只读观察原请求，不自动重发或启动替代后台；物理清理未知时继续持有数据目录租约。实际所有权、准入与两次 quiesce 合同见 [协议 v16](docs/protocol-v16.md)，开发门禁与未运行范围见 [生命周期验收](docs/acceptance-lifecycle-v1.0.md)。本节不宣称未发布工作树已通过精确提交 CI 或实机 GUI/安装验收。

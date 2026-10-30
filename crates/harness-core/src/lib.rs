@@ -1,5 +1,14 @@
 //! Shared records exchanged by the daemon, desktop bridge, and channel adapters.
 
+pub mod compatibility;
+pub mod gateway;
+mod providers;
+pub use providers::*;
+mod capabilities;
+pub use capabilities::*;
+mod execution;
+pub use execution::*;
+
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -80,9 +89,13 @@ pub struct AgentProfile {
     pub executor: String,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_threshold: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controls: Option<TaskControls>,
 }
 
 impl Default for AgentProfile {
@@ -93,8 +106,10 @@ impl Default for AgentProfile {
             instructions: "根据任务目标检查项目、实施修改并验证结果；如实说明证据和限制。".into(),
             executor: "native".into(),
             model: String::new(),
+            provider_id: None,
             context_window: None,
             compression_threshold: None,
+            controls: None,
         }
     }
 }
@@ -134,11 +149,83 @@ pub struct TaskRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_output: Option<String>,
+    #[serde(default)]
+    pub stream_output_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub source: SourceContext,
     pub steps: Vec<TaskStep>,
     #[serde(default)]
     pub evidence: Vec<CommandEvidence>,
+    #[serde(default)]
+    pub supplements: Vec<TaskSupplement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes_summary: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimate: Option<TaskContextEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compaction: Option<TaskContextCompaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<TaskControls>,
+    #[serde(default)]
+    pub budget_usage: BudgetUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_cleanup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_cleanup_updated_at: Option<String>,
+    #[serde(default)]
+    pub execution_cleanup_owner_ack: Option<CleanupOwnerAcknowledgement>,
+    #[serde(default)]
+    pub verification_attempts: Vec<VerificationAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_request_id: Option<String>,
+    #[serde(default)]
+    pub question_answers: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub managed_capabilities: TaskCapabilities,
+    #[serde(default)]
+    pub managed_provider: Option<ProviderReference>,
+    #[serde(default)]
+    pub capability_calls: Vec<CapabilityCallRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskContextEstimate {
+    pub estimated_input_tokens: u64,
+    pub context_window: u32,
+    pub compression_threshold: u8,
+    pub source: String,
+    pub phase: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskContextCompaction {
+    pub state: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskSupplement {
+    pub id: String,
+    pub task_id: String,
+    pub content: String,
+    pub status: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub applied_via: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 fn worker_kind() -> String {
@@ -275,6 +362,10 @@ pub struct Delivery {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunEvent {
     pub id: String,
+    /// Database commit order. Legacy records deserialize as zero; wire events
+    /// are hydrated from the journal and always carry a positive sequence.
+    #[serde(default)]
+    pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +373,56 @@ pub struct RunEvent {
     pub kind: String,
     pub message: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<ExecutionEvent>,
+}
+
+/// Executor-neutral evidence. This is observable output, never hidden reasoning.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionEvent {
+    AssistantDelta {
+        text: String,
+    },
+    ToolStarted {
+        call_id: String,
+        name: String,
+    },
+    ToolFinished {
+        call_id: String,
+        name: String,
+        success: bool,
+        output: String,
+    },
+    Usage {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        #[serde(default)]
+        scope: String,
+    },
+    ContextCompaction {
+        state: String,
+    },
+    ContextEstimate {
+        estimated_input_tokens: u64,
+        context_window: u32,
+        compression_threshold: u8,
+        source: String,
+        phase: String,
+    },
+}
+
+impl ExecutionEvent {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AssistantDelta { .. } => "assistant_delta",
+            Self::ToolStarted { .. } => "tool_started",
+            Self::ToolFinished { .. } => "tool_finished",
+            Self::Usage { .. } => "usage",
+            Self::ContextCompaction { .. } => "context_compaction",
+            Self::ContextEstimate { .. } => "context_estimate",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -301,6 +442,10 @@ pub struct SessionSelection {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub event_cursor: u64,
+    #[serde(default)]
+    pub context_states: Vec<ContextState>,
     pub sessions: Vec<Session>,
     pub tasks: Vec<TaskRun>,
     #[serde(default)]
@@ -311,6 +456,24 @@ pub struct Snapshot {
     pub events: Vec<RunEvent>,
     pub capabilities: Vec<Capability>,
     pub selections: Vec<SessionSelection>,
+    #[serde(default)]
+    pub execution_requests: Vec<ExecutionRequest>,
+    #[serde(default)]
+    pub managed_capabilities: ManagedCapabilities,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextState {
+    pub session_id: String,
+    pub executor: String,
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub covered_messages: Option<usize>,
+    #[serde(default)]
+    pub source_task_id: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -339,6 +502,19 @@ pub enum Command {
         #[serde(default)]
         session_id: Option<String>,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controls: Option<serde_json::Value>,
+    },
+    SteerTask {
+        task_id: String,
+        content: String,
+    },
+    ContinueTask {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controls: Option<serde_json::Value>,
     },
     StartTask {
         #[serde(default)]
@@ -346,6 +522,19 @@ pub enum Command {
         title: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controls: Option<serde_json::Value>,
+    },
+    AnswerRequest {
+        request_id: String,
+        expected_revision: u32,
+        answer: String,
+    },
+    DecideRequest {
+        request_id: String,
+        expected_revision: u32,
+        approve: bool,
+        action_digest: String,
     },
     CancelTask {
         task_id: String,
@@ -411,6 +600,8 @@ pub struct CommandReceipt {
     pub job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplement_id: Option<String>,
 }
 
 #[cfg(test)]

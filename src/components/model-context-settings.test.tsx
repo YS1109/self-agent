@@ -1,6 +1,7 @@
+import type { NamedProvider } from "../providers-client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { agentContext, modelContext } from "../model-context";
+import { agentContext, modelContext, agentEffectiveModel, mainEffectiveModel } from "../model-context";
 import type { AgentProfile, Settings } from "../types";
 import { AgentSettings, normalizeSettings } from "./agent-settings";
 import { ModelContextSettings } from "./model-context-settings";
@@ -63,4 +64,21 @@ describe("模型服务与上下文配置", () => {
     expect(html).toContain('type="password"');
     expect(html).not.toContain("sk-");
   });
+  it("命名默认与角色覆盖使用实际profile模型，草稿切换服务不复用旧主模型提示",()=>{
+    const named=(id:string,model:string):NamedProvider=>({id,revision:1,definition:{name:id,base_url:"https://fixture.invalid/v1",models_endpoint:"",model,allow_insecure_http:false},enabled:true,credential_configured:false,credential_status:"not_configured",orphaned_credentials:0,updated_at:"now"});
+    const providers=[named("global","model/main"),named("role","model/worker")];
+    const configured={...settings,provider_source:"named" as const,provider_id:"global",model:"",agents:[{...agent,model:"",provider_id:"role"}]};
+    expect(mainEffectiveModel(configured,providers)).toBe("model/main");
+    expect(agentContext(configured,{...agent,model:""},providers).context_window).toBe(256000);
+    expect(agentContext(configured,{...agent,provider_id:"role",model:""},providers).context_window).toBe(64000);
+    expect(agentEffectiveModel(configured,{...agent,provider_id:"role",model:"override"},providers)).toBe("override");
+    expect(agentEffectiveModel(configured,{...agent,provider_id:"missing",model:""},providers)).toBe("");
+    expect(agentEffectiveModel(configured,{...agent,executor:"codex",provider_id:"role",model:""},providers)).toBe("");
+    const html=renderToStaticMarkup(<AgentSettings settings={configured} providers={providers} onChange={vi.fn()} disabled={false} nativeModels={catalog} codexModels={catalog} codexPathChanged={false}/>);
+    expect(html).toContain('placeholder="继承：64000"');
+    const draft={...configured,provider_id:"role"};
+    const context=renderToStaticMarkup(<ModelContextSettings settings={draft} providers={providers} onChange={vi.fn()} disabled={false} catalogs={[]}/>);
+    expect(context).toContain("model/worker · 主模型");expect(context).toContain('value="64000"');
+  });
+
 });

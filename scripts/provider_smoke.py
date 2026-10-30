@@ -77,7 +77,7 @@ class ModelFixture(BaseHTTPRequestHandler):
                 "role": "assistant",
                 "content": "Traversal denied." if traversal else "Created proof.txt with the requested content.",
             }
-        response = json.dumps({"choices": [{"message": message}]}).encode()
+        response = json.dumps({"choices": [{"message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))

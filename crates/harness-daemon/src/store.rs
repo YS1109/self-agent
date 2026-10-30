@@ -1,7 +1,7 @@
 use std::{collections::HashSet, path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use harness_core::{new_id, now, CommandEvidence, ModelContextConfig, RunEvent};
+use harness_core::{new_id, now, CommandEvidence, ExecutionEvent, ModelContextConfig, RunEvent};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
@@ -11,9 +11,28 @@ use crate::{
     Settings,
 };
 
+pub(crate) mod capabilities;
+pub(crate) mod capability_credentials;
+mod changes;
+mod continuation;
+mod decisions;
+pub(crate) mod execution;
+pub(crate) mod gateway;
+pub(crate) mod history;
+pub(crate) mod lifecycle;
+pub(crate) mod providers;
+pub(crate) mod qq;
+pub(crate) mod reliability;
+mod scheduling;
+mod steering;
+pub(crate) mod updates;
+
 const MAX_NODES: usize = 12;
 const MAX_ROUNDS: u64 = 3;
 const MAX_ACTIVE_TASKS: usize = 32;
+const RETAINED_EVENTS: u64 = 20_000;
+const MAX_EVENT_BYTES: usize = 32 * 1024;
+const MAX_STREAM_TEXT: usize = 256 * 1024;
 const CONFIGURATION_HINT: &str =
     "请先在设置中配置兼容 Chat Completions 的模型和服务地址，或明确切换到演示模式。";
 
@@ -21,14 +40,15 @@ pub struct Store {
     db: Connection,
 }
 
-impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
-        let db = Connection::open(path)?;
-        db.busy_timeout(Duration::from_secs(3))?;
-        db.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+/// Trusted application baseline. All current schema creation and legacy event
+/// conversion share one ledger transaction; adapters cannot migrate outside it.
+pub(crate) fn prepare_database(db: &mut Connection) -> Result<()> {
+    crate::reliability::storage::migrate(
+        db,
+        |tx| {
+            let db: &Connection = tx;
+            db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS plan_changes(id TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -39,6 +59,89 @@ impl Store {
              CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, task_id TEXT UNIQUE NOT NULL, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS settings(id TEXT PRIMARY KEY, body TEXT NOT NULL);",
         )?;
+            db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_contexts(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS task_changes(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS execution_requests(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, body TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS execution_requests_task ON execution_requests(task_id);",
+        )?;
+            capabilities::migrate(db)?;
+            capability_credentials::migrate(db)?;
+            providers::migrate(db)?;
+            qq::migrate(db)?;
+            crate::reliability::jobs::migrate(tx)?;
+            // One atomic migration preserves legacy UUIDs and insertion order. An
+            // explicit AUTOINCREMENT key survives deletion, VACUUM and restarts.
+            let has_sequence = db
+                .prepare("PRAGMA table_info(events)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "sequence");
+            if !has_sequence {
+                db.execute_batch(
+                    "CREATE TABLE events_v7(sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
+                 INSERT INTO events_v7(id,body) SELECT id,body FROM events ORDER BY rowid;
+                 DROP TABLE events;
+                 ALTER TABLE events_v7 RENAME TO events;",
+                )?;
+            }
+            reliability::validate_v1_records(db)?;
+            Ok(())
+        },
+        |tx| {
+            reliability::validate_v1_records(tx)?;
+            gateway::migrate(tx)?;
+            reliability::validate_v2_records(tx)
+        },
+        |tx| {
+            reliability::validate_v2_records(tx)?;
+            scheduling::migrate(tx)
+        },
+        |tx| {
+            reliability::validate_v3_records(tx)?;
+            let unexpected: u64 = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'update_%'",
+                [],
+                |r| r.get(0),
+            )?;
+            if unexpected != 0 {
+                bail!("旧版本包含未登记的更新验证结构");
+            }
+            crate::reliability::update_state::migrate(tx)?;
+            reliability::validate_records(tx)
+        },
+    )?;
+    reliability::validate_records(db)
+}
+
+impl Store {
+    pub fn open(path: &Path) -> Result<Self> {
+        // Even a read of a hot journal on a read/write connection can mutate
+        // storage. Refuse incompatible files using read-only inspection first.
+        if path.exists() {
+            let readonly = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            crate::reliability::storage::preflight(&readonly)?;
+        }
+        let db = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        Self::from_connection(db)
+    }
+    pub(crate) fn from_connection(mut db: Connection) -> Result<Self> {
+        crate::reliability::storage::preflight(&db)?;
+        db.busy_timeout(Duration::from_secs(3))?;
+        db.execute_batch("PRAGMA foreign_keys=ON;")?;
+        prepare_database(&mut db)?;
+        db.execute_batch("PRAGMA journal_mode=WAL;")?;
         let mut store = Self { db };
         store.recover()?;
         Ok(store)
@@ -89,6 +192,29 @@ impl Store {
 
     fn recover(&mut self) -> Result<()> {
         let tx = self.db.transaction()?;
+        crate::reliability::jobs::recover_interrupted(&tx)?;
+        crate::reliability::update_state::recover(
+            &tx,
+            chrono::Utc::now().timestamp_millis().max(0) as u64,
+        )?;
+        capabilities::recover(&tx)?;
+        capability_credentials::recover(&tx)?;
+        providers::recover(&tx)?;
+        qq::recover(&tx)?;
+        gateway::recover(&tx)?;
+        decisions::recover_pending(&tx)?;
+        execution::recover_execution_cleanup(&tx)?;
+        changes::recover_changes(&tx)?;
+        for mut state in rows(&tx, "session_contexts")? {
+            if state["executor"] == "codex"
+                && matches!(state["state"].as_str(), Some("inflight" | "ready"))
+            {
+                state["state"] = json!("invalidated");
+                state["reason"] = json!("后台重启时回合结果未知；保留历史，未自动重放写入");
+                state["updated_at"] = json!(now());
+                put(&tx, "session_contexts", &state)?;
+            }
+        }
         // Existing databases predate roles; migrate them to the original native role.
         for mut plan in rows(&tx, "plans")? {
             if plan.get("agents").is_none() {
@@ -135,13 +261,16 @@ impl Store {
             }
             if task["status"] == "running" && task["task_kind"] != "plan" {
                 task["status"] = json!("failed");
+                if task["stop_reason"].is_null() {
+                    task["stop_reason"] = json!("daemon_interrupted");
+                }
                 task["error"] = json!("后台在执行过程中重启。请检查已有项目修改后再安排后续工作；此任务没有自动重放。");
                 terminal_steps(&mut task, false);
                 complete_transaction(&tx, &mut task)?;
             }
         }
         for mut delivery in rows(&tx, "deliveries")? {
-            if delivery["status"] == "sending" {
+            if delivery["status"] == "sending" && delivery["target"]["channel_id"] != "qq" {
                 delivery["status"] = json!("pending");
                 put(&tx, "deliveries", &delivery)?;
             }
@@ -155,22 +284,29 @@ impl Store {
         let mut sessions = rows(&self.db, "sessions")?;
         sessions.sort_by(|a, b| b["updated_at"].as_str().cmp(&a["updated_at"].as_str()));
         let mut tasks = rows(&self.db, "tasks")?;
+        for task in &mut tasks {
+            if !task["supplements"].is_array() {
+                task["supplements"] = json!([]);
+            }
+        }
         tasks.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
         let mut plans = rows(&self.db, "plans")?;
         plans.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
-        let mut events = rows(&self.db, "events")?;
-        events.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
-        let events: Vec<_> = events
-            .into_iter()
-            .rev()
-            .take(300)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let event_cursor = self.event_cursor()?;
+        let mut events = read_events(
+            &self.db,
+            "SELECT sequence,body FROM events ORDER BY sequence DESC LIMIT ?1",
+            300,
+        )?;
+        events.reverse();
         let shell_enabled = std::env::var("HARNESS_ALLOW_COMMANDS").as_deref() == Ok("1");
         Ok(json!({
             "sessions":sessions, "tasks":tasks, "plans":plans, "events":events,
+            "event_cursor":event_cursor,
+            "context_states":self.public_context_states()?,
+            "managed_capabilities":self.capabilities_registry()?,
+            "named_providers":self.named_providers()?,
+            "execution_requests":rows(&self.db,"execution_requests")?,
             "plan_changes":rows(&self.db,"plan_changes")?,
             "deliveries":rows(&self.db,"deliveries")?, "selections":rows(&self.db,"selections")?,
             "capabilities":[
@@ -181,10 +317,109 @@ impl Store {
                 {"id":"callback","name":"本地回调","kind":"tool","description":"持久化桌面和远程模拟器回调，固定投递到任务发起来源","enabled":true},
                 {"id":"codex","name":"Codex 执行器","kind":"executor","description":"通过本机 Codex CLI 执行项目任务，需安装并完成登录配置","enabled":true},
                 {"id":"roles","name":"子智能体角色","kind":"agent","description":"配置角色指令、执行器和模型；计划节点按角色快照执行","enabled":true},
-                {"id":"mcp","name":"MCP 连接","kind":"mcp","description":"计划接入能力注册表","enabled":false},
-                {"id":"skills","name":"本地技能","kind":"skill","description":"计划支持限定范围的 SKILL.md 发现","enabled":false}
+                {"id":"mcp","name":"MCP 连接","kind":"mcp","description":"显式注册的本机 stdio 工具；需权限和实际调用验证，无沙箱","enabled":true},
+                {"id":"skills","name":"本地技能","kind":"skill","description":"手动注册或显式 SKILL.md 导入，固定正文不自动加载脚本","enabled":true}
             ]
         }))
+    }
+
+    pub fn event_cursor(&self) -> Result<u64> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// A cursor is exclusive. The boundary just before the first retained row
+    /// is still valid; anything earlier needs an authoritative snapshot.
+    pub fn validate_event_cursor(&self, after: u64) -> Result<()> {
+        let latest = self.event_cursor()?;
+        let oldest: Option<u64> =
+            self.db
+                .query_row("SELECT MIN(sequence) FROM events", [], |row| row.get(0))?;
+        if after > latest
+            || oldest.is_some_and(|first| after < first.saturating_sub(1))
+            || (oldest.is_none() && after < latest)
+        {
+            bail!("事件游标已失效，请重新获取快照");
+        }
+        Ok(())
+    }
+
+    pub fn events_after(&self, after: u64) -> Result<Vec<RunEvent>> {
+        self.validate_event_cursor(after)?;
+        read_events(
+            &self.db,
+            "SELECT sequence,body FROM events WHERE sequence>?1 ORDER BY sequence LIMIT 128",
+            after,
+        )
+    }
+
+    pub fn execution_event(&mut self, task_id: &str, data: ExecutionEvent) -> Result<RunEvent> {
+        if serde_json::to_vec(&data)?.len() > MAX_EVENT_BYTES {
+            bail!("执行事件超过 32 KiB 限制");
+        }
+        let tx = self.db.transaction()?;
+        let mut task = record(&tx, "tasks", task_id)?;
+        if task["status"] != "running" || task["task_kind"] == "plan" {
+            bail!("任务已停止，忽略迟到的执行输出");
+        }
+        if let ExecutionEvent::AssistantDelta { text } = &data {
+            let mut output = task["stream_output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let remaining = MAX_STREAM_TEXT.saturating_sub(output.len());
+            let mut end = text.len().min(remaining);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            output.push_str(&text[..end]);
+            task["stream_output"] = json!(output);
+            if end < text.len() {
+                task["stream_output_truncated"] = json!(true);
+            } else if task.get("stream_output_truncated").is_none() {
+                task["stream_output_truncated"] = json!(false);
+            }
+            put(&tx, "tasks", &task)?;
+        }
+        match &data {
+            ExecutionEvent::ContextEstimate { .. } => {
+                let mut latest = serde_json::to_value(&data)?;
+                latest["updated_at"] = json!(now());
+                task["context_estimate"] = latest;
+                put(&tx, "tasks", &task)?;
+            }
+            ExecutionEvent::ContextCompaction { state } => {
+                task["context_compaction"] = json!({"state":state,"updated_at":now()});
+                put(&tx, "tasks", &task)?;
+            }
+            _ => {}
+        }
+        let label = match &data {
+            ExecutionEvent::AssistantDelta { .. } => "回复增量",
+            ExecutionEvent::ToolStarted { .. } => "工具开始执行",
+            ExecutionEvent::ToolFinished { .. } => "工具执行结束",
+            ExecutionEvent::Usage { .. } => "模型服务用量",
+            ExecutionEvent::ContextCompaction { .. } => "上下文压缩状态",
+            ExecutionEvent::ContextEstimate { .. } => "本地上下文估算",
+        };
+        let mut item = event(
+            Some(text(&task, "session_id")?.into()),
+            Some(task_id.into()),
+            data.kind(),
+            label,
+        );
+        item.data = Some(data);
+        persist_event(&tx, &item)?;
+        item.sequence = tx.query_row(
+            "SELECT sequence FROM events WHERE id=?1",
+            [&item.id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(item)
     }
 
     pub fn project_path(&self, session_id: &str) -> Result<String> {
@@ -196,22 +431,6 @@ impl Store {
         envelope: Value,
         settings: &Settings,
     ) -> Result<(Value, Option<RunEvent>)> {
-        let command_id = bounded_text(&envelope, "command_id", 128)?.to_string();
-        let serialized = serde_json::to_string(&envelope)?;
-        let existing: Option<(String, String)> = self
-            .db
-            .query_row(
-                "SELECT envelope,receipt FROM commands WHERE id=?1",
-                [&command_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((original, receipt)) = existing {
-            if original != serialized {
-                bail!("command_id 已被另一条指令使用");
-            }
-            return Ok((serde_json::from_str(&receipt)?, None));
-        }
         let source = envelope.get("source").context("缺少指令来源 source")?;
         for field in ["channel_id", "actor_id", "conversation_id"] {
             bounded_text(source, field, 200)?;
@@ -224,525 +443,18 @@ impl Store {
         if !matches!(channel, "desktop" | "simulator" | "cli") {
             bail!("此通讯渠道尚未配置，请使用桌面、命令行或远程模拟器");
         }
-        let command = envelope.get("command").context("缺少 command 指令")?;
-        let kind = text(command, "type")?;
         let tx = self.db.transaction()?;
-        let mut receipt = json!({"command_id":command_id,"status":"accepted"});
-        let produced;
-        match kind {
-            "create_session" => {
-                let title = bounded_text(command, "title", 200)?;
-                let project_path = std::fs::canonicalize(text(command, "project_path")?)
-                    .context("项目目录必须存在")?;
-                if !project_path.is_dir() {
-                    bail!("项目路径必须是目录");
-                }
-                let id = new_id();
-                put(
-                    &tx,
-                    "sessions",
-                    &json!({"id":id,"title":title,"project_path":project_path.to_string_lossy(),"created_at":now(),"updated_at":now(),"messages":[]}),
-                )?;
-                select(&tx, source, &id)?;
-                receipt["session_id"] = json!(id);
-                produced = Some(event(Some(id), None, "session_created", "会话已创建"));
-            }
-            "select_session" => {
-                let id = text(command, "session_id")?;
-                record(&tx, "sessions", id)?;
-                select(&tx, source, id)?;
-                receipt["session_id"] = json!(id);
-                produced = Some(event(
-                    Some(id.into()),
-                    None,
-                    "session_selected",
-                    "已选择会话",
-                ));
-            }
-            "send_message" => {
-                let id = resolve_session(&tx, source, command)?;
-                let content = bounded_text(command, "content", 100_000)?;
-                let mut session = record(&tx, "sessions", &id)?;
-                append_message(&mut session, "user", content, None)?;
-                let job_id = new_id();
-                let needs_configuration =
-                    settings.execution_mode == "native" && !settings.configured();
-                let agents = snapshot_agents(settings)?;
-                let job = json!({"id":job_id,"kind":"message","session_id":id,"source":source,"content":content,
-                    "agents":agents,"default_agent_id":settings.default_agent_id,
-                    "execution_mode":settings.execution_mode,"status":if needs_configuration {"failed"} else {"pending"},
-                    "created_at":now(),"updated_at":now(),"error":if needs_configuration {Some(CONFIGURATION_HINT)} else {None}});
-                put(&tx, "coordinator_jobs", &job)?;
-                if needs_configuration {
-                    append_message(&mut session, "assistant", CONFIGURATION_HINT, None)?;
-                }
-                put(&tx, "sessions", &session)?;
-                receipt["session_id"] = json!(id);
-                receipt["job_id"] = json!(job_id);
-                produced = Some(event(
-                    Some(id),
-                    None,
-                    if needs_configuration {
-                        "coordinator_needs_configuration"
-                    } else {
-                        "coordinator_queued"
-                    },
-                    if needs_configuration {
-                        CONFIGURATION_HINT
-                    } else {
-                        "目标已交给主智能体，当前会话可以继续使用"
-                    },
-                ));
-            }
-            "run_agent" => {
-                let session_id = resolve_session(&tx, source, command)?;
-                let content = bounded_text(command, "content", 100_000)?;
-                if !matches!(settings.main_executor.as_str(), "native" | "codex") {
-                    bail!("主智能体执行器仅支持 native 或 codex");
-                }
-                if settings.execution_mode == "native"
-                    && settings.main_executor == "native"
-                    && !settings.configured()
-                {
-                    bail!(CONFIGURATION_HINT);
-                }
-                if active_task_count(&tx)? >= MAX_ACTIVE_TASKS {
-                    bail!("后台任务已达到 32 个，请先完成或取消部分任务");
-                }
-                let main = AgentProfile {
-                    id: "main".into(),
-                    name: "主智能体".into(),
-                    instructions: String::new(),
-                    executor: settings.main_executor.clone(),
-                    model: String::new(),
-                    ..AgentProfile::default()
-                };
-                let (agent, context) = snapshot_agent(settings, main)?;
-                let sequence = rows(&tx, "tasks")?
-                    .iter()
-                    .filter(|task| task["session_id"] == session_id && task["task_kind"] == "main")
-                    .filter_map(|task| task["main_sequence"].as_u64())
-                    .max()
-                    .unwrap_or(0)
-                    + 1;
-                let mut task = worker_task(
-                    &session_id,
-                    content,
-                    &settings.execution_mode,
-                    source,
-                    None,
-                    None,
-                    None,
-                );
-                task["task_kind"] = json!("main");
-                task["main_sequence"] = json!(sequence);
-                task["agent"] = json!(agent);
-                task["context_config"] = json!(context);
-                let task_id = text(&task, "id")?.to_owned();
-                put(&tx, "tasks", &task)?;
-                let mut session = record(&tx, "sessions", &session_id)?;
-                append_message(&mut session, "user", content, Some(&task_id))?;
-                put(&tx, "sessions", &session)?;
-                receipt["session_id"] = json!(session_id);
-                receipt["task_id"] = json!(task_id);
-                produced = Some(event(
-                    Some(session_id),
-                    Some(task_id),
-                    "main_queued",
-                    "主智能体已收到目标，正在当前会话中直接处理",
-                ));
-            }
-            "start_task" => {
-                let session_id = resolve_session(&tx, source, command)?;
-                let title = bounded_text(command, "title", 100_000)?;
-                validate_agents(&settings.agents, &settings.default_agent_id)?;
-                let requested = requested_agent(command)?;
-                let agent = resolve_agent(&settings.agents, &settings.default_agent_id, requested)?;
-                let (agent, context) = snapshot_agent(settings, agent)?;
-                if settings.execution_mode == "native"
-                    && agent.executor == "native"
-                    && !(Settings {
-                        model: if agent.model.trim().is_empty() {
-                            settings.model.clone()
-                        } else {
-                            agent.model.clone()
-                        },
-                        ..settings.clone()
-                    })
-                    .configured()
-                {
-                    bail!(CONFIGURATION_HINT);
-                }
-                if active_task_count(&tx)? >= MAX_ACTIVE_TASKS {
-                    bail!("后台任务已达到 32 个，请先完成或取消部分任务");
-                }
-                let mut task = worker_task(
-                    &session_id,
-                    title,
-                    &settings.execution_mode,
-                    source,
-                    None,
-                    None,
-                    None,
-                );
-                task["agent"] = json!(agent);
-                task["context_config"] = json!(context);
-                let id = text(&task, "id")?.to_string();
-                put(&tx, "tasks", &task)?;
-                let mut session = record(&tx, "sessions", &session_id)?;
-                append_message(&mut session, "user", title, Some(&id))?;
-                append_message(
-                    &mut session,
-                    "assistant",
-                    "任务已交给后台智能体，当前会话可以继续使用。",
-                    Some(&id),
-                )?;
-                put(&tx, "sessions", &session)?;
-                receipt["session_id"] = json!(session_id);
-                receipt["task_id"] = json!(id);
-                produced = Some(event(
-                    Some(session_id),
-                    Some(id),
-                    "task_queued",
-                    "后台任务已排队",
-                ));
-            }
-            "request_plan_change" => {
-                let id = text(command, "plan_id")?;
-                let plan = record(&tx, "plans", id)?;
-                check_revision(&plan, command)?;
-                ensure_changeable(&plan)?;
-                let content = bounded_text(command, "content", 64 * 1024)?;
-                if rows(&tx, "plan_changes")?
-                    .iter()
-                    .filter(|change| {
-                        matches!(change["status"].as_str(), Some("queued" | "running"))
-                    })
-                    .count()
-                    >= MAX_ACTIVE_TASKS
-                {
-                    bail!("待生成的计划调整已达到 32 个，请等待或放弃部分建议");
-                }
-                if plan["execution_mode"] == "native" && !settings.configured() {
-                    bail!(CONFIGURATION_HINT);
-                }
-                let change_id = new_id();
-                let job_id = new_id();
-                let (agents, default_id) = role_snapshot(&plan)?;
-                put(
-                    &tx,
-                    "plan_changes",
-                    &json!({
-                        "id":change_id,"plan_id":id,"session_id":plan["session_id"],
-                        "base_revision":plan["revision"],"source":source,"content":content,
-                        "status":"queued","nodes":[],"created_at":now(),"updated_at":now()
-                    }),
-                )?;
-                put(
-                    &tx,
-                    "coordinator_jobs",
-                    &json!({
-                        "id":job_id,"kind":"change","change_id":change_id,"plan_id":id,
-                        "plan_snapshot":plan,"session_id":plan["session_id"],"source":source,
-                        "content":content,"execution_mode":plan["execution_mode"],
-                        "agents":agents,"default_agent_id":default_id,"status":"pending",
-                        "created_at":now(),"updated_at":now()
-                    }),
-                )?;
-                let mut session = record(&tx, "sessions", text(&plan, "session_id")?)?;
-                append_message(&mut session, "user", content, plan["task_id"].as_str())?;
-                put(&tx, "sessions", &session)?;
-                receipt["plan_id"] = json!(id);
-                receipt["session_id"] = plan["session_id"].clone();
-                receipt["job_id"] = json!(job_id);
-                receipt["change_id"] = json!(change_id);
-                produced = Some(plan_event(
-                    &plan,
-                    "plan_change_queued",
-                    "主智能体正在生成计划调整建议，当前执行继续；建议确认后才会应用",
-                ));
-            }
-            "apply_plan_change" => {
-                let change_id = text(command, "change_id")?;
-                let mut change = record(&tx, "plan_changes", change_id)?;
-                if change["status"] != "ready" {
-                    bail!("只有待确认的调整建议可以应用");
-                }
-                let id = text(&change, "plan_id")?;
-                let plan = record(&tx, "plans", id)?;
-                check_revision(&plan, command)?;
-                if change["base_revision"] != plan["revision"] {
-                    bail!("计划版本已变化，此建议已过期，请根据当前计划重新生成");
-                }
-                let plan = apply_plan_edit(
-                    &tx,
-                    id,
-                    &json!({
-                        "expected_revision":command["expected_revision"],"nodes":change["nodes"]
-                    }),
-                )?;
-                change["status"] = json!("applied");
-                change["updated_at"] = json!(now());
-                put(&tx, "plan_changes", &change)?;
-                receipt["plan_id"] = plan["id"].clone();
-                receipt["session_id"] = plan["session_id"].clone();
-                receipt["change_id"] = json!(change_id);
-                produced = Some(plan_event(
-                    &plan,
-                    "plan_change_applied",
-                    "调整建议已应用，执行历史已保留",
-                ));
-            }
-            "discard_plan_change" => {
-                let change_id = text(command, "change_id")?;
-                let mut change = record(&tx, "plan_changes", change_id)?;
-                if !matches!(
-                    change["status"].as_str(),
-                    Some("queued" | "running" | "ready" | "failed")
-                ) {
-                    bail!("此调整建议已经处理");
-                }
-                change["status"] = json!("discarded");
-                change["updated_at"] = json!(now());
-                put(&tx, "plan_changes", &change)?;
-                for mut job in rows(&tx, "coordinator_jobs")? {
-                    if job["change_id"] == change_id
-                        && matches!(job["status"].as_str(), Some("pending" | "running"))
-                    {
-                        job["status"] = json!("cancelled");
-                        job["updated_at"] = json!(now());
-                        put(&tx, "coordinator_jobs", &job)?;
-                    }
-                }
-                receipt["plan_id"] = change["plan_id"].clone();
-                receipt["session_id"] = change["session_id"].clone();
-                receipt["change_id"] = json!(change_id);
-                produced = Some(event(
-                    change["session_id"].as_str().map(str::to_owned),
-                    None,
-                    "plan_change_discarded",
-                    "调整建议已放弃",
-                ));
-            }
-            "set_plan_layout" => {
-                let id = text(command, "plan_id")?;
-                let mut plan = record(&tx, "plans", id)?;
-                let expected = command["expected_layout_revision"]
-                    .as_u64()
-                    .context("布局版本必须为非负整数")?;
-                if expected != plan["layout_revision"].as_u64().unwrap_or(0) {
-                    bail!("画布布局已变化，请刷新后重新保存");
-                }
-                let layout = command["layout"]
-                    .as_object()
-                    .context("画布布局必须是节点位置对象")?;
-                if layout.len() > MAX_NODES {
-                    bail!("画布布局不能超过 12 个节点");
-                }
-                for (node_id, position) in layout {
-                    if !plan["nodes"]
-                        .as_array()
-                        .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == *node_id))
-                    {
-                        bail!("布局包含不存在的节点：{node_id}");
-                    }
-                    for axis in ["x", "y"] {
-                        if position[axis]
-                            .as_f64()
-                            .is_none_or(|value| !value.is_finite() || value.abs() > 100_000.0)
-                        {
-                            bail!("节点坐标必须是 -100000 到 100000 之间的有限数值");
-                        }
-                    }
-                }
-                plan["layout"] = json!(layout);
-                plan["layout_revision"] = json!(expected + 1);
-                put(&tx, "plans", &plan)?;
-                receipt["plan_id"] = json!(id);
-                receipt["session_id"] = plan["session_id"].clone();
-                produced = Some(plan_event(&plan, "plan_layout_updated", "画布布局已保存"));
-            }
-            "update_plan" | "patch_plan" => {
-                let id = text(command, "plan_id")?;
-                let plan = record(&tx, "plans", id)?;
-                if kind == "update_plan" && plan["status"] != "draft" {
-                    bail!("只有草稿计划可以编辑");
-                }
-                if kind == "patch_plan" && plan["status"] == "draft" {
-                    bail!("草稿计划请使用编辑草稿指令");
-                }
-                let plan = apply_plan_edit(&tx, id, command)?;
-                receipt["plan_id"] = json!(id);
-                receipt["session_id"] = plan["session_id"].clone();
-                produced = Some(plan_event(
-                    &plan,
-                    if kind == "patch_plan" {
-                        "plan_patched"
-                    } else {
-                        "plan_updated"
-                    },
-                    "计划已保存，执行历史已保留",
-                ));
-            }
-            "pause_plan" | "resume_plan" => {
-                let id = text(command, "plan_id")?;
-                let mut plan = record(&tx, "plans", id)?;
-                check_revision(&plan, command)?;
-                let pause = kind == "pause_plan";
-                if pause
-                    && !matches!(
-                        plan["status"].as_str(),
-                        Some("running" | "reviewing" | "waiting_input")
-                    )
-                {
-                    bail!("此计划当前不能暂停");
-                }
-                if !pause && plan["status"] != "paused" {
-                    bail!("只有已暂停的计划可以恢复");
-                }
-                if !pause && plan["paused_from_status"] == "waiting_input" {
-                    if plan["round"].as_u64().unwrap_or(0) >= MAX_ROUNDS {
-                        bail!("计划已达到 3 轮上限，请新建计划继续处理");
-                    }
-                    plan["round"] = json!(plan["round"].as_u64().unwrap_or(0) + 1);
-                }
-                invalidate_reviews(&tx, id)?;
-                plan["paused_from_status"] = if pause {
-                    plan["status"].clone()
-                } else {
-                    Value::Null
-                };
-                plan["status"] = json!(if pause { "paused" } else { "running" });
-                touch_plan(&mut plan);
-                put(&tx, "plans", &plan)?;
-                set_parent_waiting(&tx, &plan, pause)?;
-                if !pause {
-                    advance_plans(&tx)?;
-                }
-                receipt["plan_id"] = json!(id);
-                receipt["session_id"] = plan["session_id"].clone();
-                produced = Some(plan_event(
-                    &plan,
-                    if pause { "plan_paused" } else { "plan_resumed" },
-                    if pause {
-                        "计划已暂停派发，正在执行的任务可以完成"
-                    } else {
-                        "计划已恢复派发"
-                    },
-                ));
-            }
-            "start_plan" => {
-                let id = text(command, "plan_id")?;
-                let mut plan = record(&tx, "plans", id)?;
-                check_revision(&plan, command)?;
-                if plan["execution_mode"] == "native" && !settings.configured() {
-                    bail!(CONFIGURATION_HINT);
-                }
-                match plan["status"].as_str() {
-                    Some("draft") => {
-                        let (agents, default_id) = role_snapshot(&plan)?;
-                        validate_nodes(&plan["nodes"], &[], false, &agents, &default_id)?;
-                        let task_id = new_id();
-                        let parent = json!({"id":task_id,"session_id":plan["session_id"],"title":plan["title"],
-                        "task_kind":"plan","plan_id":id,"status":"running","execution_mode":plan["execution_mode"],
-                        "created_at":now(),"updated_at":now(),"source":plan["source"],"steps":[
-                            {"id":new_id(),"title":"执行计划节点","status":"running"},
-                            {"id":new_id(),"title":"回顾结果并决定后续行动","status":"queued"}
-                        ]});
-                        put(&tx, "tasks", &parent)?;
-                        plan["task_id"] = json!(task_id);
-                        plan["status"] = json!("running");
-                        plan["round"] = json!(1);
-                        plan["used_node_ids"] = json!(plan["nodes"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|node| node["id"].clone())
-                            .collect::<Vec<_>>());
-                        touch_plan(&mut plan);
-                        put(&tx, "plans", &plan)?;
-                        advance_plans(&tx)?;
-                    }
-                    Some("waiting_input") => {
-                        if plan["round"].as_u64().unwrap_or(0) >= MAX_ROUNDS {
-                            bail!("计划已达到 3 轮上限，请新建计划继续处理");
-                        }
-                        plan["round"] = json!(plan["round"].as_u64().unwrap_or(0) + 1);
-                        plan["status"] = json!("reviewing");
-                        plan["error"] = Value::Null;
-                        touch_plan(&mut plan);
-                        put(&tx, "plans", &plan)?;
-                        set_parent_waiting(&tx, &plan, false)?;
-                        enqueue_review(&tx, &plan)?;
-                    }
-                    _ => bail!("此计划当前不能启动；仅草稿或尚有轮次预算的待确认计划可启动"),
-                }
-                let plan = record(&tx, "plans", id)?;
-                receipt["plan_id"] = json!(id);
-                receipt["session_id"] = plan["session_id"].clone();
-                receipt["task_id"] = plan["task_id"].clone();
-                produced = Some(plan_event(
-                    &plan,
-                    "plan_started",
-                    "计划已启动，独立节点将在后台执行",
-                ));
-            }
-            "cancel_plan" => {
-                let id = text(command, "plan_id")?;
-                let plan = record(&tx, "plans", id)?;
-                receipt["plan_id"] = json!(id);
-                receipt["session_id"] = plan["session_id"].clone();
-                receipt["task_id"] = plan["task_id"].clone();
-                produced = cancel_plan(&tx, id)?.into_iter().last();
-            }
-            "cancel_task" => {
-                let id = text(command, "task_id")?;
-                let mut task = record(&tx, "tasks", id)?;
-                receipt["task_id"] = json!(id);
-                receipt["session_id"] = task["session_id"].clone();
-                if task["task_kind"] == "plan" {
-                    let plan_id = text(&task, "plan_id")?;
-                    receipt["plan_id"] = json!(plan_id);
-                    produced = cancel_plan(&tx, plan_id)?.into_iter().last();
-                } else if task_active(&task) {
-                    task["status"] = json!("cancelled");
-                    task["error"] = json!("用户已取消任务。已有项目修改将保留。");
-                    terminal_steps(&mut task, false);
-                    produced = Some(complete_transaction(&tx, &mut task)?);
-                    advance_plans(&tx)?;
-                } else {
-                    produced = None;
-                }
-            }
-            "retry_delivery" => {
-                let id = text(command, "delivery_id")?;
-                let mut delivery = record(&tx, "deliveries", id)?;
-                if delivery["status"] != "sent" {
-                    delivery["status"] = json!("pending");
-                    delivery["updated_at"] = json!(now());
-                    delivery["error"] = Value::Null;
-                    put(&tx, "deliveries", &delivery)?;
-                }
-                produced = Some(event(None, None, "delivery_retry", "已请求重试回调"));
-            }
-            _ => bail!("不支持的指令类型：{kind}"),
-        }
-        if let Some(ref item) = produced {
-            persist_event(&tx, item)?;
-        }
-        tx.execute(
-            "INSERT INTO commands(id,envelope,receipt) VALUES(?1,?2,?3)",
-            params![command_id, serialized, serde_json::to_string(&receipt)?],
-        )?;
+        let result = command_transaction(&tx, &envelope, settings, "local_owner", None)?;
         tx.commit()?;
-        Ok((receipt, produced))
+        Ok(result)
     }
 
     pub fn claim_task(&mut self) -> Result<Option<Value>> {
         let tx = self.db.transaction()?;
+        qq::reconcile(&tx)?;
+        gateway::reconcile(&tx)?;
         advance_plans(&tx)?;
-        let mut candidates = rows(&tx, "tasks")?;
-        candidates.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
+        let candidates = scheduling::queued_tasks(&tx)?;
         let Some(mut task) = candidates.into_iter().find(|task| {
             task["status"] == "queued"
                 && task["task_kind"] != "plan"
@@ -797,12 +509,9 @@ impl Store {
                 {
                     continue;
                 }
-                history.push(json!({"role":"user","content":message["content"]}));
-                // A queued user message may precede the previous task's result in
-                // storage. Rebuild completed pairs to preserve conversational order.
-                if let Some(result) = other["result"].as_str().or_else(|| other["error"].as_str()) {
-                    history.push(json!({"role":"assistant","content":result}));
-                }
+                // Rebuild each task's original goal, applied supplements, and
+                // outcome together; queued messages may precede prior results.
+                history.extend(main_history_messages(other));
             } else if !reached_current
                 && matches!(message["role"].as_str(), Some("user" | "assistant"))
                 && message["content"] != "任务已交给后台智能体，当前会话可以继续使用。"
@@ -815,6 +524,19 @@ impl Store {
 
     pub fn is_cancelled(&self, task_id: &str) -> Result<bool> {
         Ok(record(&self.db, "tasks", task_id)?["status"] == "cancelled")
+    }
+
+    pub(crate) fn execution_stopped(&self, task_id: &str) -> Result<bool> {
+        let task = record(&self.db, "tasks", task_id)?;
+        Ok(
+            !matches!(task["status"].as_str(), Some("running" | "waiting_input"))
+                || !task["stop_reason"].is_null(),
+        )
+    }
+
+    pub(crate) fn execution_cleanup_settled(&self, task_id: &str) -> Result<bool> {
+        let task = record(&self.db, "tasks", task_id)?;
+        Ok(task["execution_cleanup"].is_null() || task["execution_cleanup"] == "settled")
     }
 
     pub fn task_may_start(&self, task_id: &str) -> Result<bool> {
@@ -871,6 +593,9 @@ impl Store {
     pub fn progress(&mut self, task_id: &str, detail: &str) -> Result<RunEvent> {
         let tx = self.db.transaction()?;
         let mut task = record(&tx, "tasks", task_id)?;
+        if task["status"] != "running" {
+            bail!("任务已停止，忽略迟到的执行进度");
+        }
         if task["status"] == "running" && task["task_kind"] != "plan" {
             task["steps"][0]["status"] = json!("completed");
             task["steps"][1]["status"] = json!("running");
@@ -899,6 +624,9 @@ impl Store {
             bail!("计划父任务只能由主智能体回顾或用户取消来结束");
         }
         let result = result.and_then(|result| {
+            if !execution::verification_complete(&task)? {
+                bail!("任务固化的验收命令尚无最终修改后的成功证据");
+            }
             if let Some(command) = task["acceptance_command"].as_str() {
                 if !has_passing_evidence(&task, command) {
                     bail!("验收命令未取得真实的成功退出证据：{command}");
@@ -926,9 +654,10 @@ impl Store {
 
     pub fn claim_coordinator_job(&mut self) -> Result<Option<Value>> {
         let tx = self.db.transaction()?;
+        qq::reconcile(&tx)?;
+        gateway::reconcile(&tx)?;
         advance_plans(&tx)?;
-        let mut jobs = rows(&tx, "coordinator_jobs")?;
-        jobs.sort_by(|a, b| a["created_at"].as_str().cmp(&b["created_at"].as_str()));
+        let jobs = scheduling::pending_jobs(&tx)?;
         let mut claimed = None;
         for mut job in jobs {
             if job["status"] != "pending" {
@@ -963,6 +692,8 @@ impl Store {
     pub fn coordinator_job_active(&self, job_id: &str) -> Result<bool> {
         let job = record(&self.db, "coordinator_jobs", job_id)?;
         Ok(job["status"] == "running"
+            && qq::check_source(&self.db, &job).is_ok()
+            && gateway::check_source(&self.db, &job).is_ok()
             && (job["kind"] != "review" || review_target_current(&self.db, &job)?)
             && (job["kind"] != "change" || change_target_active(&self.db, &job)?))
     }
@@ -1014,6 +745,19 @@ impl Store {
         if job["status"] != "running" {
             return Ok(Vec::new());
         }
+        // Response readiness and a revocation may race on different workers.
+        // Fence the result inside its commit transaction, not just the wait loop.
+        let result = result.and_then(|value| {
+            qq::check_source(&tx, &job)?;
+            gateway::check_source(&tx, &job)?;
+            providers::check_coordinator_provider(&tx, job_id)
+                .map_err(|_| anyhow!("作业固定的模型服务已改变，未应用旧服务返回的结果"))?;
+            if value["action"] == "plan" {
+                providers::validate_plan_role_providers(&tx, &job["agents"])
+                    .map_err(|_| anyhow!("计划角色的模型服务已撤销或不可用，未生成新计划"))?;
+            }
+            Ok(value)
+        });
         if job["kind"] == "change" {
             if !change_target_active(&tx, &job)? {
                 discard_change_job(&tx, &mut job)?;
@@ -1118,10 +862,7 @@ impl Store {
 
     pub fn deliver_one(&mut self) -> Result<Option<RunEvent>> {
         let tx = self.db.transaction()?;
-        let Some(mut delivery) = rows(&tx, "deliveries")?
-            .into_iter()
-            .find(|item| item["status"] == "pending")
-        else {
+        let Some(mut delivery) = scheduling::pending_delivery(&tx)? else {
             return Ok(None);
         };
         delivery["status"] = json!("sending");
@@ -1159,6 +900,656 @@ impl Store {
         tx.commit()?;
         Ok(Some(item))
     }
+}
+
+fn command_transaction(
+    tx: &Transaction<'_>,
+    envelope: &Value,
+    settings: &Settings,
+    decision_actor: &str,
+    copied_project_root: Option<&str>,
+) -> Result<(Value, Option<RunEvent>)> {
+    let command_id = bounded_text(envelope, "command_id", 128)?.to_string();
+    let serialized = serde_json::to_string(envelope)?;
+    let existing: Option<(String, String)> = tx
+        .query_row(
+            "SELECT envelope,receipt FROM commands WHERE id=?1",
+            [&command_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((original, receipt)) = existing {
+        if original != serialized {
+            bail!("command_id 已被另一条指令使用")
+        };
+        return Ok((serde_json::from_str(&receipt)?, None));
+    }
+    let source = envelope.get("source").context("缺少指令来源 source")?;
+    let command = envelope.get("command").context("缺少 command 指令")?;
+    let kind = text(command, "type")?;
+    let mut receipt = json!({"command_id":command_id,"status":"accepted"});
+    let produced;
+    match kind {
+        "answer_request" | "decide_request" => {
+            // Actor is minted by the authenticated owner or scoped QQ entry;
+            // source routing strings never confer decision authority.
+            let item = decisions::decide(tx, command, decision_actor)?;
+            receipt["task_id"] = json!(item.task_id);
+            receipt["session_id"] = json!(item.session_id);
+            produced = Some(item);
+        }
+        "create_session" => {
+            let title = bounded_text(command, "title", 200)?;
+            let project_path = if let Some(approved) = copied_project_root {
+                if text(command, "project_path")? != approved {
+                    bail!("QQ 项目范围不匹配");
+                }
+                let path = std::path::PathBuf::from(approved);
+                crate::project_files::ScopedProject::open(&path)?;
+                path
+            } else {
+                let path = std::fs::canonicalize(text(command, "project_path")?)
+                    .context("项目目录必须存在")?;
+                if !path.is_dir() {
+                    bail!("项目路径必须是目录");
+                }
+                path
+            };
+            let id = new_id();
+            put(
+                tx,
+                "sessions",
+                &json!({"id":id,"title":title,"project_path":project_path.to_string_lossy(),"created_at":now(),"updated_at":now(),"messages":[]}),
+            )?;
+            select(tx, source, &id)?;
+            receipt["session_id"] = json!(id);
+            produced = Some(event(Some(id), None, "session_created", "会话已创建"));
+        }
+        "select_session" => {
+            let id = text(command, "session_id")?;
+            record(tx, "sessions", id)?;
+            select(tx, source, id)?;
+            receipt["session_id"] = json!(id);
+            produced = Some(event(
+                Some(id.into()),
+                None,
+                "session_selected",
+                "已选择会话",
+            ));
+        }
+        "send_message" => {
+            let id = resolve_session(tx, source, command)?;
+            let content = bounded_text(command, "content", 100_000)?;
+            let mut session = record(tx, "sessions", &id)?;
+            append_message(&mut session, "user", content, None)?;
+            let job_id = new_id();
+            let needs_configuration = settings.execution_mode == "native"
+                && !providers::metadata_configured(tx, settings);
+            let agents = snapshot_agents(tx, settings)?;
+            let mut job = json!({"id":job_id,"kind":"message","session_id":id,"source":source,"content":content,
+                    "agents":agents,"default_agent_id":settings.default_agent_id,
+                    "execution_mode":settings.execution_mode,"status":if needs_configuration {"failed"} else {"pending"},
+                    "created_at":now(),"updated_at":now(),"error":if needs_configuration {Some(CONFIGURATION_HINT)} else {None}});
+            if !needs_configuration {
+                providers::snapshot_coordinator_provider(tx, &mut job, settings)?;
+            }
+            put(tx, "coordinator_jobs", &job)?;
+            if needs_configuration {
+                append_message(&mut session, "assistant", CONFIGURATION_HINT, None)?;
+            }
+            put(tx, "sessions", &session)?;
+            receipt["session_id"] = json!(id);
+            receipt["job_id"] = json!(job_id);
+            produced = Some(event(
+                Some(id),
+                None,
+                if needs_configuration {
+                    "coordinator_needs_configuration"
+                } else {
+                    "coordinator_queued"
+                },
+                if needs_configuration {
+                    CONFIGURATION_HINT
+                } else {
+                    "目标已交给主智能体，当前会话可以继续使用"
+                },
+            ));
+        }
+        "run_agent" | "continue_task" => {
+            let previous = if kind == "continue_task" {
+                let previous = record(tx, "tasks", bounded_text(command, "task_id", 128)?)?;
+                if previous["task_kind"] != "main"
+                    || !matches!(
+                        previous["status"].as_str(),
+                        Some("completed" | "failed" | "cancelled")
+                    )
+                {
+                    bail!("只能从已结束的直接主任务发起新的继续任务");
+                }
+                Some(previous)
+            } else {
+                None
+            };
+            let session_id = if let Some(previous) = &previous {
+                text(previous, "session_id")?.to_owned()
+            } else {
+                resolve_session(tx, source, command)?
+            };
+            let mut continuation_origin = None;
+            let mut continuation_request = None;
+            let content = if let Some(previous) = &previous {
+                let requirement = if command.get("content").is_none_or(Value::is_null) {
+                    previous["continuation_request"]
+                        .as_str()
+                        .unwrap_or("先检查现有项目和真实结果，继续完成原目标中尚未完成的工作。")
+                } else {
+                    bounded_text(command, "content", 8192)?
+                };
+                if requirement.len() > 8192 {
+                    bail!("历史继续要求超过长度限制，请新建目标");
+                }
+                let origin_id = previous["continuation_origin"]
+                    .as_str()
+                    .unwrap_or(text(previous, "id")?);
+                let origin = record(tx, "tasks", origin_id)?;
+                if origin["session_id"] != previous["session_id"] || origin["task_kind"] != "main" {
+                    bail!("继续任务的原始目标关联无效");
+                }
+                continuation_origin = Some(origin_id.to_owned());
+                continuation_request = Some(requirement.to_owned());
+                // Anchor to the original task, never recursively embed an
+                // earlier generated continuation wrapper as the new goal.
+                let objective = origin["objective"]
+                    .as_str()
+                    .or_else(|| origin["title"].as_str())
+                    .unwrap_or_default();
+                let outcome = previous["result"]
+                    .as_str()
+                    .or_else(|| previous["error"].as_str())
+                    .unwrap_or("没有已保存结果");
+                let mut end = outcome.len().min(16 * 1024);
+                while !outcome.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let content = format!("明确继续以下历史任务，而不是自动继续最近一条：\n任务 ID：{}\n原目标：\n{}\n已保存终态：{}\n已保存结果（仅历史证据，不代表重新执行）：\n{}{}\n\n本次继续要求：\n{}\n保留现有修改；不要重复未确认的写入，不得声称未运行的验证通过。",text(previous,"id")?,objective,text(previous,"status")?,&outcome[..end],if end<outcome.len(){"\n[结果预览已截断；完整历史仍保留]"}else{""},requirement);
+                if content.len() > 128 * 1024 {
+                    bail!("继续任务的目标上下文超过 128 KiB，请新建目标并明确范围");
+                }
+                content
+            } else {
+                bounded_text(command, "content", 100_000)?.to_owned()
+            };
+            if !matches!(settings.main_executor.as_str(), "native" | "codex") {
+                bail!("主智能体执行器仅支持 native 或 codex");
+            }
+            if settings.execution_mode == "native"
+                && settings.main_executor == "native"
+                && !providers::metadata_configured(tx, settings)
+            {
+                bail!(CONFIGURATION_HINT);
+            }
+            if active_task_count(tx)? >= MAX_ACTIVE_TASKS {
+                bail!("后台任务已达到 32 个，请先完成或取消部分任务");
+            }
+            let main = AgentProfile {
+                id: "main".into(),
+                name: "主智能体".into(),
+                instructions: String::new(),
+                executor: settings.main_executor.clone(),
+                model: String::new(),
+                ..AgentProfile::default()
+            };
+            let (agent, context) = snapshot_agent(tx, settings, main)?;
+            let sequence = rows(tx, "tasks")?
+                .iter()
+                .filter(|task| task["session_id"] == session_id && task["task_kind"] == "main")
+                .filter_map(|task| task["main_sequence"].as_u64())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let mut task = worker_task(
+                &session_id,
+                &content,
+                &settings.execution_mode,
+                source,
+                None,
+                None,
+                None,
+            );
+            task["task_kind"] = json!("main");
+            if let Some(previous) = &previous {
+                task["continued_from"] = previous["id"].clone();
+                task["continuation_origin"] = json!(continuation_origin);
+                task["continuation_request"] = json!(continuation_request);
+            }
+            task["main_sequence"] = json!(sequence);
+            let controls = execution::resolve_controls(
+                &settings.execution_controls,
+                agent.controls.as_ref(),
+                None,
+                &agent.executor,
+            )?;
+            let prior_controls = previous
+                .as_ref()
+                .and_then(|task| task.get("controls"))
+                .filter(|value| !value.is_null())
+                .map(|value| serde_json::from_value::<harness_core::TaskControls>(value.clone()))
+                .transpose()?;
+            task["controls"] = json!(execution::resolve_controls(
+                &controls,
+                prior_controls.as_ref(),
+                command.get("controls"),
+                &agent.executor
+            )?);
+            task["agent"] = json!(agent);
+            task["context_config"] = json!(context);
+            let task_id = text(&task, "id")?.to_owned();
+            capabilities::snapshot_task_capabilities(tx, &mut task)?;
+            providers::snapshot_task_provider(tx, &mut task)?;
+            put(tx, "tasks", &task)?;
+            let mut session = record(tx, "sessions", &session_id)?;
+            append_message(&mut session, "user", &content, Some(&task_id))?;
+            put(tx, "sessions", &session)?;
+            receipt["session_id"] = json!(session_id);
+            receipt["task_id"] = json!(task_id);
+            produced = Some(event(
+                Some(session_id),
+                Some(task_id),
+                "main_queued",
+                "主智能体已收到目标，正在当前会话中直接处理",
+            ));
+        }
+        "steer_task" => {
+            let task_id = bounded_text(command, "task_id", 128)?;
+            let content = bounded_text(command, "content", 8192)?;
+            let (id, session_id, item) = steering::accept(tx, task_id, content)?;
+            receipt["supplement_id"] = json!(id);
+            receipt["task_id"] = json!(task_id);
+            receipt["session_id"] = json!(session_id);
+            produced = Some(item);
+        }
+        "start_task" => {
+            let session_id = resolve_session(tx, source, command)?;
+            let title = bounded_text(command, "title", 100_000)?;
+            validate_agents(&settings.agents, &settings.default_agent_id)?;
+            let requested = requested_agent(command)?;
+            let agent = resolve_agent(&settings.agents, &settings.default_agent_id, requested)?;
+            let (agent, context) = snapshot_agent(tx, settings, agent)?;
+            if settings.execution_mode == "native"
+                && agent.executor == "native"
+                && !providers::effective_settings(tx, settings, &mut agent.clone())?.configured()
+            {
+                bail!(CONFIGURATION_HINT);
+            }
+            if active_task_count(tx)? >= MAX_ACTIVE_TASKS {
+                bail!("后台任务已达到 32 个，请先完成或取消部分任务");
+            }
+            let mut task = worker_task(
+                &session_id,
+                title,
+                &settings.execution_mode,
+                source,
+                None,
+                None,
+                None,
+            );
+            task["controls"] = json!(execution::resolve_controls(
+                &settings.execution_controls,
+                agent.controls.as_ref(),
+                command.get("controls"),
+                &agent.executor
+            )?);
+            task["agent"] = json!(agent);
+            task["context_config"] = json!(context);
+            let id = text(&task, "id")?.to_string();
+            capabilities::snapshot_task_capabilities(tx, &mut task)?;
+            providers::snapshot_task_provider(tx, &mut task)?;
+            put(tx, "tasks", &task)?;
+            let mut session = record(tx, "sessions", &session_id)?;
+            append_message(&mut session, "user", title, Some(&id))?;
+            append_message(
+                &mut session,
+                "assistant",
+                "任务已交给后台智能体，当前会话可以继续使用。",
+                Some(&id),
+            )?;
+            put(tx, "sessions", &session)?;
+            receipt["session_id"] = json!(session_id);
+            receipt["task_id"] = json!(id);
+            produced = Some(event(
+                Some(session_id),
+                Some(id),
+                "task_queued",
+                "后台任务已排队",
+            ));
+        }
+        "request_plan_change" => {
+            let id = text(command, "plan_id")?;
+            let plan = record(tx, "plans", id)?;
+            check_revision(&plan, command)?;
+            ensure_changeable(&plan)?;
+            let content = bounded_text(command, "content", 64 * 1024)?;
+            if rows(tx, "plan_changes")?
+                .iter()
+                .filter(|change| matches!(change["status"].as_str(), Some("queued" | "running")))
+                .count()
+                >= MAX_ACTIVE_TASKS
+            {
+                bail!("待生成的计划调整已达到 32 个，请等待或放弃部分建议");
+            }
+            if plan["execution_mode"] == "native" && !providers::metadata_configured(tx, settings) {
+                bail!(CONFIGURATION_HINT);
+            }
+            let change_id = new_id();
+            let job_id = new_id();
+            let (agents, default_id) = role_snapshot(&plan)?;
+            put(
+                tx,
+                "plan_changes",
+                &json!({
+                    "id":change_id,"plan_id":id,"session_id":plan["session_id"],
+                    "base_revision":plan["revision"],"source":source,"content":content,
+                    "status":"queued","nodes":[],"created_at":now(),"updated_at":now()
+                }),
+            )?;
+            let mut job = json!({
+                "id":job_id,"kind":"change","change_id":change_id,"plan_id":id,
+                "plan_snapshot":plan,"session_id":plan["session_id"],"source":source,
+                "content":content,"execution_mode":plan["execution_mode"],
+                "agents":agents,"default_agent_id":default_id,"status":"pending",
+                "created_at":now(),"updated_at":now()
+            });
+            providers::inherit_coordinator_provider(tx, &plan, &mut job)?;
+            put(tx, "coordinator_jobs", &job)?;
+            let mut session = record(tx, "sessions", text(&plan, "session_id")?)?;
+            append_message(&mut session, "user", content, plan["task_id"].as_str())?;
+            put(tx, "sessions", &session)?;
+            receipt["plan_id"] = json!(id);
+            receipt["session_id"] = plan["session_id"].clone();
+            receipt["job_id"] = json!(job_id);
+            receipt["change_id"] = json!(change_id);
+            produced = Some(plan_event(
+                &plan,
+                "plan_change_queued",
+                "主智能体正在生成计划调整建议，当前执行继续；建议确认后才会应用",
+            ));
+        }
+        "apply_plan_change" => {
+            let change_id = text(command, "change_id")?;
+            let mut change = record(tx, "plan_changes", change_id)?;
+            if change["status"] != "ready" {
+                bail!("只有待确认的调整建议可以应用");
+            }
+            let id = text(&change, "plan_id")?;
+            let plan = record(tx, "plans", id)?;
+            check_revision(&plan, command)?;
+            if change["base_revision"] != plan["revision"] {
+                bail!("计划版本已变化，此建议已过期，请根据当前计划重新生成");
+            }
+            let plan = apply_plan_edit(
+                tx,
+                id,
+                &json!({
+                    "expected_revision":command["expected_revision"],"nodes":change["nodes"]
+                }),
+            )?;
+            change["status"] = json!("applied");
+            change["updated_at"] = json!(now());
+            put(tx, "plan_changes", &change)?;
+            receipt["plan_id"] = plan["id"].clone();
+            receipt["session_id"] = plan["session_id"].clone();
+            receipt["change_id"] = json!(change_id);
+            produced = Some(plan_event(
+                &plan,
+                "plan_change_applied",
+                "调整建议已应用，执行历史已保留",
+            ));
+        }
+        "discard_plan_change" => {
+            let change_id = text(command, "change_id")?;
+            let mut change = record(tx, "plan_changes", change_id)?;
+            if !matches!(
+                change["status"].as_str(),
+                Some("queued" | "running" | "ready" | "failed")
+            ) {
+                bail!("此调整建议已经处理");
+            }
+            change["status"] = json!("discarded");
+            change["updated_at"] = json!(now());
+            put(tx, "plan_changes", &change)?;
+            for mut job in rows(tx, "coordinator_jobs")? {
+                if job["change_id"] == change_id
+                    && matches!(job["status"].as_str(), Some("pending" | "running"))
+                {
+                    job["status"] = json!("cancelled");
+                    job["updated_at"] = json!(now());
+                    put(tx, "coordinator_jobs", &job)?;
+                }
+            }
+            receipt["plan_id"] = change["plan_id"].clone();
+            receipt["session_id"] = change["session_id"].clone();
+            receipt["change_id"] = json!(change_id);
+            produced = Some(event(
+                change["session_id"].as_str().map(str::to_owned),
+                None,
+                "plan_change_discarded",
+                "调整建议已放弃",
+            ));
+        }
+        "set_plan_layout" => {
+            let id = text(command, "plan_id")?;
+            let mut plan = record(tx, "plans", id)?;
+            let expected = command["expected_layout_revision"]
+                .as_u64()
+                .context("布局版本必须为非负整数")?;
+            if expected != plan["layout_revision"].as_u64().unwrap_or(0) {
+                bail!("画布布局已变化，请刷新后重新保存");
+            }
+            let layout = command["layout"]
+                .as_object()
+                .context("画布布局必须是节点位置对象")?;
+            if layout.len() > MAX_NODES {
+                bail!("画布布局不能超过 12 个节点");
+            }
+            for (node_id, position) in layout {
+                if !plan["nodes"]
+                    .as_array()
+                    .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == *node_id))
+                {
+                    bail!("布局包含不存在的节点：{node_id}");
+                }
+                for axis in ["x", "y"] {
+                    if position[axis]
+                        .as_f64()
+                        .is_none_or(|value| !value.is_finite() || value.abs() > 100_000.0)
+                    {
+                        bail!("节点坐标必须是 -100000 到 100000 之间的有限数值");
+                    }
+                }
+            }
+            plan["layout"] = json!(layout);
+            plan["layout_revision"] = json!(expected + 1);
+            put(tx, "plans", &plan)?;
+            receipt["plan_id"] = json!(id);
+            receipt["session_id"] = plan["session_id"].clone();
+            produced = Some(plan_event(&plan, "plan_layout_updated", "画布布局已保存"));
+        }
+        "update_plan" | "patch_plan" => {
+            let id = text(command, "plan_id")?;
+            let plan = record(tx, "plans", id)?;
+            if kind == "update_plan" && plan["status"] != "draft" {
+                bail!("只有草稿计划可以编辑");
+            }
+            if kind == "patch_plan" && plan["status"] == "draft" {
+                bail!("草稿计划请使用编辑草稿指令");
+            }
+            let plan = apply_plan_edit(tx, id, command)?;
+            receipt["plan_id"] = json!(id);
+            receipt["session_id"] = plan["session_id"].clone();
+            produced = Some(plan_event(
+                &plan,
+                if kind == "patch_plan" {
+                    "plan_patched"
+                } else {
+                    "plan_updated"
+                },
+                "计划已保存，执行历史已保留",
+            ));
+        }
+        "pause_plan" | "resume_plan" => {
+            let id = text(command, "plan_id")?;
+            let mut plan = record(tx, "plans", id)?;
+            check_revision(&plan, command)?;
+            let pause = kind == "pause_plan";
+            if pause
+                && !matches!(
+                    plan["status"].as_str(),
+                    Some("running" | "reviewing" | "waiting_input")
+                )
+            {
+                bail!("此计划当前不能暂停");
+            }
+            if !pause && plan["status"] != "paused" {
+                bail!("只有已暂停的计划可以恢复");
+            }
+            if !pause && plan["paused_from_status"] == "waiting_input" {
+                if plan["round"].as_u64().unwrap_or(0) >= MAX_ROUNDS {
+                    bail!("计划已达到 3 轮上限，请新建计划继续处理");
+                }
+                plan["round"] = json!(plan["round"].as_u64().unwrap_or(0) + 1);
+            }
+            invalidate_reviews(tx, id)?;
+            plan["paused_from_status"] = if pause {
+                plan["status"].clone()
+            } else {
+                Value::Null
+            };
+            plan["status"] = json!(if pause { "paused" } else { "running" });
+            touch_plan(&mut plan);
+            put(tx, "plans", &plan)?;
+            set_parent_waiting(tx, &plan, pause)?;
+            if !pause {
+                advance_plans(tx)?;
+            }
+            receipt["plan_id"] = json!(id);
+            receipt["session_id"] = plan["session_id"].clone();
+            produced = Some(plan_event(
+                &plan,
+                if pause { "plan_paused" } else { "plan_resumed" },
+                if pause {
+                    "计划已暂停派发，正在执行的任务可以完成"
+                } else {
+                    "计划已恢复派发"
+                },
+            ));
+        }
+        "start_plan" => {
+            let id = text(command, "plan_id")?;
+            let mut plan = record(tx, "plans", id)?;
+            check_revision(&plan, command)?;
+            if plan["execution_mode"] == "native" && !providers::metadata_configured(tx, settings) {
+                bail!(CONFIGURATION_HINT);
+            }
+            match plan["status"].as_str() {
+                Some("draft") => {
+                    let (agents, default_id) = role_snapshot(&plan)?;
+                    validate_nodes(&plan["nodes"], &[], false, &agents, &default_id)?;
+                    let task_id = new_id();
+                    let parent = json!({"id":task_id,"session_id":plan["session_id"],"title":plan["title"],
+                    "task_kind":"plan","plan_id":id,"status":"running","execution_mode":plan["execution_mode"],
+                    "created_at":now(),"updated_at":now(),"source":plan["source"],"steps":[
+                        {"id":new_id(),"title":"执行计划节点","status":"running"},
+                        {"id":new_id(),"title":"回顾结果并决定后续行动","status":"queued"}
+                    ]});
+                    put(tx, "tasks", &parent)?;
+                    plan["task_id"] = json!(task_id);
+                    plan["status"] = json!("running");
+                    plan["round"] = json!(1);
+                    plan["used_node_ids"] = json!(plan["nodes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|node| node["id"].clone())
+                        .collect::<Vec<_>>());
+                    touch_plan(&mut plan);
+                    put(tx, "plans", &plan)?;
+                    advance_plans(tx)?;
+                }
+                Some("waiting_input") => {
+                    if plan["round"].as_u64().unwrap_or(0) >= MAX_ROUNDS {
+                        bail!("计划已达到 3 轮上限，请新建计划继续处理");
+                    }
+                    plan["round"] = json!(plan["round"].as_u64().unwrap_or(0) + 1);
+                    plan["status"] = json!("reviewing");
+                    plan["error"] = Value::Null;
+                    touch_plan(&mut plan);
+                    put(tx, "plans", &plan)?;
+                    set_parent_waiting(tx, &plan, false)?;
+                    enqueue_review(tx, &plan)?;
+                }
+                _ => bail!("此计划当前不能启动；仅草稿或尚有轮次预算的待确认计划可启动"),
+            }
+            let plan = record(tx, "plans", id)?;
+            receipt["plan_id"] = json!(id);
+            receipt["session_id"] = plan["session_id"].clone();
+            receipt["task_id"] = plan["task_id"].clone();
+            produced = Some(plan_event(
+                &plan,
+                "plan_started",
+                "计划已启动，独立节点将在后台执行",
+            ));
+        }
+        "cancel_plan" => {
+            let id = text(command, "plan_id")?;
+            let plan = record(tx, "plans", id)?;
+            receipt["plan_id"] = json!(id);
+            receipt["session_id"] = plan["session_id"].clone();
+            receipt["task_id"] = plan["task_id"].clone();
+            produced = cancel_plan(tx, id)?.into_iter().last();
+        }
+        "cancel_task" => {
+            let id = text(command, "task_id")?;
+            let mut task = record(tx, "tasks", id)?;
+            receipt["task_id"] = json!(id);
+            receipt["session_id"] = task["session_id"].clone();
+            if task["task_kind"] == "plan" {
+                let plan_id = text(&task, "plan_id")?;
+                receipt["plan_id"] = json!(plan_id);
+                produced = cancel_plan(tx, plan_id)?.into_iter().last();
+            } else if task_active(&task) {
+                task["status"] = json!("cancelled");
+                task["error"] = json!("用户已取消任务。已有项目修改将保留。");
+                terminal_steps(&mut task, false);
+                produced = Some(complete_transaction(tx, &mut task)?);
+                advance_plans(tx)?;
+            } else {
+                produced = None;
+            }
+        }
+        "retry_delivery" => {
+            let id = text(command, "delivery_id")?;
+            let mut delivery = record(tx, "deliveries", id)?;
+            if delivery["target"]["channel_id"] == "qq" {
+                bail!("QQ 通知不能重放；请由原对话发送新消息查询任务");
+            }
+            if delivery["status"] != "sent" {
+                delivery["status"] = json!("pending");
+                delivery["updated_at"] = json!(now());
+                delivery["error"] = Value::Null;
+                put(tx, "deliveries", &delivery)?;
+            }
+            produced = Some(event(None, None, "delivery_retry", "已请求重试回调"));
+        }
+        _ => bail!("不支持的指令类型：{kind}"),
+    }
+    if let Some(ref item) = produced {
+        persist_event(tx, item)?;
+    }
+    tx.execute(
+        "INSERT INTO commands(id,envelope,receipt) VALUES(?1,?2,?3)",
+        params![command_id, serialized, serde_json::to_string(&receipt)?],
+    )?;
+    Ok((receipt, produced))
 }
 
 fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
@@ -1216,11 +1607,35 @@ fn put(db: &Connection, table: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 fn persist_event(db: &Connection, item: &RunEvent) -> Result<()> {
-    db.execute(
-        "INSERT OR IGNORE INTO events(id,body) VALUES(?1,?2)",
+    let inserted = db.execute(
+        "INSERT INTO events(id,body) SELECT ?1,?2 WHERE NOT EXISTS (SELECT 1 FROM events WHERE id=?1)",
         params![item.id, serde_json::to_string(item)?],
     )?;
+    // A duplicate must not consume AUTOINCREMENT values or skip a cleanup
+    // boundary. The indexed range delete keeps retention bounded even when
+    // transactions persist the same terminal event more than once.
+    let sequence = db.last_insert_rowid().max(0) as u64;
+    if inserted != 0 && sequence > RETAINED_EVENTS {
+        db.execute(
+            "DELETE FROM events WHERE sequence<=?1",
+            [sequence - RETAINED_EVENTS],
+        )?;
+    }
     Ok(())
+}
+
+fn read_events(db: &Connection, sql: &str, parameter: u64) -> Result<Vec<RunEvent>> {
+    let mut statement = db.prepare(sql)?;
+    let rows = statement.query_map([parameter], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.map(|row| {
+        let (sequence, body) = row?;
+        let mut event: RunEvent = serde_json::from_str(&body)?;
+        event.sequence = sequence;
+        Ok(event)
+    })
+    .collect()
 }
 fn select(db: &Connection, source: &Value, session_id: &str) -> Result<()> {
     db.execute("INSERT INTO selections(source,body) VALUES(?1,?2) ON CONFLICT(source) DO UPDATE SET body=excluded.body",params![serde_json::to_string(source)?,serde_json::to_string(&json!({"source":source,"session_id":session_id}))?])?;
@@ -1260,12 +1675,7 @@ fn task_active(task: &Value) -> bool {
 fn task_plan_dispatchable(db: &Connection, task: &Value) -> Result<bool> {
     if task["task_kind"] == "main" {
         let sequence = task["main_sequence"].as_u64().unwrap_or(0);
-        if rows(db, "tasks")?.iter().any(|other| {
-            other["task_kind"] == "main"
-                && other["session_id"] == task["session_id"]
-                && other["main_sequence"].as_u64().unwrap_or(0) < sequence
-                && task_active(other)
-        }) {
+        if scheduling::has_active_main_predecessor(db, text(task, "session_id")?, sequence)? {
             return Ok(false);
         }
     }
@@ -1280,9 +1690,12 @@ fn task_plan_dispatchable(db: &Connection, task: &Value) -> Result<bool> {
 }
 
 fn snapshot_agent(
+    db: &Connection,
     settings: &Settings,
     mut agent: AgentProfile,
 ) -> Result<(AgentProfile, ModelContextConfig)> {
+    let effective = providers::effective_settings(db, settings, &mut agent)?;
+    let settings = &effective;
     if agent.model.trim().is_empty() && agent.executor == "native" {
         agent.model = crate::configuration::resolve(settings)
             .map(|resolved| resolved.model)
@@ -1292,17 +1705,23 @@ fn snapshot_agent(
     }
     let context =
         crate::model_config::resolve(&settings.model_contexts, &agent.model, Some(&agent))?;
+    agent.controls = Some(execution::resolve_controls(
+        &settings.execution_controls,
+        agent.controls.as_ref(),
+        None,
+        &agent.executor,
+    )?);
     agent.context_window = Some(context.context_window);
     agent.compression_threshold = Some(context.compression_threshold);
     Ok((agent, context))
 }
 
-fn snapshot_agents(settings: &Settings) -> Result<Vec<AgentProfile>> {
+fn snapshot_agents(db: &Connection, settings: &Settings) -> Result<Vec<AgentProfile>> {
     settings
         .agents
         .iter()
         .cloned()
-        .map(|agent| snapshot_agent(settings, agent).map(|(agent, _)| agent))
+        .map(|agent| snapshot_agent(db, settings, agent).map(|(agent, _)| agent))
         .collect()
 }
 
@@ -1359,10 +1778,45 @@ fn active_task_count(db: &Connection) -> Result<usize> {
         .iter()
         .filter(|task| {
             task["task_kind"] != "plan"
-                && matches!(task["status"].as_str(), Some("running" | "queued"))
+                && matches!(
+                    task["status"].as_str(),
+                    Some("running" | "queued" | "waiting_input")
+                )
         })
         .count())
 }
+fn main_history_messages(task: &Value) -> Vec<Value> {
+    let mut messages = vec![
+        json!({"role":"user","content":task["objective"].as_str().or_else(||task["title"].as_str()).unwrap_or_default()}),
+    ];
+    let inputs = task["supplements"].as_array().cloned().unwrap_or_default();
+    for input in &inputs {
+        if input["status"] == "applied" {
+            messages.push(json!({"role":"user","content":input["content"]}));
+        }
+    }
+    for answered in task["question_answers"].as_array().into_iter().flatten() {
+        if let (Some(prompt), Some(answer)) =
+            (answered["prompt"].as_str(), answered["answer"].as_str())
+        {
+            messages.push(json!({"role":"assistant","content":format!("此前任务提出的问题（不是授权请求）：{prompt}")}));
+            messages.push(json!({"role":"user","content":answer}));
+        }
+    }
+    let unapplied: Vec<_> = inputs
+        .iter()
+        .filter(|input| input["status"] != "applied")
+        .map(|input| json!({"content":input["content"],"status":input["status"]}))
+        .collect();
+    if !unapplied.is_empty() {
+        messages.push(json!({"role":"assistant","content":format!("先前任务未确认应用的补充记录，仅供背景查询，不作为当前任务指令：{}",json!(unapplied))}));
+    }
+    if let Some(result) = task["result"].as_str().or_else(|| task["error"].as_str()) {
+        messages.push(json!({"role":"assistant","content":result}));
+    }
+    messages
+}
+
 fn worker_task(
     session_id: &str,
     title: &str,
@@ -1373,7 +1827,7 @@ fn worker_task(
     parent_task_id: Option<&str>,
 ) -> Value {
     json!({"id":new_id(),"session_id":session_id,"title":title,"objective":title,"task_kind":"worker","plan_id":plan_id,"node_id":node_id,"parent_task_id":parent_task_id,
-    "agent":AgentProfile::default(),"status":"queued","evidence":[],"execution_mode":execution_mode,"created_at":now(),"updated_at":now(),"source":source,"steps":[
+    "agent":AgentProfile::default(),"status":"queued","evidence":[],"supplements":[],"execution_mode":execution_mode,"created_at":now(),"updated_at":now(),"source":source,"steps":[
         {"id":new_id(),"title":"理解任务目标","status":"queued"},
         {"id":new_id(),"title":"使用项目工具执行","status":"queued"},
         {"id":new_id(),"title":"汇报证据和限制","status":"queued"}
@@ -1396,8 +1850,14 @@ fn terminal_steps(task: &mut Value, success: bool) {
     }
 }
 fn complete_transaction(tx: &Transaction<'_>, task: &mut Value) -> Result<RunEvent> {
+    if task["status"] == "cancelled" && task["stop_reason"].is_null() {
+        task["stop_reason"] = json!("user_cancelled");
+    }
+    decisions::cancel_for_task(tx, text(task, "id")?, "任务已结束，未执行待授权操作")?;
+    steering::finalize(task);
     task["updated_at"] = json!(now());
     put(tx, "tasks", task)?;
+    continuation::complete_context_transaction(tx, task)?;
     sync_task_node(tx, task)?;
     let task_id = text(task, "id")?;
     let session_id = text(task, "session_id")?;
@@ -1419,12 +1879,17 @@ fn complete_transaction(tx: &Transaction<'_>, task: &mut Value) -> Result<RunEve
         "cancelled" => "已取消",
         _ => status,
     };
-    put(
-        tx,
-        "deliveries",
-        &json!({"id":new_id(),"task_id":task_id,"session_id":session_id,"target":task["source"],
+    // Gateway is a scoped read/SSE transport, not an outbound delivery adapter.
+    // Durable task/event/session state below is the only result authority; do not
+    // create an unfulfillable callback or pretend a network send succeeded.
+    if task["source"]["channel_id"] != "gateway" {
+        put(
+            tx,
+            "deliveries",
+            &json!({"id":new_id(),"task_id":task_id,"session_id":session_id,"target":task["source"],
         "status":"pending","payload":format!("会话 {session_id} 的任务 {task_id}：{status_label}\n{result}"),"attempts":0,"created_at":now(),"updated_at":now()}),
-    )?;
+        )?;
+    }
     let mut session = record(tx, "sessions", session_id)?;
     append_message(&mut session, "assistant", result, Some(task_id))?;
     put(tx, "sessions", &session)?;
@@ -1860,7 +2325,7 @@ fn sync_task_node(tx: &Transaction<'_>, task: &Value) -> Result<()> {
 
 fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
     let mut produced = Vec::new();
-    for mut plan in rows(tx, "plans")? {
+    for mut plan in scheduling::running_plans(tx)? {
         if plan["status"] != "running" {
             continue;
         }
@@ -1948,6 +2413,7 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                         requested_agent(&nodes[index])?,
                     )?);
                     let agent: AgentProfile = serde_json::from_value(task["agent"].clone())?;
+                    task["controls"] = json!(agent.controls.clone().unwrap_or_default());
                     task["context_config"] = json!(crate::model_config::resolve(
                         &std::collections::BTreeMap::new(),
                         &agent.model,
@@ -1955,6 +2421,22 @@ fn advance_plans(tx: &Transaction<'_>) -> Result<Vec<RunEvent>> {
                     )?);
                     task["title"] = nodes[index]["title"].clone();
                     task["acceptance_command"] = nodes[index]["acceptance_command"].clone();
+                    // A revoked downstream selection blocks only that node.
+                    // Do not roll back the preceding task's completed result.
+                    // The savepoint also prevents half-created private snapshots
+                    // when the second authority check fails.
+                    tx.execute_batch("SAVEPOINT plan_task_authority")?;
+                    let authority = providers::inherit_task_provider(tx, &plan, &mut task)
+                        .and_then(|_| capabilities::snapshot_task_capabilities(tx, &mut task));
+                    if authority.is_err() {
+                        tx.execute_batch(
+                            "ROLLBACK TO plan_task_authority; RELEASE plan_task_authority",
+                        )?;
+                        nodes[index]["status"] = json!("blocked");
+                        nodes[index]["error"] = json!("后续任务的模型服务或托管能力已撤销或不可用，未创建执行任务；前置结果已保留。");
+                        continue;
+                    }
+                    tx.execute_batch("RELEASE plan_task_authority")?;
                     put(tx, "tasks", &task)?;
                     nodes[index]["status"] = json!("queued");
                     nodes[index]["task_id"] = task["id"].clone();
@@ -2016,11 +2498,9 @@ fn enqueue_review(tx: &Transaction<'_>, plan: &Value) -> Result<()> {
     }) {
         return Ok(());
     }
-    put(
-        tx,
-        "coordinator_jobs",
-        &json!({"id":new_id(),"kind":"review","session_id":plan["session_id"],"plan_id":plan["id"],"plan_revision":plan["revision"],"source":plan["source"],"execution_mode":plan["execution_mode"],"agents":plan["agents"],"default_agent_id":plan["default_agent_id"],"status":"pending","created_at":now(),"updated_at":now()}),
-    )
+    let mut job = json!({"id":new_id(),"kind":"review","session_id":plan["session_id"],"plan_id":plan["id"],"plan_revision":plan["revision"],"source":plan["source"],"execution_mode":plan["execution_mode"],"agents":plan["agents"],"default_agent_id":plan["default_agent_id"],"status":"pending","created_at":now(),"updated_at":now()});
+    providers::inherit_coordinator_provider(tx, plan, &mut job)?;
+    put(tx, "coordinator_jobs", &job)
 }
 fn review_target_current(db: &Connection, job: &Value) -> Result<bool> {
     let plan = record(db, "plans", text(job, "plan_id")?)?;
@@ -2232,10 +2712,11 @@ fn apply_outcome(
             nodes,
         } => {
             let (agents, default_id) = role_snapshot(job)?;
-            let plan = json!({"id":new_id(),"session_id":job["session_id"],"task_id":null,"title":title,"source":job["source"],
+            let mut plan = json!({"id":new_id(),"session_id":job["session_id"],"task_id":null,"title":title,"source":job["source"],
                 "agents":agents,"default_agent_id":default_id,
                 "execution_mode":job["execution_mode"],"status":"draft","revision":1,"round":0,"max_rounds":MAX_ROUNDS,
                 "created_at":now(),"updated_at":now(),"nodes":nodes,"layout":{},"layout_revision":0});
+            providers::inherit_plan_provider(tx, job, &mut plan)?;
             put(tx, "plans", &plan)?;
             append_plan_message(tx, &plan, &message)?;
             produced.push(plan_event(
@@ -2310,6 +2791,475 @@ fn apply_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_summaries_reuse_verified_prefix_and_preserve_later_results() {
+        use crate::continuation::{fingerprint, NativeSummary};
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let first = send(&mut store, json!({"type":"run_agent","content":"FIRST"}));
+        store.claim_task().unwrap();
+        store
+            .finish(
+                first["task_id"].as_str().unwrap(),
+                Ok("FIRST_RESULT".into()),
+            )
+            .unwrap();
+        let second = send(&mut store, json!({"type":"run_agent","content":"SECOND"}));
+        let second_id = second["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        assert!(store
+            .prepare_native_summary(second_id, "config-a")
+            .unwrap()
+            .is_none());
+        let history = store.execution_history(second_id).unwrap();
+        store
+            .save_native_summary(
+                second_id,
+                "config-a",
+                NativeSummary {
+                    summary: "FIRST 的真实结果已保存".into(),
+                    covered_messages: history.len(),
+                    prefix_fingerprint: fingerprint(&json!(history)),
+                },
+            )
+            .unwrap();
+        store.finish(second_id, Ok("SECOND_RESULT".into())).unwrap();
+        let third = send(&mut store, json!({"type":"run_agent","content":"THIRD"}));
+        let third_id = third["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        let summary = store
+            .prepare_native_summary(third_id, "config-a")
+            .unwrap()
+            .unwrap();
+        let history = store.execution_history(third_id).unwrap();
+        assert_eq!(summary.covered_messages, 2);
+        let snapshot = store.snapshot().unwrap();
+        let context = snapshot["context_states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["executor"] == "native")
+            .unwrap();
+        assert_eq!(context["source_task_id"], second_id);
+        assert_ne!(context["source_task_id"], third_id);
+        assert_eq!(history[2]["content"], "SECOND");
+        assert_eq!(history[3]["content"], "SECOND_RESULT");
+        assert!(store
+            .prepare_native_summary(third_id, "different-model")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .save_native_summary(third_id, "config-a", summary.clone())
+            .is_err());
+        send(&mut store, json!({"type":"cancel_task","task_id":third_id}));
+        assert!(store
+            .save_native_summary(
+                third_id,
+                "different-model",
+                NativeSummary {
+                    summary: "迟到摘要".into(),
+                    covered_messages: history.len(),
+                    prefix_fingerprint: fingerprint(&json!(history)),
+                }
+            )
+            .is_err());
+        let fourth = send(
+            &mut store,
+            json!({"type":"run_agent","content":"AFTER_CANCEL"}),
+        );
+        let history = store
+            .execution_history(fourth["task_id"].as_str().unwrap())
+            .unwrap();
+        assert!(history.iter().any(|message| message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("用户已取消"))));
+    }
+
+    fn codex_main(store: &mut Store, goal: &str) -> String {
+        let mut settings = config();
+        settings.main_executor = "codex".into();
+        let receipt = send_with(store, json!({"type":"run_agent","content":goal}), &settings);
+        store.claim_task().unwrap().unwrap();
+        receipt["task_id"].as_str().unwrap().into()
+    }
+
+    fn complete_codex_round(store: &mut Store, task: &str, thread: &str, turn: &str, result: &str) {
+        use crate::codex::CodexLifecycle as L;
+        store
+            .codex_lifecycle(
+                task,
+                L::ThreadReady {
+                    thread_id: thread.into(),
+                },
+            )
+            .unwrap();
+        store
+            .codex_lifecycle(
+                task,
+                L::TurnStarting {
+                    thread_id: thread.into(),
+                },
+            )
+            .unwrap();
+        store
+            .codex_lifecycle(
+                task,
+                L::TurnStarted {
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                },
+            )
+            .unwrap();
+        store
+            .codex_lifecycle(
+                task,
+                L::TurnCompleted {
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                },
+            )
+            .unwrap();
+        store.finish(task, Ok(result.into())).unwrap();
+    }
+
+    #[test]
+    fn codex_association_resumes_three_rounds_but_invalidates_policy_or_foreign_history() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        for n in 1..=3 {
+            let task = codex_main(&mut store, &format!("ROUND{n}"));
+            let prior = store
+                .prepare_codex_continuation(&task, "same-config")
+                .unwrap();
+            assert_eq!(
+                prior,
+                (n > 1).then(|| ("thread-one".into(), format!("turn-{}", n - 1)))
+            );
+            complete_codex_round(
+                &mut store,
+                &task,
+                "thread-one",
+                &format!("turn-{n}"),
+                &format!("RESULT{n}"),
+            );
+        }
+        send(
+            &mut store,
+            json!({"type":"send_message","content":"外部讨论的新要求"}),
+        );
+        let task = codex_main(&mut store, "ROUND4");
+        assert!(store
+            .prepare_codex_continuation(&task, "same-config")
+            .unwrap()
+            .is_none());
+        complete_codex_round(&mut store, &task, "thread-two", "turn-four", "RESULT4");
+        let task = codex_main(&mut store, "ROUND5");
+        assert!(store
+            .prepare_codex_continuation(&task, "new-provider")
+            .unwrap()
+            .is_none());
+        let public = store.snapshot().unwrap()["context_states"].to_string();
+        assert!(!public.contains("new-provider"));
+        assert!(!public.contains("thread-one"));
+        assert!(!public.contains("history_fingerprint"));
+    }
+
+    #[test]
+    fn codex_completed_round_survives_restart_unknown_round_is_never_replayed() {
+        use crate::codex::CodexLifecycle as L;
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("self-agent-context-{}.sqlite", new_id()));
+        let mut store = Store::open(&path).unwrap();
+        session(&mut store);
+        let first = codex_main(&mut store, "FIRST");
+        store.prepare_codex_continuation(&first, "config").unwrap();
+        complete_codex_round(
+            &mut store,
+            &first,
+            "persistent-thread",
+            "turn1",
+            "FIRST_RESULT",
+        );
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        let second = codex_main(&mut store, "SECOND");
+        assert_eq!(
+            store.prepare_codex_continuation(&second, "config").unwrap(),
+            Some(("persistent-thread".into(), "turn1".into()))
+        );
+        store
+            .codex_lifecycle(
+                &second,
+                L::ThreadReady {
+                    thread_id: "persistent-thread".into(),
+                },
+            )
+            .unwrap();
+        store
+            .codex_lifecycle(
+                &second,
+                L::TurnStarting {
+                    thread_id: "persistent-thread".into(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(
+            record(&store.db, "tasks", &second).unwrap()["status"],
+            "failed"
+        );
+        let third = codex_main(&mut store, "THIRD");
+        assert!(store
+            .prepare_codex_continuation(&third, "config")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .codex_lifecycle(
+                &second,
+                L::TurnCompleted {
+                    thread_id: "persistent-thread".into(),
+                    turn_id: "late".into()
+                }
+            )
+            .is_err());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_summary_survives_restart_and_does_not_cross_sessions_or_executors() {
+        use crate::continuation::{fingerprint, NativeSummary};
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("self-agent-summary-{}.sqlite", new_id()));
+        let mut store = Store::open(&path).unwrap();
+        let session_id = session(&mut store);
+        let first = send(&mut store, json!({"type":"run_agent","content":"FIRST"}));
+        store.claim_task().unwrap();
+        store
+            .finish(first["task_id"].as_str().unwrap(), Ok("REAL_RESULT".into()))
+            .unwrap();
+        let second = send(&mut store, json!({"type":"run_agent","content":"SECOND"}));
+        let id = second["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        store.prepare_native_summary(id, "native-config").unwrap();
+        let history = store.execution_history(id).unwrap();
+        store
+            .save_native_summary(
+                id,
+                "native-config",
+                NativeSummary {
+                    summary: "摘要 REAL_RESULT".into(),
+                    covered_messages: history.len(),
+                    prefix_fingerprint: fingerprint(&json!(history)),
+                },
+            )
+            .unwrap();
+        store.finish(id, Ok("SECOND_RESULT".into())).unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        let third = send(
+            &mut store,
+            json!({"type":"run_agent","session_id":session_id,"content":"THIRD"}),
+        );
+        let id = third["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        assert!(store
+            .prepare_native_summary(id, "native-config")
+            .unwrap()
+            .is_some());
+        store.finish(id, Ok("THIRD_RESULT".into())).unwrap();
+        let codex = codex_main(&mut store, "SWITCH_CODEX");
+        store
+            .prepare_codex_continuation(&codex, "codex-config")
+            .unwrap();
+        complete_codex_round(&mut store, &codex, "new-thread", "turn", "CODEX_RESULT");
+        let fourth = send(
+            &mut store,
+            json!({"type":"run_agent","content":"BACK_NATIVE"}),
+        );
+        let id = fourth["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        assert!(store
+            .prepare_native_summary(id, "native-config")
+            .unwrap()
+            .is_none());
+        store.finish(id, Ok("FOURTH_RESULT".into())).unwrap();
+        session(&mut store);
+        let other = send(&mut store, json!({"type":"run_agent","content":"ISOLATED"}));
+        let id = other["task_id"].as_str().unwrap();
+        store.claim_task().unwrap();
+        assert!(store
+            .prepare_native_summary(id, "native-config")
+            .unwrap()
+            .is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_events_migrate_in_order_and_cursors_survive_restart() {
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("self-agent-events-{}.sqlite", new_id()));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE events(id TEXT PRIMARY KEY, body TEXT NOT NULL);")
+            .unwrap();
+        for id in ["old-b", "old-a"] {
+            db.execute(
+                "INSERT INTO events(id,body) VALUES(?1,?2)",
+                params![
+                    id,
+                    json!({"id":id,"kind":"legacy","message":"旧事件","created_at":"same"})
+                        .to_string()
+                ],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let store = Store::open(&path).unwrap();
+        let events = store.events_after(0).unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["old-b", "old-a"]
+        );
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(store.snapshot().unwrap()["event_cursor"], 2);
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        session(&mut store);
+        assert_eq!(store.event_cursor().unwrap(), 3);
+        assert_eq!(store.events_after(2).unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streaming_snapshot_and_event_commit_atomically_and_reject_late_output() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let receipt = send(&mut store, json!({"type":"run_agent","content":"目标"}));
+        let id = receipt["task_id"].as_str().unwrap();
+        store.claim_task().unwrap().unwrap();
+        let before = store.event_cursor().unwrap();
+        let delta = || ExecutionEvent::AssistantDelta {
+            text: "中文回复".into(),
+        };
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER reject_delta BEFORE INSERT ON events
+            WHEN json_extract(NEW.body,'$.kind')='assistant_delta'
+            BEGIN SELECT RAISE(ABORT,'fixture'); END;",
+            )
+            .unwrap();
+        assert!(store.execution_event(id, delta()).is_err());
+        assert!(record(&store.db, "tasks", id).unwrap()["stream_output"].is_null());
+        assert_eq!(store.event_cursor().unwrap(), before);
+        store.db.execute_batch("DROP TRIGGER reject_delta").unwrap();
+        let event = store.execution_event(id, delta()).unwrap();
+        assert_eq!(event.sequence, before + 1);
+        assert_eq!(
+            store.events_after(before).unwrap()[0].sequence,
+            event.sequence
+        );
+        assert_eq!(
+            record(&store.db, "tasks", id).unwrap()["stream_output"],
+            "中文回复"
+        );
+        send(&mut store, json!({"type":"cancel_task","task_id":id}));
+        let cancelled_cursor = store.event_cursor().unwrap();
+        assert!(store.execution_event(id, delta()).is_err());
+        assert!(store.progress(id, "迟到进度").is_err());
+        assert!(store.finish(id, Ok("迟到成功".into())).unwrap().is_none());
+        assert_eq!(store.event_cursor().unwrap(), cancelled_cursor);
+        let terminal = store
+            .events_after(before)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "task_cancelled")
+            .count();
+        assert_eq!(terminal, 1);
+    }
+
+    #[test]
+    fn pruned_or_future_cursors_require_snapshot_and_sequences_are_not_reused() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        for _ in 0..(RETAINED_EVENTS + 128) {
+            persist_event(&store.db, &event(None, None, "fixture", "事件")).unwrap();
+        }
+        let latest = store.event_cursor().unwrap();
+        let count: u64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert!(count <= RETAINED_EVENTS + 127);
+        assert!(store.events_after(0).is_err());
+        assert!(store.events_after(latest + 1).is_err());
+        assert!(store.events_after(latest).unwrap().is_empty());
+        let first: u64 = store
+            .db
+            .query_row("SELECT MIN(sequence) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(store.events_after(first - 1).unwrap()[0].sequence, first);
+        store.db.execute("DELETE FROM events", []).unwrap();
+        session(&mut store);
+        assert!(store.event_cursor().unwrap() > latest);
+    }
+
+    #[test]
+    fn duplicate_event_persistence_cannot_skip_retention_cleanup() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        for _ in 0..(RETAINED_EVENTS + 256) {
+            let item = event(None, None, "fixture", "重复提交");
+            persist_event(&store.db, &item).unwrap();
+            persist_event(&store.db, &item).unwrap();
+        }
+        let count: u64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, RETAINED_EVENTS);
+        assert_eq!(store.event_cursor().unwrap(), RETAINED_EVENTS + 256);
+        assert!(store.events_after(0).is_err());
+    }
+
+    #[test]
+    fn stream_snapshot_is_bounded_on_utf8_boundaries() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let receipt = send(&mut store, json!({"type":"run_agent","content":"目标"}));
+        let id = receipt["task_id"].as_str().unwrap();
+        store.claim_task().unwrap().unwrap();
+        for _ in 0..100 {
+            store
+                .execution_event(
+                    id,
+                    ExecutionEvent::AssistantDelta {
+                        text: "中".repeat(1000),
+                    },
+                )
+                .unwrap();
+        }
+        let task = record(&store.db, "tasks", id).unwrap();
+        assert!(task["stream_output"].as_str().unwrap().len() <= MAX_STREAM_TEXT);
+        assert_eq!(task["stream_output_truncated"], true);
+        assert!(store
+            .execution_event(
+                id,
+                ExecutionEvent::AssistantDelta {
+                    text: "x".repeat(MAX_EVENT_BYTES),
+                }
+            )
+            .is_err());
+    }
     fn source() -> Value {
         json!({"channel_id":"simulator","actor_id":"owner","conversation_id":"remote-1"})
     }
@@ -2619,7 +3569,7 @@ mod tests {
     }
     #[test]
     fn outbox_survives_restart_without_repeating_completed_work() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");
         {
@@ -2788,6 +3738,7 @@ mod tests {
         let first = store.claim_task().unwrap().unwrap();
         let mut expected_agent = original.agents[0].clone();
         expected_agent.context_window = Some(64_000);
+        expected_agent.controls = Some(original.execution_controls.clone());
         assert_eq!(first["agent"], json!(expected_agent));
         assert_eq!(first["context_config"]["context_window"], 64_000);
         assert_eq!(first["context_config"]["compression_threshold"], 55);
@@ -2850,7 +3801,7 @@ mod tests {
 
     #[test]
     fn direct_codex_tasks_do_not_require_main_model_and_keep_role_after_cancel_restart() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let task_id;
@@ -2903,7 +3854,7 @@ mod tests {
 
     #[test]
     fn restart_migrates_pre_role_plans_jobs_and_tasks_without_using_new_settings() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         {
@@ -3476,7 +4427,7 @@ mod tests {
 
     #[test]
     fn restart_retries_coordinator_but_fails_running_child_and_preserves_parent() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let plan_id;
@@ -3558,7 +4509,7 @@ mod tests {
 
     #[test]
     fn restart_retries_uncommitted_review_without_failing_plan_parent() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let parent_id;
@@ -3705,6 +4656,42 @@ mod tests {
         assert_eq!(
             record(&store.db, "tasks", cancelled["task_id"].as_str().unwrap()).unwrap()["status"],
             "cancelled"
+        );
+    }
+
+    #[test]
+    fn indexed_claim_skips_paused_plan_and_blocked_session_without_starvation() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        session(&mut store);
+        let plan = draft(&mut store, json!([node("paused-first", &[])]));
+        start(&mut store, &plan);
+        control(&mut store, plan["id"].as_str().unwrap(), "pause_plan");
+        // The oldest queued child is in a paused plan, not a reason to stop
+        // searching the queue before a later independently runnable main task.
+        let first = send(&mut store, json!({"type":"run_agent","content":"FIRST"}));
+        let blocked = send(&mut store, json!({"type":"run_agent","content":"BLOCKED"}));
+        assert_eq!(store.claim_task().unwrap().unwrap()["id"], first["task_id"]);
+        assert!(store.claim_task().unwrap().is_none());
+        session(&mut store);
+        let other = send(
+            &mut store,
+            json!({"type":"run_agent","content":"OTHER SESSION"}),
+        );
+        assert_eq!(store.claim_task().unwrap().unwrap()["id"], other["task_id"]);
+        assert_eq!(
+            record(&store.db, "tasks", blocked["task_id"].as_str().unwrap()).unwrap()["status"],
+            "queued"
+        );
+        store
+            .finish(first["task_id"].as_str().unwrap(), Ok("done".into()))
+            .unwrap();
+        assert_eq!(
+            store.claim_task().unwrap().unwrap()["id"],
+            blocked["task_id"]
+        );
+        assert_eq!(
+            current_plan(&store, plan["id"].as_str().unwrap())["status"],
+            "paused"
         );
     }
 
@@ -3863,7 +4850,7 @@ mod tests {
 
     #[test]
     fn acceptance_requires_exact_successful_tool_evidence_and_keeps_failure_history() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let mut store = Store::open(&path).unwrap();
@@ -4012,7 +4999,7 @@ mod tests {
 
     #[test]
     fn paused_plan_evidence_and_queued_work_survive_restart_without_replay() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let id;
@@ -4320,7 +5307,7 @@ mod tests {
 
     #[test]
     fn suggestion_restart_retries_generation_and_preserves_ready_without_autoapply() {
-        let dir = std::env::temp_dir().join(new_id());
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(new_id());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let plan;

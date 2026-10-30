@@ -21,13 +21,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy -p harness-core -p harness-daemon -p harness-cli --all-targets -- -D warnings
-      - run: cargo test -p harness-core -p harness-daemon -p harness-cli
-      - run: cargo build -p harness-daemon -p harness-cli
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p harness-core -p harness-daemon -p harness-cli -p harness-gateway --all-targets -- -D warnings
+      - run: cargo test -p harness-core -p harness-daemon -p harness-cli -p harness-gateway
+      - run: cargo build -p harness-daemon -p harness-cli -p harness-gateway
       - run: python scripts/smoke.py
       - run: python scripts/provider_smoke.py
       - run: python scripts/configuration_smoke.py
@@ -36,6 +36,23 @@ jobs:
       - run: python scripts/runtime_smoke.py
       - run: python scripts/plan_change_smoke.py
       - run: python scripts/headless_smoke.py
+      - run: python scripts/streaming_smoke.py
+      - run: python scripts/continuation_smoke.py
+      - run: python scripts/steering_smoke.py
+      - run: python scripts/changes_smoke.py
+      - run: python scripts/budget_smoke.py
+      - run: python scripts/execution_control_smoke.py
+      - run: python scripts/capabilities_smoke.py
+      - run: python scripts/qq_smoke.py
+      - run: python scripts/gateway_smoke.py
+      - run: python scripts/reliability_smoke.py
+      - run: python scripts/history_smoke.py
+      - run: python scripts/history_benchmark.py --self-test
+      - run: cargo build -p harness-daemon --example update_fixture
+      - run: python scripts/update_control_smoke.py
+      - run: python scripts/package_lifecycle_smoke.py --self-test
+      - run: python scripts/package_lifecycle_smoke.py
+      - run: python scripts/daemon_shutdown_smoke.py
 
   desktop:
     name: Desktop / ${{ matrix.os }}
@@ -63,5 +80,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: pnpm build:web
+      - run: pnpm build:mobile
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/web_stream_smoke.py
       - run: node scripts/prepare-sidecar.mjs
       - run: cargo check -p self-agent-desktop
+      - run: cargo test -p self-agent-desktop --lib

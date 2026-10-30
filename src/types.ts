@@ -1,3 +1,7 @@
+import type { NamedProviders } from "./providers-client";
+import type { CapabilitySelection, ManagedCapabilities } from "./capabilities-client";
+export type { CapabilitySelection, ManagedCapabilities, McpServerView, SkillView } from "./capabilities-client";
+
 export interface SourceContext {
   channel_id: string;
   actor_id: string;
@@ -9,6 +13,7 @@ export interface Message {
   content: string;
   created_at: string;
   task_id?: string;
+  history_offset?: number;
 }
 export interface Session {
   id: string;
@@ -29,7 +34,124 @@ export interface ExecutionEvidence {
   exit_code: number;
   output: string;
 }
+export interface TaskSupplement {
+  id: string;
+  task_id: string;
+  content: string;
+  status: "pending" | "delivering" | "applied" | "not_applied" | "unknown";
+  reason?: string | null;
+  applied_via?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+export interface ChangesSummary {
+  state: string;
+  visible_files?: number;
+  skipped_files?: number;
+  partial?: boolean;
+  excluded_count?: number;
+  attribution?: string;
+}
+export interface GitStatusEntry {
+  path: string; index: string; worktree: string; untracked: boolean;
+  raw_worktree?: "equal_bytes" | "different_bytes" | "missing" | "unknown" | "not_in_index_ignore_unknown" | "not_present";
+}
+export interface GitObservation {
+  state: "available" | "partial" | "not_git" | "unavailable";
+  reason?: string;
+  omitted_count?: number;
+  head_comparison?: "available" | "unknown";
+  worktree_comparison?: "raw_bytes_only";
+  reasons?: string[];
+  notice?: string;
+  entries: GitStatusEntry[];
+}
+export interface ChangesReport {
+  version?: number;
+  reason?: string;
+  task_id?: string;
+  summary?: ChangesSummary;
+  state?: string;
+  scope?: string;
+  coverage?: string;
+  attribution?: string;
+  notice?: string;
+  files?: {
+    path: string; status: "added" | "modified" | "deleted" | "renamed"; previous_path?: string;
+    binary: boolean; before_bytes: number | null; after_bytes: number | null;
+    before_readonly: boolean | null; after_readonly: boolean | null;
+    before_mode: number | null; after_mode: number | null;
+    diff_state: "available" | "binary_not_shown" | "diff_budget_exceeded"; diff?: string;
+  }[];
+  skipped?: { path: string; reason: string }[];
+  baseline_git?: GitObservation;
+  current_git?: GitObservation;
+  partial?: boolean;
+  excluded_count?: number;
+  sensitive_file_count?: number;
+  limits?: Record<string, number>;
+  exclusions?: string;
+}
+export interface TaskContextEstimate {
+  estimated_input_tokens: number;
+  context_window: number;
+  compression_threshold: number;
+  source: string;
+  phase: string;
+  updated_at: string;
+}
+export interface TaskContextCompaction {
+  state: string;
+  updated_at: string;
+}
+export type PermissionMode = "allow" | "ask" | "deny";
+export interface ExecutionBudget {
+  max_model_requests: number;
+  max_runtime_seconds: number;
+  max_retries: number;
+  max_repair_attempts: number;
+  max_output_bytes: number;
+  max_external_calls: number;
+}
+export interface TaskControls {
+  budget: ExecutionBudget;
+  permissions: { read_files: boolean; write_files: PermissionMode; run_commands: PermissionMode; managed_tools: PermissionMode };
+  acceptance_commands: string[];
+  capabilities: CapabilitySelection;
+}
+export interface TaskControlsInput {
+  budget?: Partial<ExecutionBudget>;
+  permissions?: Partial<TaskControls["permissions"]>;
+  acceptance_commands?: string[];
+  capabilities?: CapabilitySelection;
+}
+export interface BudgetUsage {
+  model_requests: number; retries: number; repair_attempts: number; output_bytes: number;
+  external_calls?: number;
+  mutation_generation: number; started_at: string | null;
+}
+export interface VerificationAttempt {
+  id: string; command: string; exit_code: number | null; output: string;
+  mutation_generation: number; created_at: string;
+}
+export interface ExecutionRequest {
+  id: string; task_id: string; session_id: string; kind: "question" | "approval";
+  prompt: string; action: Record<string, unknown> | null; action_digest: string | null;
+  revision: number; status: "pending" | "answered" | "approved" | "denied" | "expired" | "cancelled";
+  expires_at_ms: number; answer: string | null; reason?: string;
+  created_at?: string; updated_at?: string; consumed_at?: string | null;
+}
+export interface CapabilityReference { id: string; revision: number; name: string; digest: string }
+export interface TaskCapabilities { mcp_servers: CapabilityReference[]; skills: CapabilityReference[] }
+export interface CapabilityCallRecord {
+  id: string; task_id: string; server_id: string; revision: number; tool: string; digest: string;
+  status: string; reason: string | null; created_at: string; updated_at: string;
+}
 export interface TaskRun {
+  managed_provider?: {id:string;revision:number;name:string;model:string} | null;
+  managed_capabilities?: TaskCapabilities;
+  capability_calls?: CapabilityCallRecord[];
+  execution_cleanup_owner_ack?: {expected_updated_at:string;confirmed_at:string;source:"local_owner"} | null;
   id: string;
   session_id: string;
   title: string;
@@ -38,6 +160,11 @@ export interface TaskRun {
   created_at: string;
   updated_at: string;
   result?: string;
+  supplements?: TaskSupplement[];
+  continued_from?: string | null;
+  changes_summary?: ChangesSummary | null;
+  stream_output?: string;
+  stream_output_truncated?: boolean;
   error?: string;
   source: SourceContext;
   steps: TaskStep[];
@@ -46,13 +173,24 @@ export interface TaskRun {
   task_kind?: "worker" | "plan" | "main";
   agent?: AgentProfile | null;
   context_config?: ModelContextConfig | null;
+  context_estimate?: TaskContextEstimate | null;
+  context_compaction?: TaskContextCompaction | null;
   main_sequence?: number | null;
   evidence?: ExecutionEvidence[];
+  controls?: TaskControls | null;
+  budget_usage?: BudgetUsage | null;
+  stop_reason?: string | null;
+  execution_cleanup?: "pending" | "settled" | "unknown" | null;
+  execution_cleanup_updated_at?: string | null;
+  verification_attempts?: VerificationAttempt[];
+  waiting_request_id?: string | null;
 }
 export interface AgentProfile {
+  provider_id?: string | null;
   id: string;
   name: string;
   instructions: string;
+  controls?: TaskControls | null;
   executor: "native" | "codex";
   model: string;
   context_window?: number | null;
@@ -125,13 +263,22 @@ export interface Delivery {
   updated_at: string;
   error?: string;
 }
+export type ExecutionEvent =
+  | { kind: "assistant_delta"; text: string }
+  | { kind: "tool_started"; call_id: string; name: string }
+  | { kind: "tool_finished"; call_id: string; name: string; success: boolean; output: string }
+  | { kind: "usage"; input_tokens: number | null; output_tokens: number | null; scope?: string }
+  | { kind: "context_compaction"; state: string }
+  | { kind: "context_estimate"; estimated_input_tokens: number; context_window: number; compression_threshold: number; source: string; phase: string };
 export interface RunEvent {
   id: string;
+  sequence?: number;
   session_id?: string;
   task_id?: string;
   kind: string;
   message: string;
   created_at: string;
+  data?: ExecutionEvent;
 }
 export interface Capability {
   id: string;
@@ -140,7 +287,26 @@ export interface Capability {
   description: string;
   enabled: boolean;
 }
+export interface ContextState {
+  session_id: string;
+  executor: "native" | "codex";
+  state: string;
+  reason: string;
+  covered_messages: number | null;
+  source_task_id: string;
+  updated_at: string;
+}
 export interface Snapshot {
+  history?: {
+    version: 1; anchor: string;
+    collections: Record<string, { total: number; returned: number; has_more: boolean; pending?: number; omitted?: number; pinned?: number; pinned_pending?: number; unavailable?: { id: string; reason: string }[] }>;
+    session_messages: Record<string, { offset: number; total: number; returned: number; has_more_before: boolean; unavailable?: { id: string; offset: number; reason: string }[] }>;
+  };
+  named_providers?: NamedProviders;
+  managed_capabilities?: ManagedCapabilities;
+  execution_requests?: ExecutionRequest[];
+  context_states?: ContextState[];
+  event_cursor?: number;
   sessions: Session[];
   tasks: TaskRun[];
   deliveries: Delivery[];
@@ -155,8 +321,10 @@ export interface ModelContextConfig {
   compression_threshold: number;
 }
 export interface Settings {
+  execution_controls?: TaskControls;
   api_key_configured?: boolean;
-  provider_source?: "manual" | "local_codex";
+  provider_source?: "manual" | "local_codex" | "named";
+  provider_id?: string | null;
   configuration_error?: string | null;
   base_url: string;
   model: string;
@@ -173,9 +341,13 @@ export type Command =
   | { type: "create_session"; title: string; project_path: string }
   | { type: "select_session"; session_id: string }
   | { type: "send_message"; session_id?: string; content: string }
-  | { type: "run_agent"; session_id?: string; content: string }
-  | { type: "start_task"; session_id?: string; title: string }
+  | { type: "run_agent"; session_id?: string; content: string; controls?: TaskControlsInput }
+  | { type: "start_task"; session_id?: string; title: string; controls?: TaskControlsInput }
   | { type: "cancel_task"; task_id: string }
+  | { type: "answer_request"; request_id: string; expected_revision: number; answer: string }
+  | { type: "decide_request"; request_id: string; expected_revision: number; approve: boolean; action_digest: string }
+  | { type: "steer_task"; task_id: string; content: string }
+  | { type: "continue_task"; task_id: string; content?: string }
   | { type: "update_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
   | { type: "patch_plan"; plan_id: string; expected_revision: number; nodes: EditablePlanNode[] }
   | { type: "set_plan_layout"; plan_id: string; expected_layout_revision: number; layout: PlanLayout }
@@ -192,6 +364,7 @@ export interface Receipt {
   session_id?: string;
   task_id?: string;
   plan_id?: string;
+  supplement_id?: string;
   job_id?: string;
   change_id?: string;
 }

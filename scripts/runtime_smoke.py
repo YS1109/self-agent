@@ -61,7 +61,7 @@ class Model(BaseHTTPRequestHandler):
                 else:
                     output = {"action": "complete", "message": "修复已通过实际命令复验，保留最初失败历史。"}
             message = {"role": "assistant", "content": json.dumps(output, ensure_ascii=False)}
-        data = json.dumps({"choices": [{"message": message}]}).encode()
+        data = json.dumps({"choices": [{"message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))

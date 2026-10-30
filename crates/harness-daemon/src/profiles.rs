@@ -36,8 +36,16 @@ pub fn validate_agents(agents: &[AgentProfile], default_id: &str) -> Result<()> 
         if agent.instructions.len() > 32_000 || agent.model.len() > 200 {
             bail!("角色指令不能超过 32000 字节，模型名不能超过 200 字节");
         }
+        if let Some(id) = &agent.provider_id {
+            if agent.executor != "native" || uuid::Uuid::parse_str(id).is_err() {
+                bail!("只有 Native 角色可选择有效的命名模型服务 UUID");
+            }
+        }
         crate::configuration::validate_model(&agent.model)?;
         crate::model_config::validate_overrides(agent)?;
+        if let Some(controls) = &agent.controls {
+            crate::store::execution::resolve_controls(controls, None, None, &agent.executor)?;
+        }
         if !matches!(agent.executor.as_str(), "native" | "codex") {
             bail!("角色执行器仅支持 native 或 codex");
         }

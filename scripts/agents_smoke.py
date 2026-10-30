@@ -40,7 +40,7 @@ class ModelFixture(BaseHTTPRequestHandler):
                     ],
                 }
             message = {"role": "assistant", "content": json.dumps(output, ensure_ascii=False)}
-        encoded = json.dumps({"choices": [{"message": message}]}).encode()
+        encoded = json.dumps({"choices": [{"message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
@@ -121,6 +121,9 @@ def main():
                 "api_key": "fixture-secret-not-for-storage",
                 "model_contexts": contexts,
             })
+            defaults = daemon.request("GET", "/api/v1/settings")["execution_controls"]
+            for expected in expected_agents:
+                expected["controls"] = defaults
             session_id = daemon.command({
                 "type": "create_session", "title": "角色协议验证", "project_path": str(project),
             }, REMOTE)["session_id"]

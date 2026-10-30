@@ -1,19 +1,21 @@
+import type { NamedProvider } from "../providers-client";
 import { useEffect, useState } from "react";
 import { Layers3, RotateCcw } from "lucide-react";
 import type { Settings } from "../types";
-import { modelContext } from "../model-context";
+import { modelContext, mainEffectiveModel, agentEffectiveModel } from "../model-context";
 import { Button } from "./ui/button";
 import { Select } from "./ui/select";
 import type { ModelCatalog } from "./model-select";
 
-export function ModelContextSettings({ settings, onChange, disabled, catalogs }: {
-  settings: Settings; onChange: (settings: Settings) => void; disabled: boolean; catalogs: ModelCatalog[];
+export function ModelContextSettings({ settings, onChange, disabled, catalogs, providers = [] }: {
+  settings: Settings; onChange: (settings: Settings) => void; disabled: boolean; catalogs: ModelCatalog[]; providers?: NamedProvider[];
 }) {
-  const [target, setTarget] = useState(settings.model);
-  useEffect(() => setTarget(settings.model), [settings.model]);
+  const mainModel = mainEffectiveModel(settings, providers);
+  const [target, setTarget] = useState(mainModel);
+  useEffect(() => setTarget(mainModel), [mainModel]);
   const models = [...new Set([
-    settings.model,
-    ...settings.agents.map((agent) => agent.model),
+    mainModel,
+    ...settings.agents.map((agent) => agentEffectiveModel(settings, agent, providers)),
     ...Object.keys(settings.model_contexts ?? {}),
     ...catalogs.flatMap((catalog) => catalog.models.map((model) => model.id)),
   ].filter(Boolean))];
@@ -28,7 +30,7 @@ export function ModelContextSettings({ settings, onChange, disabled, catalogs }:
     <p className="help-text">按模型 ID 统一保存，主智能体和使用同一模型的子智能体共享。子智能体可分别覆盖窗口和阈值。未单独配置时使用 128,000 tokens / 80%。</p>
     <label>配置模型
       <Select aria-label="上下文配置模型" disabled={disabled || !models.length} value={model} onValueChange={setTarget}
-        options={models.length ? models.map((id) => ({ value: id, label: `${id}${id === settings.model ? " · 主模型" : ""}` })) : [{ value: "", label: "请先选择模型" }]} />
+        options={models.length ? models.map((id) => ({ value: id, label: `${id}${id === mainModel ? " · 主模型" : ""}` })) : [{ value: "", label: "请先选择模型" }]} />
     </label>
     <div className="context-fields">
       <label>上下文窗口（tokens）

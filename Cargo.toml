@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/harness-core", "crates/harness-daemon", "crates/harness-cli", "src-tauri"]
-default-members = ["crates/harness-core", "crates/harness-daemon", "crates/harness-cli"]
+members = ["crates/harness-core", "crates/harness-daemon", "crates/harness-cli", "crates/harness-gateway", "src-tauri"]
+default-members = ["crates/harness-core", "crates/harness-daemon", "crates/harness-cli", "crates/harness-gateway"]
 resolver = "2"
 
 [workspace.package]
@@ -13,13 +13,19 @@ rust-version = "1.96"
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 futures-util = "0.3"
+flate2 = "1"
+sha1 = "0.10"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup", "serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 shlex = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

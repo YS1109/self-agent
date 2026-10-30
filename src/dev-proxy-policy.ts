@@ -3,8 +3,29 @@ const localOrigins = new Set([
   "http://localhost:1420",
 ]);
 
+export function historyProxyPath(path: string): boolean {
+  const id = "[A-Za-z0-9_-]{1,128}", cursor = "[A-Za-z0-9_-]{1,2048}";
+  return new RegExp(`^/api/v1/tasks/${id}$`).test(path)
+    || new RegExp(`^/api/v1/history/(?:sessions|tasks|plans|plan_changes|deliveries|execution_requests)(?:\\?(?:session_id=${id}(?:&cursor=${cursor})?|cursor=${cursor}))?$`).test(path)
+    || new RegExp(`^/api/v1/history/sessions/${id}/messages(?:\\?cursor=${cursor})?$`).test(path);
+}
+
 const routes: Record<string, string> = {
-  "GET /api/v1/snapshot": "GET",
+  "GET /api/v1/lifecycle": "GET",
+  "POST /api/v1/lifecycle/shutdown?wait_ms=30000": "POST",
+  "GET /api/v1/snapshot?window=1": "GET",
+  "GET /api/v1/reliability": "GET",
+  "GET /api/v1/reliability/updates": "GET",
+  "GET /api/v1/reliability/diagnostics": "GET",
+  "POST /api/v1/reliability/backups": "POST",
+  "GET /api/v1/gateway": "GET",
+  "POST /api/v1/gateway/commands": "POST",
+  "GET /api/v1/qq": "GET",
+  "POST /api/v1/qq/commands": "POST",
+  "GET /api/v1/providers": "GET",
+  "POST /api/v1/providers/commands": "POST",
+  "GET /api/v1/capabilities": "GET",
+  "POST /api/v1/capabilities/commands": "POST",
   "GET /api/v1/settings": "GET",
   "GET /api/v1/provider/local-codex": "GET",
   "POST /api/v1/settings/check": "POST",
@@ -14,6 +35,45 @@ const routes: Record<string, string> = {
   "PUT /api/v1/settings": "PUT",
 };
 
+export function eventProxyPath(path: string): boolean {
+  const match = /^\/api\/v1\/events\?after=(0|[1-9]\d*)$/.exec(path);
+  return !!match && Number.isSafeInteger(Number(match[1]));
+}
+
+export function changesProxyPath(path: string): boolean {
+  return /^\/api\/v1\/tasks\/[A-Za-z0-9_-]{1,128}\/changes$/.test(path);
+}
+
+export function cleanupResolutionProxyPath(path: string): boolean {
+  return /^\/api\/v1\/tasks\/[A-Za-z0-9_-]{1,128}\/cleanup-resolution$/.test(path);
+}
+
+export function credentialOperationProxyPath(path:string):boolean { return /^\/api\/v1\/credential-operations\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(path); }
+
+export function providerMutationProxyPath(path:string):boolean {
+  return /^\/api\/v1\/(?:providers\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/(?:credential|credential-delete)|credential-operations\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/cleanup)$/.test(path);
+}
+
+export function mcpCredentialProxyPath(method:string,path:string):boolean {
+ const id="[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+ return method==="GET"?new RegExp(`^/api/v1/capability-credential-operations/${id}$`).test(path):method==="POST"&&(new RegExp(`^/api/v1/capabilities/mcp/${id}/credentials/[A-Z][A-Z0-9_]{0,63}(?:/delete)?$`).test(path)||new RegExp(`^/api/v1/capability-credential-operations/${id}/cleanup$`).test(path));
+}
+
+export function backupReceiptProxyPath(path:string):boolean {return /^\/api\/v1\/reliability\/backups\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(path);}
+
+export function qqProxyPath(method:string,path:string):boolean {
+ const id="[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+ if(method==="GET")return new RegExp(`^/api/v1/qq/(?:commands|credential-operations)/${id}$`).test(path);
+ if(method==="POST"&&new RegExp(`^/api/v1/qq/credentials/cleanup/${id}$`).test(path))return true;
+ return ["POST","DELETE"].includes(method)&&new RegExp(`^/api/v1/qq/credentials/${id}$`).test(path);
+}
+export function gatewayProxyPath(method:string,path:string):boolean {
+ const id="[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+ if(method==="GET")return new RegExp(`^/api/v1/gateway/(?:commands|credential-operations)/${id}$`).test(path);
+ if(method==="POST"&&new RegExp(`^/api/v1/gateway/credentials/cleanup/${id}$`).test(path))return true;
+ return ["POST","DELETE"].includes(method)&&new RegExp(`^/api/v1/gateway/credentials/${id}$`).test(path);
+}
+
 export function allowDevelopmentProxy(
   method: string,
   path: string,
@@ -21,7 +81,7 @@ export function allowDevelopmentProxy(
   fetchSite: string | undefined,
   contentType: string | undefined,
 ): boolean {
-  if (!Object.hasOwn(routes, `${method} ${path}`)) return false;
+  if (!gatewayProxyPath(method,path) && !qqProxyPath(method,path) && !mcpCredentialProxyPath(method,path) && !Object.hasOwn(routes, `${method} ${path}`) && !(method === "GET" && (historyProxyPath(path) || /^\/api\/v1\/reliability\/updates\/verifications\/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(path) || backupReceiptProxyPath(path) || eventProxyPath(path) || changesProxyPath(path) || credentialOperationProxyPath(path))) && !(method === "POST" && (cleanupResolutionProxyPath(path)||providerMutationProxyPath(path)))) return false;
   if (fetchSite === "cross-site") return false;
   if (origin && !localOrigins.has(origin)) return false;
   return (

@@ -22,7 +22,7 @@ export function modelOptions(models: ModelOption[], current: string): ModelOptio
     : models;
 }
 
-export function useModelCatalog(body: { base_url?: string; models_endpoint?: string; api_key?: string; executor?: string; provider_source?: string }, enabled: boolean): ModelCatalog {
+export function useModelCatalog(body: { base_url?: string; models_endpoint?: string; api_key?: string; executor?: string; provider_source?: string; provider_id?: string }, enabled: boolean): ModelCatalog {
   const key = JSON.stringify(body);
   const [reload, setReload] = useState(0);
   const [result, setResult] = useState<{ key: string; models: ModelOption[]; loading: boolean; error: string }>({
